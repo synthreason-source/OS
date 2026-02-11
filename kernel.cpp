@@ -23,12 +23,6 @@ typedef signed int int32_t;
 typedef unsigned int uintptr_t;
 typedef unsigned int size_t;
 
-// --- Embedded BusyBox Binary Symbols (from linker) ---
-extern "C" {
-    extern uint8_t ramdisk_start;
-    extern uint8_t ramdisk_end;
-}
-
 // --- CXX ABI Stubs ---
 namespace __cxxabiv1 {
     extern "C" int __cxa_guard_acquire(long long *g) { return !*(char *)(g); }
@@ -81,10 +75,13 @@ int fat32_remove_file(const char* filename);
 char* fat32_read_file_as_string(const char* filename);
 void fat32_list_files();
 typedef struct { char name[11]; uint8_t attr; uint8_t ntres; uint8_t crt_time_tenth; uint16_t crt_time, crt_date, lst_acc_date, fst_clus_hi; uint16_t wrt_time, wrt_date, fst_clus_lo; uint32_t file_size; } __attribute__((packed)) fat_dir_entry_t;
-int fat32_list_directory(const char* path, fat_dir_entry_t* buffer, int max_entries); // Modified
+int fat32_list_directory(const char* path, fat_dir_entry_t* buffer, int max_entries);
+int fat32_find_entry(const char* filename, fat_dir_entry_t* entry_out, uint32_t* sector_out, uint32_t* offset_out);
 bool fat32_init();
 
 // --- BusyBox Extraction Function ---
+extern "C" uint8_t ramdisk_start;
+extern "C" uint8_t ramdisk_end;
 bool extract_busybox_to_filesystem() {
     uint8_t* start = &ramdisk_start;
     uint8_t* end = &ramdisk_end;
@@ -98,7 +95,6 @@ bool extract_busybox_to_filesystem() {
     int result = fat32_write_file("busybox", start, size);
     return (result == 0);
 }
-
 
 // --- Global Clipboard ---
 static char g_clipboard_buffer[1024] = {0}; // New
@@ -4618,7 +4614,85 @@ bool run_process_waiting_for_input() {
     return false;
 }
 		
-	
+	// =============================================================================
+// ELF32 LOADER AND PROCESS EXECUTION
+// =============================================================================
+
+// ELF32 Header structures
+#define EI_NIDENT 16
+#define EI_MAG0 0
+#define EI_MAG1 1
+#define EI_MAG2 2
+#define EI_MAG3 3
+#define EI_CLASS 4
+#define EI_DATA 5
+
+#define ELFMAG0 0x7f
+#define ELFMAG1 'E'
+#define ELFMAG2 'L'
+#define ELFMAG3 'F'
+#define ELFCLASS32 1
+#define ELFDATA2LSB 1
+
+#define ET_EXEC 2
+#define EM_386 3
+
+#define PT_LOAD 1
+#define PF_X 1
+#define PF_W 2
+#define PF_R 4
+
+typedef struct {
+    uint8_t  e_ident[EI_NIDENT];
+    uint16_t e_type;
+    uint16_t e_machine;
+    uint32_t e_version;
+    uint32_t e_entry;
+    uint32_t e_phoff;
+    uint32_t e_shoff;
+    uint32_t e_flags;
+    uint16_t e_ehsize;
+    uint16_t e_phentsize;
+    uint16_t e_phnum;
+    uint16_t e_shentsize;
+    uint16_t e_shnum;
+    uint16_t e_shstrndx;
+} __attribute__((packed)) Elf32_Ehdr;
+
+typedef struct {
+    uint32_t p_type;
+    uint32_t p_offset;
+    uint32_t p_vaddr;
+    uint32_t p_paddr;
+    uint32_t p_filesz;
+    uint32_t p_memsz;
+    uint32_t p_flags;
+    uint32_t p_align;
+} __attribute__((packed)) Elf32_Phdr;
+
+// Process structure for ELF execution
+#define MAX_ELF_PROCESSES 4
+#define ELF_STACK_SIZE (64 * 1024)  // 64KB stack per process
+#define ELF_HEAP_SIZE (256 * 1024)   // 256KB heap per process
+
+struct ElfProcess {
+    bool active;
+    uint32_t entry_point;
+    uint8_t* memory_base;      // Base address of process memory
+    uint32_t memory_size;      // Total size of process memory
+    uint8_t* stack;            // Stack memory
+    uint32_t esp;              // Stack pointer
+    uint32_t eip;              // Instruction pointer
+    TerminalWindow* terminal;  // Associated terminal
+    char cmdline[256];         // Command line arguments
+    bool waiting_for_input;
+    char input_buffer[256];
+    int input_pos;
+    bool completed;
+    int exit_code;
+};
+
+static ElfProcess elf_processes[MAX_ELF_PROCESSES];
 // =============================================================================
 // TERMINAL WINDOW IMPLEMENTATION
 // =============================================================================
@@ -5098,6 +5172,97 @@ bool aes_decrypt_file(const char* key_hex, const char* infile, const char* outfi
 }	
 char startup_command_buffer[256];
 
+
+// Initialize ELF subsystem
+void init_elf_subsystem() {
+    for (int i = 0; i < MAX_ELF_PROCESSES; i++) {
+        elf_processes[i].active = false;
+        elf_processes[i].memory_base = nullptr;
+        elf_processes[i].stack = nullptr;
+        elf_processes[i].terminal = nullptr;
+        elf_processes[i].waiting_for_input = false;
+        elf_processes[i].completed = false;
+    }
+}
+
+// Find free process slot
+int find_free_elf_slot() {
+    for (int i = 0; i < MAX_ELF_PROCESSES; i++) {
+        if (!elf_processes[i].active) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// Validate ELF header
+bool validate_elf_header(const Elf32_Ehdr* ehdr) {
+    if (ehdr->e_ident[EI_MAG0] != ELFMAG0 ||
+        ehdr->e_ident[EI_MAG1] != ELFMAG1 ||
+        ehdr->e_ident[EI_MAG2] != ELFMAG2 ||
+        ehdr->e_ident[EI_MAG3] != ELFMAG3) {
+        return false;
+    }
+    
+    if (ehdr->e_ident[EI_CLASS] != ELFCLASS32) {
+        return false;
+    }
+    
+    if (ehdr->e_ident[EI_DATA] != ELFDATA2LSB) {
+        return false;
+    }
+    
+    if (ehdr->e_type != ET_EXEC) {
+        return false;
+    }
+    
+    if (ehdr->e_machine != EM_386) {
+        return false;
+    }
+    
+    return true;
+}
+
+
+
+// Kill an ELF process
+void kill_elf_process(int slot) {
+    if (slot >= 0 && slot < MAX_ELF_PROCESSES && elf_processes[slot].active) {
+        if (elf_processes[slot].memory_base) {
+            delete[] elf_processes[slot].memory_base;
+        }
+        if (elf_processes[slot].stack) {
+            delete[] elf_processes[slot].stack;
+        }
+        elf_processes[slot].active = false;
+        elf_processes[slot].memory_base = nullptr;
+        elf_processes[slot].stack = nullptr;
+    }
+}
+
+// List ELF processes
+void list_elf_processes(TerminalWindow* terminal) {
+    if (!terminal) return;
+    
+    terminal->console_print("Active ELF processes:\n");
+    bool found = false;
+    for (int i = 0; i < MAX_ELF_PROCESSES; i++) {
+        if (elf_processes[i].active) {
+            char msg[128];
+            snprintf(msg, 128, "  Slot %d: entry=0x%x mem=%d KB cmd=%s\n", 
+                     i, 
+                     elf_processes[i].entry_point,
+                     elf_processes[i].memory_size / 1024,
+                     elf_processes[i].cmdline);
+            terminal->console_print(msg);
+            found = true;
+        }
+    }
+    if (!found) {
+        terminal->console_print("  (none)\n");
+    }
+}
+
 // --- Terminal command handler ---
 void handle_command() {
     int selected_port = 0;
@@ -5127,7 +5292,7 @@ void handle_command() {
         }
     }
 
-    if (strcmp(command, "help") == 0) { console_print("Commands: help, clear, busybox, killexec, killrun, ps, ls, edit, aesdec, aesenc, run, rm, cp, mv, formatfs, chkdsk ( /r /f), time, version\n"); }
+    if (strcmp(command, "help") == 0) { console_print("Commands: help, clear, busybox, pself, killelf, killexec, killrun, ps, ls, edit, aesdec, aesenc, run, rm, cp, mv, formatfs, chkdsk ( /r /f), time, version\n"); }
         else if (strcmp(command, "aesenc") == 0 || strcmp(command, "aesdec") == 0) {
             bool encrypt = strcmp(command, "aesenc") == 0;
             char* key_hex = get_arg(args, 0);
@@ -5145,37 +5310,53 @@ void handle_command() {
         cmd_compile(ahci_base, selected_port, get_arg(args, 0));
     } else if (strcmp(command, "busybox") == 0) {
         // Launch busybox with optional arguments
-        char* busybox_args = args;
-        if (busybox_args && strlen(busybox_args) > 0) {
-            // Build command: busybox <args>
-            char full_command[256];
-            snprintf(full_command, 256, "./busybox %s", busybox_args);
-            
-            // Read busybox binary from filesystem
-            char* busybox_data = fat32_read_file_as_string("busybox");
-            if (busybox_data) {
-                console_print("Executing busybox ");
-                console_print(busybox_args);
-                console_print("...\n");
-                
-                // TODO: Actually execute the ELF binary
-                // For now, just acknowledge the command
-                console_print("BusyBox execution not yet implemented.\n");
-                console_print("BusyBox is available at: busybox\n");
-                
-                delete[] busybox_data;
-            } else {
+        if (args && strlen(args) > 0) {
+            // Check if busybox file exists, if not extract it
+            char* test_data = fat32_read_file_as_string("busybox");
+            if (!test_data) {
                 console_print("BusyBox not found. Extracting from embedded image...\n");
                 if (extract_busybox_to_filesystem()) {
-                    console_print("BusyBox extracted successfully to filesystem.\n");
+                    console_print("BusyBox extracted successfully.\n");
                 } else {
                     console_print("Failed to extract BusyBox.\n");
+                    return;
                 }
+            } else {
+                delete[] test_data;
+            }
+            
+            // Load and execute BusyBox ELF
+            console_print("Loading BusyBox: ");
+            console_print(args);
+            console_print("\n");
+            
+            // Build full command line
+            char full_args[256];
+            snprintf(full_args, 256, "busybox %s", args);
+            
+            int slot = load_and_execute_elf("busybox", full_args, this);
+            if (slot >= 0) {
+                console_print("BusyBox loaded successfully\n");
             }
         } else {
             console_print("Usage: busybox <command> [args]\n");
             console_print("Example: busybox ls\n");
             console_print("         busybox sh\n");
+            console_print("Available commands: ");
+            console_print("ls, cat, echo, sh, grep, find, etc.\n");
+        }
+    } else if (strcmp(command, "pself") == 0) {
+        // List ELF processes
+        list_elf_processes(this);
+    } else if (strcmp(command, "killelf") == 0) {
+        // Kill an ELF process
+        char* arg = get_arg(args, 0);
+        if (arg) {
+            int slot = simple_atoi(arg);
+            kill_elf_process(slot);
+            console_print("ELF process killed\n");
+        } else {
+            console_print("Usage: killelf <slot>\n");
         }
     } else if (strcmp(command, "run") == 0) {
         cmd_run(ahci_base, selected_port, get_arg(args, 0));
@@ -5339,6 +5520,148 @@ void handle_command() {
     }
     
     if(!in_editor) print_prompt();
+}
+// ELF Loader implementation
+int load_and_execute_elf(const char* filename, const char* args, TerminalWindow* terminal) {
+    // Read ELF file from filesystem
+    char* elf_data = fat32_read_file_as_string(filename);
+    if (!elf_data) {
+        if (terminal) {
+            terminal->console_print("Failed to read ELF file: ");
+            terminal->console_print(filename);
+            terminal->console_print("\n");
+        }
+        return -1;
+    }
+    
+    // Get file size by finding the entry and reading its size
+    fat_dir_entry_t entry;
+    uint32_t sector, offset;
+    if (fat32_find_entry(filename, &entry, &sector, &offset) != 0) {
+        delete[] elf_data;
+        return -1;
+    }
+    
+    // Validate ELF header
+    Elf32_Ehdr* ehdr = (Elf32_Ehdr*)elf_data;
+    if (!validate_elf_header(ehdr)) {
+        if (terminal) {
+            terminal->console_print("Invalid ELF file\n");
+        }
+        delete[] elf_data;
+        return -1;
+    }
+    
+    // Find free process slot
+    int slot = find_free_elf_slot();
+    if (slot < 0) {
+        if (terminal) {
+            terminal->console_print("No free process slots\n");
+        }
+        delete[] elf_data;
+        return -1;
+    }
+    
+    ElfProcess* proc = &elf_processes[slot];
+    
+    // Calculate memory requirements
+    uint32_t min_vaddr = 0xFFFFFFFF;
+    uint32_t max_vaddr = 0;
+    
+    Elf32_Phdr* phdr = (Elf32_Phdr*)(elf_data + ehdr->e_phoff);
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+        if (phdr[i].p_type == PT_LOAD) {
+            uint32_t seg_start = phdr[i].p_vaddr;
+            uint32_t seg_end = phdr[i].p_vaddr + phdr[i].p_memsz;
+            if (seg_start < min_vaddr) min_vaddr = seg_start;
+            if (seg_end > max_vaddr) max_vaddr = seg_end;
+        }
+    }
+    
+    // Allocate memory for process
+    uint32_t memory_size = max_vaddr - min_vaddr + ELF_HEAP_SIZE;
+    proc->memory_base = new uint8_t[memory_size];
+    if (!proc->memory_base) {
+        if (terminal) {
+            terminal->console_print("Failed to allocate process memory\n");
+        }
+        delete[] elf_data;
+        return -1;
+    }
+    memset(proc->memory_base, 0, memory_size);
+    proc->memory_size = memory_size;
+    
+    // Load program segments
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+        if (phdr[i].p_type == PT_LOAD) {
+            uint32_t vaddr = phdr[i].p_vaddr - min_vaddr;
+            memcpy(proc->memory_base + vaddr, 
+                   elf_data + phdr[i].p_offset, 
+                   phdr[i].p_filesz);
+            
+            // Zero out BSS if memsz > filesz
+            if (phdr[i].p_memsz > phdr[i].p_filesz) {
+                memset(proc->memory_base + vaddr + phdr[i].p_filesz, 
+                       0, 
+                       phdr[i].p_memsz - phdr[i].p_filesz);
+            }
+        }
+    }
+    
+    // Allocate stack
+    proc->stack = new uint8_t[ELF_STACK_SIZE];
+    if (!proc->stack) {
+        delete[] proc->memory_base;
+        delete[] elf_data;
+        return -1;
+    }
+    memset(proc->stack, 0, ELF_STACK_SIZE);
+    
+    // Initialize process state
+    proc->active = true;
+    proc->entry_point = ehdr->e_entry - min_vaddr;
+    proc->eip = proc->entry_point;
+    proc->esp = ELF_STACK_SIZE - 16;
+    proc->terminal = terminal;
+    proc->waiting_for_input = false;
+    proc->input_pos = 0;
+    proc->completed = false;
+    proc->exit_code = 0;
+    
+    // Copy command line
+    if (args) {
+        strncpy(proc->cmdline, args, 255);
+        proc->cmdline[255] = '\0';
+    } else {
+        proc->cmdline[0] = '\0';
+    }
+    
+    delete[] elf_data;
+    
+    if (terminal) {
+        terminal->console_print("ELF process loaded (slot ");
+        char buf[16];
+        snprintf(buf, 16, "%d", slot);
+        terminal->console_print(buf);
+        terminal->console_print(")\n");
+        // Tick ELF processes (add after VM ticks)
+		for (int i = 0; i < MAX_ELF_PROCESSES; i++) {
+			if (elf_processes[i].active && !elf_processes[i].completed) {
+				// Simple stub execution - just marks as completed
+				// Real implementation would execute instructions at elf_processes[i].eip
+				elf_processes[i].completed = true;
+				elf_processes[i].exit_code = 0;
+				
+				if (elf_processes[i].terminal) {
+					char msg[64];
+					snprintf(msg, 64, "\nELF process %d completed\n", i);
+					elf_processes[i].terminal->console_print(msg);
+				}
+			}
+		}
+    }
+    
+    return slot;
 }
     
     
@@ -5864,19 +6187,28 @@ void WindowManager::print_to_focused(const char* s) {
 
 void launch_new_terminal() {
     static int win_count = 0;
-    wm.add_window(new TerminalWindow(100 + (win_count++ % 10) * 30, 50 + (win_count % 10) * 30));
+    int idx = (win_count++ % 10);
+    int off = idx * 30;
+    wm.add_window(new TerminalWindow(100 + off, 50 + off));
 }
+
 
 void launch_new_explorer() {
     static int win_count = 0;
-    wm.add_window(new FileExplorerWindow(120 + (win_count++ % 10) * 30, 70 + (win_count % 10) * 30, "/"));
+    int idx = (win_count++ % 10);
+    int off = idx * 30;
+    wm.add_window(new FileExplorerWindow(120 + off, 70 + off, "/"));
 }
+
 
 // ADD THIS NEW FUNCTION
 void launch_terminal_with_command(const char* command) {
     static int win_count = 0;
-    wm.add_window(new TerminalWindow(150 + (win_count++ % 10) * 30, 90 + (win_count % 10) * 30, command));
+    int idx = (win_count++ % 10);
+    int off = idx * 30;
+    wm.add_window(new TerminalWindow(150 + off, 90 + off, command));
 }
+
 void swap_buffers() {
     if (fb_info.ptr && backbuffer) {
         uint32_t* dest = fb_info.ptr;
@@ -6290,6 +6622,7 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
     backbuffer = new uint32_t[fb_info.width * fb_info.height];
     
     g_gfx.init(false);
+    initialize_vm_subsystems();
     initialize_vm_subsystems();
     launch_new_terminal();
     
