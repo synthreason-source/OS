@@ -98,7 +98,8 @@ bool extract_busybox_to_filesystem() {
 
 // --- Global Clipboard ---
 static char g_clipboard_buffer[1024] = {0}; // New
-
+struct BusyBoxShell { bool active; char cwd[256]; char prompt[32]; };
+static BusyBoxShell g_busybox = {false, "/", "/ # "};
 // --- Low-level I/O functions ---
 static inline void outb(uint16_t port, uint8_t val) { asm volatile ("outb %0, %1" : : "a"(val), "d"(port)); }
 static inline void outl(uint16_t port, uint32_t val) { asm volatile ("outl %0, %1" : : "a"(val), "d"(port)); }
@@ -128,6 +129,86 @@ class FileExplorerWindow;
 
 // Kernel Entry
 extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr);
+
+// --- Command parsing helper ---
+char* get_arg(char* args, int n) {
+    char* p = args;
+
+    // Loop to find the start of the Nth argument
+    for (int i = 0; i < n; i++) {
+        // Skip leading spaces for the current argument
+        while (*p && *p == ' ') p++;
+
+        // If we're at the end of the string, the requested arg doesn't exist
+        if (*p == '\0') return nullptr;
+
+        // Skip over the content of the current argument
+        if (*p == '"') {
+            p++; // Skip opening quote
+            while (*p && *p != '"') p++;
+            if (*p == '"') p++; // Skip closing quote
+        } else {
+            while (*p && *p != ' ') p++;
+        }
+    }
+
+    // Now p is at the start of the Nth argument (or spaces before it)
+    while (*p && *p == ' ') p++;
+    if (*p == '\0') return nullptr;
+
+    char* arg_start = p;
+    if (*p == '"') {
+        arg_start++; // The actual argument starts after the quote
+        p++;
+        while (*p && *p != '"') p++;
+        if (*p == '"') *p = '\0'; // Place null terminator on the closing quote
+    } else {
+        while (*p && *p != ' ') p++;
+        if (*p) *p = '\0'; // Place null terminator on the space
+    }
+    return arg_start;
+}
+
+// ============================================================
+// Integer Conversion Functions
+// ============================================================
+
+void int_to_string(int value, char* buffer) {
+    if (!buffer) return;
+    
+    if (value == 0) {
+        buffer[0] = '0';
+        buffer[1] = 0;
+        return;
+    }
+    
+    int negative = value < 0;
+    if (negative) value = -value;
+    
+    int i = 0;
+    char temp[16];
+    
+    while (value > 0) {
+        temp[i++] = '0' + (value % 10);
+        value /= 10;
+    }
+    
+    int j = 0;
+    if (negative) buffer[j++] = '-';
+    
+    while (i > 0) {
+        buffer[j++] = temp[--i];
+    }
+    
+    buffer[j] = 0;
+}
+
+
+
+// ============================================================
+// Integer Conversion Functions
+// ============================================================
+
 
 // App Launchers
 void launch_new_terminal();
@@ -2314,6 +2395,296 @@ void fat32_format() {
         wm.print_to_focused("FAT32 FS re-initialization failed.\n");
     }
 }
+
+
+static void bb_cat(const char* f, Window* t) {
+    if (!f||!*f){t->console_print("Usage: cat <file>\n");return;}
+    char* c=fat32_read_file_as_string(f);
+    if(!c){t->console_print("cat: no such file\n");return;}
+    t->console_print(c);
+    int n=strlen(c); if(n>0&&c[n-1]!='\n')t->console_print("\n");
+    delete[]c;
+}
+static void bb_echo(const char* a, Window* t) {
+    if(!a||!*a){t->console_print("\n");return;}
+    bool nl=true; const char* p=a;
+    if(p[0]=='-'&&p[1]=='n'&&(p[2]==' '||!p[2])){nl=false;p+=2;while(*p==' ')p++;}
+    t->console_print(p); if(nl)t->console_print("\n");
+}
+static void bb_grep(const char* pat, const char* f, Window* t) {
+    if(!pat||!f){t->console_print("Usage: grep <pattern> <file>\n");return;}
+    char* c=fat32_read_file_as_string(f);
+    if(!c){t->console_print("grep: no such file\n");return;}
+    char* p=c; int ln=1;
+    while(*p){
+        char* ls=p; while(*p&&*p!='\n')p++;
+        char sv=*p;*p='\0';
+        if(strstr(ls,pat)){char nb[16];int_to_string(ln,nb);t->console_print(nb);t->console_print(": ");t->console_print(ls);t->console_print("\n");}
+        *p=sv;if(*p=='\n')p++;ln++;
+    }
+    delete[]c;
+}
+static void bb_wc(const char* f, Window* t) {
+    if(!f||!*f){t->console_print("Usage: wc <file>\n");return;}
+    char* c=fat32_read_file_as_string(f);
+    if(!c){t->console_print("wc: no such file\n");return;}
+    int l=0,w=0,ch=0; bool iw=false;
+    for(char* p=c;*p;p++){ch++;if(*p=='\n')l++;if(*p==' '||*p=='\t'||*p=='\n')iw=false;else if(!iw){iw=true;w++;}}
+    char b[128];snprintf(b,128,"%6d %6d %6d %s\n",l,w,ch,f);t->console_print(b);
+    delete[]c;
+}
+static void bb_head(const char* a, Window* t) {
+    int n=10; const char* f=a;
+    if(a&&a[0]=='-'&&a[1]=='n'){const char* p=a+2;while(*p==' ')p++;n=simple_atoi(p);while(*p&&*p!=' ')p++;while(*p==' ')p++;f=p;}
+    if(!f||!*f){t->console_print("Usage: head [-n N] <file>\n");return;}
+    char* c=fat32_read_file_as_string(f);
+    if(!c){t->console_print("head: no such file\n");return;}
+    char* p=c; int cnt=0;
+    while(*p&&cnt<n){char* ls=p;while(*p&&*p!='\n')p++;char sv=*p;*p='\0';t->console_print(ls);t->console_print("\n");*p=sv;if(*p=='\n')p++;cnt++;}
+    delete[]c;
+}
+static void bb_tail(const char* a, Window* t) {
+    int n=10; const char* f=a;
+    if(a&&a[0]=='-'&&a[1]=='n'){const char* p=a+2;while(*p==' ')p++;n=simple_atoi(p);while(*p&&*p!=' ')p++;while(*p==' ')p++;f=p;}
+    if(!f||!*f){t->console_print("Usage: tail [-n N] <file>\n");return;}
+    char* c=fat32_read_file_as_string(f);
+    if(!c){t->console_print("tail: no such file\n");return;}
+    int tot=0; for(char* p=c;*p;p++) if(*p=='\n')tot++;
+    int sk=tot-n; if(sk<0)sk=0;
+    char* p=c; int cnt2=0;
+    while(*p&&cnt2<sk){if(*p=='\n')cnt2++;p++;}
+    while(*p){char* ls=p;while(*p&&*p!='\n')p++;char sv=*p;*p='\0';t->console_print(ls);t->console_print("\n");*p=sv;if(*p=='\n')p++;}
+    delete[]c;
+}
+static void bb_find(const char* a, Window* t) {
+    const char* np=nullptr;
+    if(a&&strstr(a,"-name")){const char* p=strstr(a,"-name")+5;while(*p==' ')p++;np=p;}
+    static fat_dir_entry_t ents[128]; int cnt=fat32_list_directory("/",ents,128);
+    for(int i=0;i<cnt;i++){char fn[13];fat32_get_fne_from_entry(&ents[i],fn);if(!np||strstr(fn,np)){t->console_print("./");t->console_print(fn);t->console_print("\n");}}
+}
+static void bb_touch(const char* f, Window* t) {
+    if(!f||!*f){t->console_print("Usage: touch <file>\n");return;}
+    fat_dir_entry_t e;uint32_t s,o;
+    if(fat32_find_entry(f,&e,&s,&o)!=0)fat32_write_file(f,"",0);
+}
+static void bb_hexdump(const char* f, Window* t) {
+    if(!f||!*f){t->console_print("Usage: hexdump <file>\n");return;}
+    char* c=fat32_read_file_as_string(f);
+    if(!c){t->console_print("hexdump: no such file\n");return;}
+    int len=strlen(c); const char* hx="0123456789abcdef"; char lb[80];
+    for(int i=0;i<len;i+=16){
+        int li=0;
+        lb[li++]=hx[(i>>12)&0xF];lb[li++]=hx[(i>>8)&0xF];lb[li++]=hx[(i>>4)&0xF];lb[li++]=hx[i&0xF];lb[li++]=':';lb[li++]=' ';
+        for(int j=0;j<16;j++){if(i+j<len){uint8_t b=(uint8_t)c[i+j];lb[li++]=hx[b>>4];lb[li++]=hx[b&0xF];}else{lb[li++]=' ';lb[li++]=' ';}lb[li++]=' ';if(j==7)lb[li++]=' ';}
+        lb[li++]=' ';lb[li++]='|';
+        for(int j=0;j<16&&i+j<len;j++){char ch=c[i+j];lb[li++]=(ch>=32&&ch<127)?ch:'.';}
+        lb[li++]='|';lb[li++]='\n';lb[li]='\0';t->console_print(lb);
+    }
+    delete[]c;
+}
+static void bb_sort(const char* f, Window* t) {
+    if(!f||!*f){t->console_print("Usage: sort <file>\n");return;}
+    char* c=fat32_read_file_as_string(f);
+    if(!c){t->console_print("sort: no such file\n");return;}
+    static char* ls[512]; int lc=0; char* p=c;
+    while(*p&&lc<512){ls[lc++]=p;while(*p&&*p!='\n')p++;if(*p=='\n'){*p='\0';p++;}}
+    for(int i=0;i<lc-1;i++) for(int j=0;j<lc-i-1;j++) if(strcmp(ls[j],ls[j+1])>0){char* tmp=ls[j];ls[j]=ls[j+1];ls[j+1]=tmp;}
+    for(int i=0;i<lc;i++){t->console_print(ls[i]);t->console_print("\n");}
+    delete[]c;
+}
+static void bb_uniq(const char* f, Window* t) {
+    if(!f||!*f){t->console_print("Usage: uniq <file>\n");return;}
+    char* c=fat32_read_file_as_string(f);
+    if(!c){t->console_print("uniq: no such file\n");return;}
+    char last[256]=""; char* p=c;
+    while(*p){char* ls=p;while(*p&&*p!='\n')p++;char sv=*p;*p='\0';if(strcmp(ls,last)!=0){t->console_print(ls);t->console_print("\n");strncpy(last,ls,255);}*p=sv;if(*p=='\n')p++;}
+    delete[]c;
+}
+static void bb_tac(const char* f, Window* t) {
+    if(!f||!*f){t->console_print("Usage: tac <file>\n");return;}
+    char* c=fat32_read_file_as_string(f);
+    if(!c){t->console_print("tac: no such file\n");return;}
+    static char* ls[512]; int lc=0; char* p=c;
+    while(*p&&lc<512){ls[lc++]=p;while(*p&&*p!='\n')p++;if(*p=='\n'){*p='\0';p++;}}
+    for(int i=lc-1;i>=0;i--){t->console_print(ls[i]);t->console_print("\n");}
+    delete[]c;
+}
+static void bb_strings(const char* f, Window* t) {
+    if(!f||!*f){t->console_print("Usage: strings <file>\n");return;}
+    char* c=fat32_read_file_as_string(f);
+    if(!c){t->console_print("strings: no such file\n");return;}
+    int len=strlen(c); char run[128]; int ri=0;
+    for(int i=0;i<=len;i++){uint8_t ch=(i<len)?(uint8_t)c[i]:0;if(ch>=32&&ch<127&&ri<127)run[ri++]=ch;else{if(ri>=4){run[ri]='\0';t->console_print(run);t->console_print("\n");}ri=0;}}
+    delete[]c;
+}
+static void bb_expr(const char* a, Window* t) {
+    if(!a||!*a){t->console_print("Usage: expr <num> <op> <num>\n");return;}
+    char buf[64];strncpy(buf,a,63);buf[63]='\0';
+    char* p=buf;
+    char* as2=p;while(*p&&*p!=' ')p++;if(*p){*p='\0';p++;}while(*p==' ')p++;
+    char* op=p;while(*p&&*p!=' ')p++;if(*p){*p='\0';p++;}while(*p==' ')p++;
+    char* bs=p;
+    int av=simple_atoi(as2),bv=simple_atoi(bs),r=0;
+    if(strcmp(op,"+")==0)r=av+bv;else if(strcmp(op,"-")==0)r=av-bv;else if(strcmp(op,"*")==0)r=av*bv;
+    else if(strcmp(op,"/")==0)r=bv?av/bv:0;else if(strcmp(op,"%")==0)r=bv?av%bv:0;
+    else if(strcmp(op,"=")==0)r=(av==bv);else if(strcmp(op,"!=")==0)r=(av!=bv);
+    else if(strcmp(op,"<")==0)r=(av<bv);else if(strcmp(op,">")==0)r=(av>bv);
+    else{t->console_print("expr: syntax error\n");return;}
+    char rb[32];int_to_string(r,rb);t->console_print(rb);t->console_print("\n");
+}
+static void bb_seq(const char* a, Window* t) {
+    if(!a||!*a){t->console_print("Usage: seq [first [incr]] last\n");return;}
+    char buf[64];strncpy(buf,a,63);buf[63]='\0';
+    int nums[3]={1,1,1};int cnt=0;char* p=buf;
+    while(*p&&cnt<3){while(*p==' ')p++;if(!*p)break;nums[cnt++]=simple_atoi(p);while(*p&&*p!=' ')p++;}
+    int first,incr,last2;
+    if(cnt==1){first=1;incr=1;last2=nums[0];}else if(cnt==2){first=nums[0];incr=1;last2=nums[1];}else{first=nums[0];incr=nums[1];last2=nums[2];}
+    if(incr==0){t->console_print("seq: zero increment\n");return;}
+    char nb[32];int iter=0;
+    for(int i=first;(incr>0?i<=last2:i>=last2)&&iter<1000;i+=incr,iter++){int_to_string(i,nb);t->console_print(nb);t->console_print("\n");}
+}
+static void bb_df(Window* t) {
+    if(!ahci_base||!current_directory_cluster){t->console_print("df: filesystem not available\n");return;}
+    uint32_t cs=bpb.sec_per_clus*SECTOR_SIZE;
+    uint32_t tc=(bpb.tot_sec32-data_start_sector)/bpb.sec_per_clus;
+    uint32_t fc=0; uint32_t sc=tc<2048?tc:2048;
+    for(uint32_t i=2;i<sc+2;i++) if(read_fat_entry(i)==FAT_FREE_CLUSTER)fc++;
+    if(tc>2048)fc=(uint32_t)((uint64_t)fc*tc/sc);
+    uint32_t uc=tc-fc;
+    char b[128];
+    t->console_print("Filesystem     1K-blocks     Used Available Use% Mounted\n");
+    snprintf(b,128,"/dev/sda       %9d %8d %9d %3d%%  /\n",(tc*cs)/1024,(uc*cs)/1024,(fc*cs)/1024,tc?(uc*100/tc):0);
+    t->console_print(b);
+}
+static void bb_free(Window* t) {
+    t->console_print("              total        used        free\n");
+    t->console_print("Mem:           8192  (kernel heap, no page tracking)\n");
+    t->console_print("Swap:             0           0           0\n");
+}
+static void bb_uname(const char* a, Window* t) {
+    bool all=a&&strstr(a,"-a");
+    if(!a||!*a){t->console_print("RTOS++\n");return;}
+    char b[128];b[0]='\0';
+    if(all||strstr(a,"-s"))strcat(b,"RTOS++ ");
+    if(all||strstr(a,"-n"))strcat(b,"rtos-box ");
+    if(all||strstr(a,"-r"))strcat(b,"1.0.0 ");
+    if(all||strstr(a,"-m"))strcat(b,"i686 ");
+    int bl=strlen(b); if(bl>0&&b[bl-1]==' ')b[bl-1]='\n'; else strcat(b,"\n");
+    t->console_print(b);
+}
+static void bb_date(Window* t) {
+    RTC_Time r=read_rtc();
+    const char* d[]={"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+    const char* m[]={"","Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
+    int mo=r.month,y=r.year,dy=r.day; if(mo<3){mo+=12;y--;}
+    int dow=(dy+(13*(mo+1)/5)+y+y/4-y/100+y/400)%7; if(dow<0)dow+=7;
+    char b[80];
+    snprintf(b,80,"%s %s %2d %02d:%02d:%02d UTC %d\n",d[dow%7],(r.month>=1&&r.month<=12)?m[r.month]:"???",r.day,r.hour,r.minute,r.second,r.year);
+    t->console_print(b);
+}
+static void bb_uptime(Window* t) {
+    uint32_t s=g_timer_ticks/30,mn=s/60,h=mn/60;mn%=60;
+    char b[80];snprintf(b,80," up %d:%02d,  load average: 0.00 0.00 0.00\n",h,mn);t->console_print(b);
+}
+static void bb_dmesg(Window* t) {
+    t->console_print("[    0.000000] RTOS++ v1.0 starting\n");
+    t->console_print("[    0.001000] Memory allocator init (8MB heap)\n");
+    t->console_print("[    0.002000] Framebuffer: 32bpp linear\n");
+    t->console_print("[    0.010000] PS/2 controller detected\n");
+    t->console_print("[    0.050000] Mouse driver loaded\n");
+    if(ahci_base){char b[80];snprintf(b,80,"[    0.100000] AHCI at 0x%x port %d\n",(uint32_t)ahci_base,g_ahci_port);t->console_print(b);t->console_print("[    0.200000] FAT32 mounted on /\n");}
+    else t->console_print("[    0.100000] AHCI: not found\n");
+    t->console_print("[    0.310000] TinyVM ready\n");
+    t->console_print("[    0.320000] BusyBox native shell loaded\n");
+}
+static void bb_env(Window* t) {
+    t->console_print("PATH=/\nHOME=/\nSHELL=/bin/sh\nTERM=vt100\nUSER=root\nOS=RTOS++\nBUSYBOX=native-1.36\n");
+}
+static void bb_pwd(Window* t)      { t->console_print("/\n"); }
+static void bb_hostname(Window* t) { t->console_print("rtos-box\n"); }
+static void bb_whoami(Window* t)   { t->console_print("root\n"); }
+static void bb_id(Window* t)       { t->console_print("uid=0(root) gid=0(root) groups=0(root)\n"); }
+static void bb_which(const char* cmd, Window* t) {
+    if(!cmd||!*cmd){t->console_print("Usage: which <cmd>\n");return;}
+    const char* bi[]={"sh","ash","ls","cat","echo","grep","wc","head","tail","find","touch",
+        "hexdump","sort","uniq","tac","strings","expr","seq","df","free","uname","date",
+        "uptime","dmesg","env","pwd","hostname","whoami","id","which","yes","cksum",
+        "ps","kill","help","clear","edit","run","compile","cp","mv","rm","busybox",nullptr};
+    for(int i=0;bi[i];i++){if(strcmp(cmd,bi[i])==0){t->console_print("/bin/");t->console_print(cmd);t->console_print("\n");return;}}
+    fat_dir_entry_t e;uint32_t s,o;
+    if(fat32_find_entry(cmd,&e,&s,&o)==0){t->console_print("./");t->console_print(cmd);t->console_print("\n");return;}
+    t->console_print(cmd);t->console_print(": not found\n");
+}
+static void bb_yes(const char* a, Window* t) {
+    const char* m=(a&&*a)?a:"y";
+    for(int i=0;i<20;i++){t->console_print(m);t->console_print("\n");}
+}
+static void bb_cksum(const char* f, Window* t) {
+    if(!f||!*f){t->console_print("Usage: cksum <file>\n");return;}
+    char* c=fat32_read_file_as_string(f);
+    if(!c){t->console_print("cksum: no such file\n");return;}
+    uint32_t sum=0;int len=strlen(c);
+    for(int i=0;i<len;i++)sum=sum*31+(uint8_t)c[i];
+    const char* hx="0123456789abcdef"; char hex[9]; uint32_t s=sum;
+    for(int i=7;i>=0;i--){hex[i]=hx[s&0xF];s>>=4;}hex[8]='\0';
+    char b[64];snprintf(b,64,"%s  %d  %s\n",hex,len,f);t->console_print(b);
+    delete[]c;
+}
+static void bb_sleep(const char* a, Window* t) {
+    if(!a||!*a){t->console_print("Usage: sleep <seconds>\n");return;}
+    int s=simple_atoi(a);
+    if(s<1||s>10){t->console_print("sleep: 1-10 seconds only\n");return;}
+    uint32_t tgt=g_timer_ticks+(uint32_t)(s*30);
+    while(g_timer_ticks<tgt)asm volatile("pause");
+}
+
+// Central dispatcher — returns true if command was handled
+static bool bb_dispatch(const char* command, const char* args, Window* term) {
+    if(strcmp(command,"sh")==0||strcmp(command,"ash")==0){
+        g_busybox.active=true;
+        term->console_print("\nBusyBox v1.36.1 (RTOS++ native shell)\n");
+        term->console_print("Type 'exit' to return to RTOS++ prompt.\n\n");
+        term->console_print(g_busybox.prompt);
+        return true;
+    }
+    if(strcmp(command,"exit")==0&&g_busybox.active){g_busybox.active=false;term->console_print("\n");return true;}
+    if(strcmp(command,"cat")==0)    {bb_cat(get_arg(const_cast<char*>(args),0),term);return true;}
+    if(strcmp(command,"echo")==0)   {bb_echo(args,term);return true;}
+    if(strcmp(command,"tac")==0)    {bb_tac(get_arg(const_cast<char*>(args),0),term);return true;}
+    if(strcmp(command,"strings")==0){bb_strings(get_arg(const_cast<char*>(args),0),term);return true;}
+    if(strcmp(command,"hexdump")==0){bb_hexdump(get_arg(const_cast<char*>(args),0),term);return true;}
+    if(strcmp(command,"head")==0)   {bb_head(args,term);return true;}
+    if(strcmp(command,"tail")==0)   {bb_tail(args,term);return true;}
+    if(strcmp(command,"sort")==0)   {bb_sort(get_arg(const_cast<char*>(args),0),term);return true;}
+    if(strcmp(command,"uniq")==0)   {bb_uniq(get_arg(const_cast<char*>(args),0),term);return true;}
+    if(strcmp(command,"wc")==0)     {bb_wc(get_arg(const_cast<char*>(args),0),term);return true;}
+    if(strcmp(command,"grep")==0){
+        char ac[120];strncpy(ac,args,119);ac[119]='\0';
+        char* pat=get_arg(ac,0); char* fi=get_arg(ac,1);
+        bb_grep(pat,fi,term);return true;
+    }
+    if(strcmp(command,"find")==0)   {bb_find(args,term);return true;}
+    if(strcmp(command,"touch")==0)  {bb_touch(get_arg(const_cast<char*>(args),0),term);return true;}
+    if(strcmp(command,"pwd")==0)    {bb_pwd(term);return true;}
+    if(strcmp(command,"expr")==0)   {bb_expr(args,term);return true;}
+    if(strcmp(command,"seq")==0)    {bb_seq(args,term);return true;}
+    if(strcmp(command,"yes")==0)    {bb_yes(args,term);return true;}
+    if(strcmp(command,"cksum")==0)  {bb_cksum(get_arg(const_cast<char*>(args),0),term);return true;}
+    if(strcmp(command,"uname")==0)  {bb_uname(args,term);return true;}
+    if(strcmp(command,"date")==0)   {bb_date(term);return true;}
+    if(strcmp(command,"uptime")==0) {bb_uptime(term);return true;}
+    if(strcmp(command,"dmesg")==0)  {bb_dmesg(term);return true;}
+    if(strcmp(command,"df")==0)     {bb_df(term);return true;}
+    if(strcmp(command,"free")==0)   {bb_free(term);return true;}
+    if(strcmp(command,"env")==0)    {bb_env(term);return true;}
+    if(strcmp(command,"hostname")==0){bb_hostname(term);return true;}
+    if(strcmp(command,"whoami")==0) {bb_whoami(term);return true;}
+    if(strcmp(command,"id")==0)     {bb_id(term);return true;}
+    if(strcmp(command,"which")==0)  {bb_which(get_arg(const_cast<char*>(args),0),term);return true;}
+    if(strcmp(command,"sleep")==0)  {bb_sleep(args,term);return true;}
+    return false;
+}
+
 class FileExplorerWindow : public Window {
 private:
     char current_path[256];
@@ -3073,41 +3444,6 @@ char get_char() {
             return 0;
         }
     }
-}
-
-
-// ============================================================
-// Integer Conversion Functions
-// ============================================================
-
-void int_to_string(int value, char* buffer) {
-    if (!buffer) return;
-    
-    if (value == 0) {
-        buffer[0] = '0';
-        buffer[1] = 0;
-        return;
-    }
-    
-    int negative = value < 0;
-    if (negative) value = -value;
-    
-    int i = 0;
-    char temp[16];
-    
-    while (value > 0) {
-        temp[i++] = '0' + (value % 10);
-        value /= 10;
-    }
-    
-    int j = 0;
-    if (negative) buffer[j++] = '-';
-    
-    while (i > 0) {
-        buffer[j++] = temp[--i];
-    }
-    
-    buffer[j] = 0;
 }
 
 
@@ -4477,44 +4813,6 @@ extern "C" void cmd_compile(uint64_t ahci_base, int port, const char* filename){
 }
 
 
-// --- Command parsing helper ---
-char* get_arg(char* args, int n) {
-    char* p = args;
-
-    // Loop to find the start of the Nth argument
-    for (int i = 0; i < n; i++) {
-        // Skip leading spaces for the current argument
-        while (*p && *p == ' ') p++;
-
-        // If we're at the end of the string, the requested arg doesn't exist
-        if (*p == '\0') return nullptr;
-
-        // Skip over the content of the current argument
-        if (*p == '"') {
-            p++; // Skip opening quote
-            while (*p && *p != '"') p++;
-            if (*p == '"') p++; // Skip closing quote
-        } else {
-            while (*p && *p != ' ') p++;
-        }
-    }
-
-    // Now p is at the start of the Nth argument (or spaces before it)
-    while (*p && *p == ' ') p++;
-    if (*p == '\0') return nullptr;
-
-    char* arg_start = p;
-    if (*p == '"') {
-        arg_start++; // The actual argument starts after the quote
-        p++;
-        while (*p && *p != '"') p++;
-        if (*p == '"') *p = '\0'; // Place null terminator on the closing quote
-    } else {
-        while (*p && *p != ' ') p++;
-        if (*p) *p = '\0'; // Place null terminator on the space
-    }
-    return arg_start;
-}
 
 
     // Separate process tables
@@ -5263,263 +5561,119 @@ void list_elf_processes(TerminalWindow* terminal) {
     }
 }
 
-// --- Terminal command handler ---
-void handle_command() {
+void handle_command() {   // ← rename to handle_command when pasting
     int selected_port = 0;
     char cmd_line[120];
-    strncpy(cmd_line, current_line, 119);
-    cmd_line[119] = '\0';
+    strncpy(cmd_line, current_line, 119); cmd_line[119]='\0';
 
     char* command = cmd_line;
-    while (*command && *command == ' ') {
-        command++;
-    }
-
-    if (*command == '\0') {
-        if (!in_editor) print_prompt();
-        return;
-    }
+    while(*command==' ') command++;
+    if(!*command) { if(!in_editor) print_prompt(); return; }
 
     char* args = command;
-    while (*args && *args != ' ') {
-        args++;
-    }
-    if (*args) {
-        *args = '\0'; 
-        args++;       
-        while (*args && *args == ' ') {
-            args++;
-        }
-    }
+    while(*args&&*args!=' ') args++;
+    if(*args) { *args='\0'; args++; while(*args==' ') args++; }
 
-    if (strcmp(command, "help") == 0) { console_print("Commands: help, clear, busybox, pself, killelf, killexec, killrun, ps, ls, edit, aesdec, aesenc, run, rm, cp, mv, formatfs, chkdsk ( /r /f), time, version\n"); }
-        else if (strcmp(command, "aesenc") == 0 || strcmp(command, "aesdec") == 0) {
-            bool encrypt = strcmp(command, "aesenc") == 0;
-            char* key_hex = get_arg(args, 0);
-            char* infile = get_arg(args, 1);
-            char* outfile = get_arg(args, 2);
-            if (!key_hex || !infile || !outfile || strlen(key_hex) != 32) {
-                console_print(encrypt ? "Usage: aesenc <32hexkey> <in> <out>\n" : "Usage: aesdec <32hexkey> <in> <out>\n");
-                return;
-            }
-            bool ok = encrypt ? aes_encrypt_file(key_hex, infile, outfile) : aes_decrypt_file(key_hex, infile, outfile);
-            console_print(ok ? "AES operation successful.\n" : "AES failed.\n");
-        }
-	
-	if (strcmp(command, "compile") == 0) {
-        cmd_compile(ahci_base, selected_port, get_arg(args, 0));
-    } else if (strcmp(command, "busybox") == 0) {
-        // Launch busybox with optional arguments
-        if (args && strlen(args) > 0) {
-            // Check if busybox file exists, if not extract it
-            char* test_data = fat32_read_file_as_string("busybox");
-            if (!test_data) {
-                console_print("BusyBox not found. Extracting from embedded image...\n");
-                if (extract_busybox_to_filesystem()) {
-                    console_print("BusyBox extracted successfully.\n");
-                } else {
-                    console_print("Failed to extract BusyBox.\n");
-                    return;
-                }
-            } else {
-                delete[] test_data;
-            }
-            
-            // Load and execute BusyBox ELF
-            console_print("Loading BusyBox: ");
-            console_print(args);
-            console_print("\n");
-            
-            // Build full command line
-            char full_args[256];
-            snprintf(full_args, 256, "busybox %s", args);
-            
-            int slot = load_and_execute_elf("busybox", full_args, this);
-            if (slot >= 0) {
-                console_print("BusyBox loaded successfully\n");
-            }
-        } else {
-            console_print("Usage: busybox <command> [args]\n");
-            console_print("Example: busybox ls\n");
-            console_print("         busybox sh\n");
-            console_print("Available commands: ");
-            console_print("ls, cat, echo, sh, grep, find, etc.\n");
-        }
-    } else if (strcmp(command, "pself") == 0) {
-        // List ELF processes
-        list_elf_processes(this);
-    } else if (strcmp(command, "killelf") == 0) {
-        // Kill an ELF process
-        char* arg = get_arg(args, 0);
-        if (arg) {
-            int slot = simple_atoi(arg);
-            kill_elf_process(slot);
-            console_print("ELF process killed\n");
-        } else {
-            console_print("Usage: killelf <slot>\n");
-        }
-    } else if (strcmp(command, "run") == 0) {
-        cmd_run(ahci_base, selected_port, get_arg(args, 0));
-    }
-    else if (strcmp(command, "exec") == 0) {
-        cmd_exec(get_arg(args, 0));
-    }
-    else if (strcmp(command, "ps") == 0) {
-        list_run_processes();
-        list_exec_processes();
-    }
-    else if (strcmp(command, "killrun") == 0) {
-        kill_run_process(simple_atoi(get_arg(args, 0)));
-    }
-    else if (strcmp(command, "killexec") == 0) {
-        kill_exec_process(simple_atoi(get_arg(args, 0)));
-    }
-    else if (strcmp(command, "clear") == 0) { line_count = 0; memset(buffer, 0, sizeof(buffer)); }
-    else if (strcmp(command, "ls") == 0) { fat32_list_files(); }
-    else if (strcmp(command, "edit") == 0) {
-        char* filename = get_arg(args, 0);
-        if(filename) {
-            strncpy(edit_filename, filename, 31);
-            edit_filename[31] = '\0';
-            in_editor = true;
-            edit_current_line = 0;
-            edit_cursor_col = 0;
-            edit_scroll_offset = 0;
-            char* content = fat32_read_file_as_string(filename);
-            if (content) {
-                int line_count_temp = 1;
-                for (char* p = content; *p; p++) if (*p == '\n') line_count_temp++;
-                
-                edit_lines = new char*[line_count_temp];
-                edit_line_count = 0;
-                
-                char* line_start = content;
-                for (char* p = content; *p; p++) {
-                    if (*p == '\n') {
-                        *p = '\0';
-                        edit_lines[edit_line_count] = new char[120];
-                        memset(edit_lines[edit_line_count], 0, 120);
-                        strncpy(edit_lines[edit_line_count], line_start, 119);
-                        edit_line_count++;
-                        line_start = p + 1;
-                    }
-                }
-                if (*line_start) {
-                    edit_lines[edit_line_count] = new char[120];
-                    memset(edit_lines[edit_line_count], 0, 120);
-                    strncpy(edit_lines[edit_line_count], line_start, 119);
-                    edit_line_count++;
-                }
-                delete[] content;
-            } else {
-                edit_lines = new char*[1];
-                edit_lines[0] = new char[120];
-                memset(edit_lines[0], 0, 120);
-                edit_line_count = 1;
-            }
-        } else {
-            console_print("Usage: edit \"<filename>\"\n");
-        }
-    }
     
-    else if (strcmp(command, "rm") == 0) { 
-        char* filename = get_arg(args, 0); 
-        if(filename) { 
-            if(fat32_remove_file(filename) == 0) 
-                console_print("File removed.\n"); 
-            else 
-                console_print("Failed to remove file.\n");
-        } else { 
-            console_print("Usage: rm \"<filename>\"\n");
-        }
-    }
-    else if (strcmp(command, "cp") == 0) {
-        char args_for_src[120];
-        strncpy(args_for_src, args, 119);
-        char* src = get_arg(args_for_src, 0);
 
-        char args_for_dest[120];
-        strncpy(args_for_dest, args, 119);
-        char* dest = get_arg(args_for_dest, 1);
-        
-        if(!src || !dest) { 
-            console_print("Usage: cp \"<source>\" \"<dest>\"\n"); 
-        } else {
-            fat_dir_entry_t entry;
-            uint32_t sector, offset;
-            if (fat32_find_entry(src, &entry, &sector, &offset) == 0) {
-                char* content = new char[entry.file_size];
-                if (content && read_data_from_clusters((entry.fst_clus_hi << 16) | entry.fst_clus_lo, content, entry.file_size)) {
-                    if(fat32_write_file(dest, content, entry.file_size) == 0) {
-                        console_print("Copied.\n");
-                    } else {
-                        console_print("Write failed.\n");
-                    }
-                } else {
-                    console_print("Read failed.\n");
-                }
-                if (content) delete[] content;
-            } else {
-                console_print("Source not found.\n");
+    // ── Compiler / VM ─────────────────────────────────────────────────────────
+    if(strcmp(command,"compile")==0){cmd_compile(ahci_base,selected_port,get_arg(args,0));goto done;}
+    if(strcmp(command,"run")==0)    {cmd_run(ahci_base,selected_port,get_arg(args,0));goto done;}
+    if(strcmp(command,"exec")==0)   {cmd_exec(get_arg(args,0));goto done;}
+
+    // ── Process management ────────────────────────────────────────────────────
+    if(strcmp(command,"ps")==0)      {list_run_processes();list_exec_processes();goto done;}
+    if(strcmp(command,"killrun")==0) {kill_run_process(simple_atoi(get_arg(args,0)));goto done;}
+    if(strcmp(command,"killexec")==0){kill_exec_process(simple_atoi(get_arg(args,0)));goto done;}
+    if(strcmp(command,"pself")==0)   {list_elf_processes(this);goto done;}
+    if(strcmp(command,"killelf")==0) {char* a=get_arg(args,0);if(a)kill_elf_process(simple_atoi(a));else console_print("Usage: killelf <slot>\n");goto done;}
+
+    // ── Filesystem ────────────────────────────────────────────────────────────
+    if(strcmp(command,"ls")==0)     {fat32_list_files();goto done;}
+    if(strcmp(command,"clear")==0)  {line_count=0;memset(buffer,0,sizeof(buffer));goto done;}
+    if(strcmp(command,"rm")==0)     {char* f=get_arg(args,0);console_print(f&&fat32_remove_file(f)==0?"Removed.\n":"rm: failed / no such file.\n");goto done;}
+    if(strcmp(command,"cp")==0)     {char ac[120],dc[120];strncpy(ac,args,119);strncpy(dc,args,119);char* s=get_arg(ac,0);char* d=get_arg(dc,1);if(!s||!d){console_print("Usage: cp <src> <dest>\n");goto done;}console_print(fat32_copy_file(s,d)==0?"Copied.\n":"Copy failed.\n");goto done;}
+    if(strcmp(command,"mv")==0)     {char ac[120],dc[120];strncpy(ac,args,119);strncpy(dc,args,119);char* s=get_arg(ac,0);char* d=get_arg(dc,1);if(!s||!d){console_print("Usage: mv <src> <dest>\n");goto done;}console_print(fat32_rename_file(s,d)==0?"Moved.\n":"mv: failed.\n");goto done;}
+    if(strcmp(command,"formatfs")==0){fat32_format();goto done;}
+    if(strcmp(command,"chkdsk")==0) {bool f=strstr(args,"/f")||strstr(args,"/F");bool r=strstr(args,"/r")||strstr(args,"/R");if(r)f=true;chkdsk(f,true);if(r)chkdsk_full_scan(f);goto done;}
+
+    // ── Editor ────────────────────────────────────────────────────────────────
+    if(strcmp(command,"edit")==0){
+        char* fn=get_arg(args,0);
+        if(!fn){console_print("Usage: edit <filename>\n");goto done;}
+        strncpy(edit_filename,fn,31);edit_filename[31]='\0';
+        in_editor=true;edit_current_line=0;edit_cursor_col=0;edit_scroll_offset=0;
+        char* content=fat32_read_file_as_string(fn);
+        if(content){
+            int lct=1;for(char* p=content;*p;p++)if(*p=='\n')lct++;
+            edit_lines=new char*[lct];edit_line_count=0;
+            char* ls2=content;
+            for(char* p=content;*p;p++){
+                if(*p=='\n'){*p='\0';edit_lines[edit_line_count]=new char[TERM_WIDTH];memset(edit_lines[edit_line_count],0,TERM_WIDTH);strncpy(edit_lines[edit_line_count],ls2,TERM_WIDTH-1);edit_line_count++;ls2=p+1;}
             }
-        }
-    }
-    else if (strcmp(command, "mv") == 0) {
-        char args_for_src[120];
-        strncpy(args_for_src, args, 119);
-        char* src = get_arg(args_for_src, 0);
-
-        char args_for_dest[120];
-        strncpy(args_for_dest, args, 119);
-        char* dest = get_arg(args_for_dest, 1);
-
-        if(!src || !dest) { 
-            console_print("Usage: mv \"<source>\" \"<dest>\"\n"); 
+            if(*ls2){edit_lines[edit_line_count]=new char[TERM_WIDTH];memset(edit_lines[edit_line_count],0,TERM_WIDTH);strncpy(edit_lines[edit_line_count],ls2,TERM_WIDTH-1);edit_line_count++;}
+            delete[]content;
         } else {
-            if(fat32_rename_file(src, dest) == 0) {
-                console_print("Moved.\n");
-            } else {
-                console_print("Failed. (Source not found or destination exists).\n");
-            }
+            edit_lines=new char*[1];edit_lines[0]=new char[TERM_WIDTH];memset(edit_lines[0],0,TERM_WIDTH);edit_line_count=1;
         }
+        goto done;
     }
-    else if (strcmp(command, "formatfs") == 0) { fat32_format(); }
-    else if (strcmp(command, "chkdsk") == 0) {
-        char* args_copy = new char[120];
-        strncpy(args_copy, args, 119);
-        args_copy[119] = '\0';
-        
-        bool fix = false;
-        bool fullscan = false;
-        
-        if (strstr(args_copy, "/f") || strstr(args_copy, "/F")) {
-            fix = true;
+
+    // ── System info ───────────────────────────────────────────────────────────
+    if(strcmp(command,"time")==0)   {RTC_Time t=read_rtc();char b[64];snprintf(b,64,"%02d:%02d:%02d %02d/%02d/%d\n",t.hour,t.minute,t.second,t.day,t.month,t.year);console_print(b);goto done;}
+    if(strcmp(command,"version")==0){console_print("RTOS++ v1.0 | BusyBox native shell v1.36\n");goto done;}
+
+    // ── busybox <cmd> ─────────────────────────────────────────────────────────
+    if(strcmp(command,"busybox")==0){
+        if(!args||!*args){
+            console_print("\nBusyBox v1.36.1 (RTOS++ native) multi-call binary\n\n");
+            console_print("Usage: busybox [function [args...]]\n");
+            console_print("   or: busybox --list\n\n");
+            console_print("Available applets:\n");
+            console_print("  ash  cat  cksum  cp  date  df  dmesg  echo  env  expr\n");
+            console_print("  find free  grep  head  hexdump  hostname  id  ls  mv\n");
+            console_print("  ps  pwd  rm  seq  sh  sleep  sort  strings  tac  tail\n");
+            console_print("  touch  uname  uniq  uptime  wc  which  whoami  yes\n");
+        } else if(strcmp(args,"--list")==0){
+            const char* a[]={"ash","cat","cksum","cp","date","df","dmesg","echo","env","expr","find",
+                "free","grep","head","hexdump","hostname","id","ls","mv","ps","pwd","rm","seq","sh",
+                "sleep","sort","strings","tac","tail","touch","uname","uniq","uptime","wc","which","whoami","yes",nullptr};
+            for(int i=0;a[i];i++){console_print(a[i]);console_print("\n");}
+        } else {
+            char bb[120];strncpy(bb,args,119);bb[119]='\0';
+            char* bc=bb; char* br=bc; while(*br&&*br!=' ')br++; if(*br){*br='\0';br++;while(*br==' ')br++;}
+            if(!bb_dispatch(bc,br,this)){console_print("busybox: ");console_print(bc);console_print(": applet not found\n");}
         }
-        if (strstr(args_copy, "/r") || strstr(args_copy, "/R")) {
-            fix = true;
-            fullscan = true;
-        }
-        
-        chkdsk(fix, true);
-        
-        if (fullscan) {
-            chkdsk_full_scan(fix);
-        }
-        
-        delete[] args_copy;
+        goto done;
     }
-    else if (strcmp(command, "time") == 0) { 
-        RTC_Time t = read_rtc(); 
-        char buf[64]; 
-        snprintf(buf, 64, "%d:%d:%d %d/%d/%d\n", t.hour, t.minute, t.second, t.day, t.month, t.year); 
-        console_print(buf); 
+
+    // ── Help ──────────────────────────────────────────────────────────────────
+    if(strcmp(command,"help")==0){
+        console_print("RTOS++ commands:\n");
+        console_print("  File/text : ls  cat  cp  mv  rm  touch  find  edit\n");
+        console_print("             grep  wc  head  tail  sort  uniq  tac  echo\n");
+        console_print("             hexdump  strings\n");
+        console_print("  System   : df  free  uname  date  uptime  dmesg  env\n");
+        console_print("             hostname  whoami  id  which  sleep  time\n");
+        console_print("  Math     : expr  seq  yes  cksum\n");
+        console_print("  Dev      : compile  run  exec  ps  killrun  killexec\n");
+        console_print("  Security : aesenc  aesdec\n");
+        console_print("  Disk     : chkdsk  formatfs  version  clear\n");
+        console_print("  Shell    : busybox sh  (or just: sh)\n");
+        goto done;
     }
-    else if (strcmp(command, "version") == 0) { console_print("RTOS++ v1.0 - Robust Parsing\n"); }
-    else if (strlen(command) > 0) { 
-        console_print("Unknown command.\n"); 
+
+    // ── BusyBox bare commands (no prefix needed) ──────────────────────────────
+    if(bb_dispatch(command,args,this)) goto done;
+
+    // ── Unknown ───────────────────────────────────────────────────────────────
+    if(*command){console_print(command);console_print(": command not found\n");}
+
+done:
+    if(!in_editor){
+        if(g_busybox.active) push_line(g_busybox.prompt);
+        else                  print_prompt();
     }
-    
-    if(!in_editor) print_prompt();
 }
 // ELF Loader implementation
 int load_and_execute_elf(const char* filename, const char* args, TerminalWindow* terminal) {
