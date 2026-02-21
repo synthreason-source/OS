@@ -20,6 +20,7 @@ typedef unsigned long long uint64_t;
 typedef signed char int8_t;
 typedef signed short int16_t;
 typedef signed int int32_t;
+typedef signed int int64_t;
 typedef unsigned int uintptr_t;
 typedef unsigned int size_t;
 
@@ -78,7 +79,6 @@ typedef struct { char name[11]; uint8_t attr; uint8_t ntres; uint8_t crt_time_te
 int fat32_list_directory(const char* path, fat_dir_entry_t* buffer, int max_entries);
 int fat32_find_entry(const char* filename, fat_dir_entry_t* entry_out, uint32_t* sector_out, uint32_t* offset_out);
 bool fat32_init();
-
 // --- BusyBox Extraction Function ---
 extern "C" uint8_t ramdisk_start;
 extern "C" uint8_t ramdisk_end;
@@ -98,8 +98,7 @@ bool extract_busybox_to_filesystem() {
 
 // --- Global Clipboard ---
 static char g_clipboard_buffer[1024] = {0}; // New
-struct BusyBoxShell { bool active; char cwd[256]; char prompt[32]; };
-static BusyBoxShell g_busybox = {false, "/", "/ # "};
+
 // --- Low-level I/O functions ---
 static inline void outb(uint16_t port, uint8_t val) { asm volatile ("outb %0, %1" : : "a"(val), "d"(port)); }
 static inline void outl(uint16_t port, uint32_t val) { asm volatile ("outl %0, %1" : : "a"(val), "d"(port)); }
@@ -129,86 +128,6 @@ class FileExplorerWindow;
 
 // Kernel Entry
 extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr);
-
-// --- Command parsing helper ---
-char* get_arg(char* args, int n) {
-    char* p = args;
-
-    // Loop to find the start of the Nth argument
-    for (int i = 0; i < n; i++) {
-        // Skip leading spaces for the current argument
-        while (*p && *p == ' ') p++;
-
-        // If we're at the end of the string, the requested arg doesn't exist
-        if (*p == '\0') return nullptr;
-
-        // Skip over the content of the current argument
-        if (*p == '"') {
-            p++; // Skip opening quote
-            while (*p && *p != '"') p++;
-            if (*p == '"') p++; // Skip closing quote
-        } else {
-            while (*p && *p != ' ') p++;
-        }
-    }
-
-    // Now p is at the start of the Nth argument (or spaces before it)
-    while (*p && *p == ' ') p++;
-    if (*p == '\0') return nullptr;
-
-    char* arg_start = p;
-    if (*p == '"') {
-        arg_start++; // The actual argument starts after the quote
-        p++;
-        while (*p && *p != '"') p++;
-        if (*p == '"') *p = '\0'; // Place null terminator on the closing quote
-    } else {
-        while (*p && *p != ' ') p++;
-        if (*p) *p = '\0'; // Place null terminator on the space
-    }
-    return arg_start;
-}
-
-// ============================================================
-// Integer Conversion Functions
-// ============================================================
-
-void int_to_string(int value, char* buffer) {
-    if (!buffer) return;
-    
-    if (value == 0) {
-        buffer[0] = '0';
-        buffer[1] = 0;
-        return;
-    }
-    
-    int negative = value < 0;
-    if (negative) value = -value;
-    
-    int i = 0;
-    char temp[16];
-    
-    while (value > 0) {
-        temp[i++] = '0' + (value % 10);
-        value /= 10;
-    }
-    
-    int j = 0;
-    if (negative) buffer[j++] = '-';
-    
-    while (i > 0) {
-        buffer[j++] = temp[--i];
-    }
-    
-    buffer[j] = 0;
-}
-
-
-
-// ============================================================
-// Integer Conversion Functions
-// ============================================================
-
 
 // App Launchers
 void launch_new_terminal();
@@ -2395,296 +2314,6 @@ void fat32_format() {
         wm.print_to_focused("FAT32 FS re-initialization failed.\n");
     }
 }
-
-
-static void bb_cat(const char* f, Window* t) {
-    if (!f||!*f){t->console_print("Usage: cat <file>\n");return;}
-    char* c=fat32_read_file_as_string(f);
-    if(!c){t->console_print("cat: no such file\n");return;}
-    t->console_print(c);
-    int n=strlen(c); if(n>0&&c[n-1]!='\n')t->console_print("\n");
-    delete[]c;
-}
-static void bb_echo(const char* a, Window* t) {
-    if(!a||!*a){t->console_print("\n");return;}
-    bool nl=true; const char* p=a;
-    if(p[0]=='-'&&p[1]=='n'&&(p[2]==' '||!p[2])){nl=false;p+=2;while(*p==' ')p++;}
-    t->console_print(p); if(nl)t->console_print("\n");
-}
-static void bb_grep(const char* pat, const char* f, Window* t) {
-    if(!pat||!f){t->console_print("Usage: grep <pattern> <file>\n");return;}
-    char* c=fat32_read_file_as_string(f);
-    if(!c){t->console_print("grep: no such file\n");return;}
-    char* p=c; int ln=1;
-    while(*p){
-        char* ls=p; while(*p&&*p!='\n')p++;
-        char sv=*p;*p='\0';
-        if(strstr(ls,pat)){char nb[16];int_to_string(ln,nb);t->console_print(nb);t->console_print(": ");t->console_print(ls);t->console_print("\n");}
-        *p=sv;if(*p=='\n')p++;ln++;
-    }
-    delete[]c;
-}
-static void bb_wc(const char* f, Window* t) {
-    if(!f||!*f){t->console_print("Usage: wc <file>\n");return;}
-    char* c=fat32_read_file_as_string(f);
-    if(!c){t->console_print("wc: no such file\n");return;}
-    int l=0,w=0,ch=0; bool iw=false;
-    for(char* p=c;*p;p++){ch++;if(*p=='\n')l++;if(*p==' '||*p=='\t'||*p=='\n')iw=false;else if(!iw){iw=true;w++;}}
-    char b[128];snprintf(b,128,"%6d %6d %6d %s\n",l,w,ch,f);t->console_print(b);
-    delete[]c;
-}
-static void bb_head(const char* a, Window* t) {
-    int n=10; const char* f=a;
-    if(a&&a[0]=='-'&&a[1]=='n'){const char* p=a+2;while(*p==' ')p++;n=simple_atoi(p);while(*p&&*p!=' ')p++;while(*p==' ')p++;f=p;}
-    if(!f||!*f){t->console_print("Usage: head [-n N] <file>\n");return;}
-    char* c=fat32_read_file_as_string(f);
-    if(!c){t->console_print("head: no such file\n");return;}
-    char* p=c; int cnt=0;
-    while(*p&&cnt<n){char* ls=p;while(*p&&*p!='\n')p++;char sv=*p;*p='\0';t->console_print(ls);t->console_print("\n");*p=sv;if(*p=='\n')p++;cnt++;}
-    delete[]c;
-}
-static void bb_tail(const char* a, Window* t) {
-    int n=10; const char* f=a;
-    if(a&&a[0]=='-'&&a[1]=='n'){const char* p=a+2;while(*p==' ')p++;n=simple_atoi(p);while(*p&&*p!=' ')p++;while(*p==' ')p++;f=p;}
-    if(!f||!*f){t->console_print("Usage: tail [-n N] <file>\n");return;}
-    char* c=fat32_read_file_as_string(f);
-    if(!c){t->console_print("tail: no such file\n");return;}
-    int tot=0; for(char* p=c;*p;p++) if(*p=='\n')tot++;
-    int sk=tot-n; if(sk<0)sk=0;
-    char* p=c; int cnt2=0;
-    while(*p&&cnt2<sk){if(*p=='\n')cnt2++;p++;}
-    while(*p){char* ls=p;while(*p&&*p!='\n')p++;char sv=*p;*p='\0';t->console_print(ls);t->console_print("\n");*p=sv;if(*p=='\n')p++;}
-    delete[]c;
-}
-static void bb_find(const char* a, Window* t) {
-    const char* np=nullptr;
-    if(a&&strstr(a,"-name")){const char* p=strstr(a,"-name")+5;while(*p==' ')p++;np=p;}
-    static fat_dir_entry_t ents[128]; int cnt=fat32_list_directory("/",ents,128);
-    for(int i=0;i<cnt;i++){char fn[13];fat32_get_fne_from_entry(&ents[i],fn);if(!np||strstr(fn,np)){t->console_print("./");t->console_print(fn);t->console_print("\n");}}
-}
-static void bb_touch(const char* f, Window* t) {
-    if(!f||!*f){t->console_print("Usage: touch <file>\n");return;}
-    fat_dir_entry_t e;uint32_t s,o;
-    if(fat32_find_entry(f,&e,&s,&o)!=0)fat32_write_file(f,"",0);
-}
-static void bb_hexdump(const char* f, Window* t) {
-    if(!f||!*f){t->console_print("Usage: hexdump <file>\n");return;}
-    char* c=fat32_read_file_as_string(f);
-    if(!c){t->console_print("hexdump: no such file\n");return;}
-    int len=strlen(c); const char* hx="0123456789abcdef"; char lb[80];
-    for(int i=0;i<len;i+=16){
-        int li=0;
-        lb[li++]=hx[(i>>12)&0xF];lb[li++]=hx[(i>>8)&0xF];lb[li++]=hx[(i>>4)&0xF];lb[li++]=hx[i&0xF];lb[li++]=':';lb[li++]=' ';
-        for(int j=0;j<16;j++){if(i+j<len){uint8_t b=(uint8_t)c[i+j];lb[li++]=hx[b>>4];lb[li++]=hx[b&0xF];}else{lb[li++]=' ';lb[li++]=' ';}lb[li++]=' ';if(j==7)lb[li++]=' ';}
-        lb[li++]=' ';lb[li++]='|';
-        for(int j=0;j<16&&i+j<len;j++){char ch=c[i+j];lb[li++]=(ch>=32&&ch<127)?ch:'.';}
-        lb[li++]='|';lb[li++]='\n';lb[li]='\0';t->console_print(lb);
-    }
-    delete[]c;
-}
-static void bb_sort(const char* f, Window* t) {
-    if(!f||!*f){t->console_print("Usage: sort <file>\n");return;}
-    char* c=fat32_read_file_as_string(f);
-    if(!c){t->console_print("sort: no such file\n");return;}
-    static char* ls[512]; int lc=0; char* p=c;
-    while(*p&&lc<512){ls[lc++]=p;while(*p&&*p!='\n')p++;if(*p=='\n'){*p='\0';p++;}}
-    for(int i=0;i<lc-1;i++) for(int j=0;j<lc-i-1;j++) if(strcmp(ls[j],ls[j+1])>0){char* tmp=ls[j];ls[j]=ls[j+1];ls[j+1]=tmp;}
-    for(int i=0;i<lc;i++){t->console_print(ls[i]);t->console_print("\n");}
-    delete[]c;
-}
-static void bb_uniq(const char* f, Window* t) {
-    if(!f||!*f){t->console_print("Usage: uniq <file>\n");return;}
-    char* c=fat32_read_file_as_string(f);
-    if(!c){t->console_print("uniq: no such file\n");return;}
-    char last[256]=""; char* p=c;
-    while(*p){char* ls=p;while(*p&&*p!='\n')p++;char sv=*p;*p='\0';if(strcmp(ls,last)!=0){t->console_print(ls);t->console_print("\n");strncpy(last,ls,255);}*p=sv;if(*p=='\n')p++;}
-    delete[]c;
-}
-static void bb_tac(const char* f, Window* t) {
-    if(!f||!*f){t->console_print("Usage: tac <file>\n");return;}
-    char* c=fat32_read_file_as_string(f);
-    if(!c){t->console_print("tac: no such file\n");return;}
-    static char* ls[512]; int lc=0; char* p=c;
-    while(*p&&lc<512){ls[lc++]=p;while(*p&&*p!='\n')p++;if(*p=='\n'){*p='\0';p++;}}
-    for(int i=lc-1;i>=0;i--){t->console_print(ls[i]);t->console_print("\n");}
-    delete[]c;
-}
-static void bb_strings(const char* f, Window* t) {
-    if(!f||!*f){t->console_print("Usage: strings <file>\n");return;}
-    char* c=fat32_read_file_as_string(f);
-    if(!c){t->console_print("strings: no such file\n");return;}
-    int len=strlen(c); char run[128]; int ri=0;
-    for(int i=0;i<=len;i++){uint8_t ch=(i<len)?(uint8_t)c[i]:0;if(ch>=32&&ch<127&&ri<127)run[ri++]=ch;else{if(ri>=4){run[ri]='\0';t->console_print(run);t->console_print("\n");}ri=0;}}
-    delete[]c;
-}
-static void bb_expr(const char* a, Window* t) {
-    if(!a||!*a){t->console_print("Usage: expr <num> <op> <num>\n");return;}
-    char buf[64];strncpy(buf,a,63);buf[63]='\0';
-    char* p=buf;
-    char* as2=p;while(*p&&*p!=' ')p++;if(*p){*p='\0';p++;}while(*p==' ')p++;
-    char* op=p;while(*p&&*p!=' ')p++;if(*p){*p='\0';p++;}while(*p==' ')p++;
-    char* bs=p;
-    int av=simple_atoi(as2),bv=simple_atoi(bs),r=0;
-    if(strcmp(op,"+")==0)r=av+bv;else if(strcmp(op,"-")==0)r=av-bv;else if(strcmp(op,"*")==0)r=av*bv;
-    else if(strcmp(op,"/")==0)r=bv?av/bv:0;else if(strcmp(op,"%")==0)r=bv?av%bv:0;
-    else if(strcmp(op,"=")==0)r=(av==bv);else if(strcmp(op,"!=")==0)r=(av!=bv);
-    else if(strcmp(op,"<")==0)r=(av<bv);else if(strcmp(op,">")==0)r=(av>bv);
-    else{t->console_print("expr: syntax error\n");return;}
-    char rb[32];int_to_string(r,rb);t->console_print(rb);t->console_print("\n");
-}
-static void bb_seq(const char* a, Window* t) {
-    if(!a||!*a){t->console_print("Usage: seq [first [incr]] last\n");return;}
-    char buf[64];strncpy(buf,a,63);buf[63]='\0';
-    int nums[3]={1,1,1};int cnt=0;char* p=buf;
-    while(*p&&cnt<3){while(*p==' ')p++;if(!*p)break;nums[cnt++]=simple_atoi(p);while(*p&&*p!=' ')p++;}
-    int first,incr,last2;
-    if(cnt==1){first=1;incr=1;last2=nums[0];}else if(cnt==2){first=nums[0];incr=1;last2=nums[1];}else{first=nums[0];incr=nums[1];last2=nums[2];}
-    if(incr==0){t->console_print("seq: zero increment\n");return;}
-    char nb[32];int iter=0;
-    for(int i=first;(incr>0?i<=last2:i>=last2)&&iter<1000;i+=incr,iter++){int_to_string(i,nb);t->console_print(nb);t->console_print("\n");}
-}
-static void bb_df(Window* t) {
-    if(!ahci_base||!current_directory_cluster){t->console_print("df: filesystem not available\n");return;}
-    uint32_t cs=bpb.sec_per_clus*SECTOR_SIZE;
-    uint32_t tc=(bpb.tot_sec32-data_start_sector)/bpb.sec_per_clus;
-    uint32_t fc=0; uint32_t sc=tc<2048?tc:2048;
-    for(uint32_t i=2;i<sc+2;i++) if(read_fat_entry(i)==FAT_FREE_CLUSTER)fc++;
-    if(tc>2048)fc=(uint32_t)((uint64_t)fc*tc/sc);
-    uint32_t uc=tc-fc;
-    char b[128];
-    t->console_print("Filesystem     1K-blocks     Used Available Use% Mounted\n");
-    snprintf(b,128,"/dev/sda       %9d %8d %9d %3d%%  /\n",(tc*cs)/1024,(uc*cs)/1024,(fc*cs)/1024,tc?(uc*100/tc):0);
-    t->console_print(b);
-}
-static void bb_free(Window* t) {
-    t->console_print("              total        used        free\n");
-    t->console_print("Mem:           8192  (kernel heap, no page tracking)\n");
-    t->console_print("Swap:             0           0           0\n");
-}
-static void bb_uname(const char* a, Window* t) {
-    bool all=a&&strstr(a,"-a");
-    if(!a||!*a){t->console_print("RTOS++\n");return;}
-    char b[128];b[0]='\0';
-    if(all||strstr(a,"-s"))strcat(b,"RTOS++ ");
-    if(all||strstr(a,"-n"))strcat(b,"rtos-box ");
-    if(all||strstr(a,"-r"))strcat(b,"1.0.0 ");
-    if(all||strstr(a,"-m"))strcat(b,"i686 ");
-    int bl=strlen(b); if(bl>0&&b[bl-1]==' ')b[bl-1]='\n'; else strcat(b,"\n");
-    t->console_print(b);
-}
-static void bb_date(Window* t) {
-    RTC_Time r=read_rtc();
-    const char* d[]={"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
-    const char* m[]={"","Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
-    int mo=r.month,y=r.year,dy=r.day; if(mo<3){mo+=12;y--;}
-    int dow=(dy+(13*(mo+1)/5)+y+y/4-y/100+y/400)%7; if(dow<0)dow+=7;
-    char b[80];
-    snprintf(b,80,"%s %s %2d %02d:%02d:%02d UTC %d\n",d[dow%7],(r.month>=1&&r.month<=12)?m[r.month]:"???",r.day,r.hour,r.minute,r.second,r.year);
-    t->console_print(b);
-}
-static void bb_uptime(Window* t) {
-    uint32_t s=g_timer_ticks/30,mn=s/60,h=mn/60;mn%=60;
-    char b[80];snprintf(b,80," up %d:%02d,  load average: 0.00 0.00 0.00\n",h,mn);t->console_print(b);
-}
-static void bb_dmesg(Window* t) {
-    t->console_print("[    0.000000] RTOS++ v1.0 starting\n");
-    t->console_print("[    0.001000] Memory allocator init (8MB heap)\n");
-    t->console_print("[    0.002000] Framebuffer: 32bpp linear\n");
-    t->console_print("[    0.010000] PS/2 controller detected\n");
-    t->console_print("[    0.050000] Mouse driver loaded\n");
-    if(ahci_base){char b[80];snprintf(b,80,"[    0.100000] AHCI at 0x%x port %d\n",(uint32_t)ahci_base,g_ahci_port);t->console_print(b);t->console_print("[    0.200000] FAT32 mounted on /\n");}
-    else t->console_print("[    0.100000] AHCI: not found\n");
-    t->console_print("[    0.310000] TinyVM ready\n");
-    t->console_print("[    0.320000] BusyBox native shell loaded\n");
-}
-static void bb_env(Window* t) {
-    t->console_print("PATH=/\nHOME=/\nSHELL=/bin/sh\nTERM=vt100\nUSER=root\nOS=RTOS++\nBUSYBOX=native-1.36\n");
-}
-static void bb_pwd(Window* t)      { t->console_print("/\n"); }
-static void bb_hostname(Window* t) { t->console_print("rtos-box\n"); }
-static void bb_whoami(Window* t)   { t->console_print("root\n"); }
-static void bb_id(Window* t)       { t->console_print("uid=0(root) gid=0(root) groups=0(root)\n"); }
-static void bb_which(const char* cmd, Window* t) {
-    if(!cmd||!*cmd){t->console_print("Usage: which <cmd>\n");return;}
-    const char* bi[]={"sh","ash","ls","cat","echo","grep","wc","head","tail","find","touch",
-        "hexdump","sort","uniq","tac","strings","expr","seq","df","free","uname","date",
-        "uptime","dmesg","env","pwd","hostname","whoami","id","which","yes","cksum",
-        "ps","kill","help","clear","edit","run","compile","cp","mv","rm","busybox",nullptr};
-    for(int i=0;bi[i];i++){if(strcmp(cmd,bi[i])==0){t->console_print("/bin/");t->console_print(cmd);t->console_print("\n");return;}}
-    fat_dir_entry_t e;uint32_t s,o;
-    if(fat32_find_entry(cmd,&e,&s,&o)==0){t->console_print("./");t->console_print(cmd);t->console_print("\n");return;}
-    t->console_print(cmd);t->console_print(": not found\n");
-}
-static void bb_yes(const char* a, Window* t) {
-    const char* m=(a&&*a)?a:"y";
-    for(int i=0;i<20;i++){t->console_print(m);t->console_print("\n");}
-}
-static void bb_cksum(const char* f, Window* t) {
-    if(!f||!*f){t->console_print("Usage: cksum <file>\n");return;}
-    char* c=fat32_read_file_as_string(f);
-    if(!c){t->console_print("cksum: no such file\n");return;}
-    uint32_t sum=0;int len=strlen(c);
-    for(int i=0;i<len;i++)sum=sum*31+(uint8_t)c[i];
-    const char* hx="0123456789abcdef"; char hex[9]; uint32_t s=sum;
-    for(int i=7;i>=0;i--){hex[i]=hx[s&0xF];s>>=4;}hex[8]='\0';
-    char b[64];snprintf(b,64,"%s  %d  %s\n",hex,len,f);t->console_print(b);
-    delete[]c;
-}
-static void bb_sleep(const char* a, Window* t) {
-    if(!a||!*a){t->console_print("Usage: sleep <seconds>\n");return;}
-    int s=simple_atoi(a);
-    if(s<1||s>10){t->console_print("sleep: 1-10 seconds only\n");return;}
-    uint32_t tgt=g_timer_ticks+(uint32_t)(s*30);
-    while(g_timer_ticks<tgt)asm volatile("pause");
-}
-
-// Central dispatcher — returns true if command was handled
-static bool bb_dispatch(const char* command, const char* args, Window* term) {
-    if(strcmp(command,"sh")==0||strcmp(command,"ash")==0){
-        g_busybox.active=true;
-        term->console_print("\nBusyBox v1.36.1 (RTOS++ native shell)\n");
-        term->console_print("Type 'exit' to return to RTOS++ prompt.\n\n");
-        term->console_print(g_busybox.prompt);
-        return true;
-    }
-    if(strcmp(command,"exit")==0&&g_busybox.active){g_busybox.active=false;term->console_print("\n");return true;}
-    if(strcmp(command,"cat")==0)    {bb_cat(get_arg(const_cast<char*>(args),0),term);return true;}
-    if(strcmp(command,"echo")==0)   {bb_echo(args,term);return true;}
-    if(strcmp(command,"tac")==0)    {bb_tac(get_arg(const_cast<char*>(args),0),term);return true;}
-    if(strcmp(command,"strings")==0){bb_strings(get_arg(const_cast<char*>(args),0),term);return true;}
-    if(strcmp(command,"hexdump")==0){bb_hexdump(get_arg(const_cast<char*>(args),0),term);return true;}
-    if(strcmp(command,"head")==0)   {bb_head(args,term);return true;}
-    if(strcmp(command,"tail")==0)   {bb_tail(args,term);return true;}
-    if(strcmp(command,"sort")==0)   {bb_sort(get_arg(const_cast<char*>(args),0),term);return true;}
-    if(strcmp(command,"uniq")==0)   {bb_uniq(get_arg(const_cast<char*>(args),0),term);return true;}
-    if(strcmp(command,"wc")==0)     {bb_wc(get_arg(const_cast<char*>(args),0),term);return true;}
-    if(strcmp(command,"grep")==0){
-        char ac[120];strncpy(ac,args,119);ac[119]='\0';
-        char* pat=get_arg(ac,0); char* fi=get_arg(ac,1);
-        bb_grep(pat,fi,term);return true;
-    }
-    if(strcmp(command,"find")==0)   {bb_find(args,term);return true;}
-    if(strcmp(command,"touch")==0)  {bb_touch(get_arg(const_cast<char*>(args),0),term);return true;}
-    if(strcmp(command,"pwd")==0)    {bb_pwd(term);return true;}
-    if(strcmp(command,"expr")==0)   {bb_expr(args,term);return true;}
-    if(strcmp(command,"seq")==0)    {bb_seq(args,term);return true;}
-    if(strcmp(command,"yes")==0)    {bb_yes(args,term);return true;}
-    if(strcmp(command,"cksum")==0)  {bb_cksum(get_arg(const_cast<char*>(args),0),term);return true;}
-    if(strcmp(command,"uname")==0)  {bb_uname(args,term);return true;}
-    if(strcmp(command,"date")==0)   {bb_date(term);return true;}
-    if(strcmp(command,"uptime")==0) {bb_uptime(term);return true;}
-    if(strcmp(command,"dmesg")==0)  {bb_dmesg(term);return true;}
-    if(strcmp(command,"df")==0)     {bb_df(term);return true;}
-    if(strcmp(command,"free")==0)   {bb_free(term);return true;}
-    if(strcmp(command,"env")==0)    {bb_env(term);return true;}
-    if(strcmp(command,"hostname")==0){bb_hostname(term);return true;}
-    if(strcmp(command,"whoami")==0) {bb_whoami(term);return true;}
-    if(strcmp(command,"id")==0)     {bb_id(term);return true;}
-    if(strcmp(command,"which")==0)  {bb_which(get_arg(const_cast<char*>(args),0),term);return true;}
-    if(strcmp(command,"sleep")==0)  {bb_sleep(args,term);return true;}
-    return false;
-}
-
 class FileExplorerWindow : public Window {
 private:
     char current_path[256];
@@ -3444,6 +3073,41 @@ char get_char() {
             return 0;
         }
     }
+}
+
+
+// ============================================================
+// Integer Conversion Functions
+// ============================================================
+
+void int_to_string(int value, char* buffer) {
+    if (!buffer) return;
+    
+    if (value == 0) {
+        buffer[0] = '0';
+        buffer[1] = 0;
+        return;
+    }
+    
+    int negative = value < 0;
+    if (negative) value = -value;
+    
+    int i = 0;
+    char temp[16];
+    
+    while (value > 0) {
+        temp[i++] = '0' + (value % 10);
+        value /= 10;
+    }
+    
+    int j = 0;
+    if (negative) buffer[j++] = '-';
+    
+    while (i > 0) {
+        buffer[j++] = temp[--i];
+    }
+    
+    buffer[j] = 0;
 }
 
 
@@ -4813,6 +4477,44 @@ extern "C" void cmd_compile(uint64_t ahci_base, int port, const char* filename){
 }
 
 
+// --- Command parsing helper ---
+char* get_arg(char* args, int n) {
+    char* p = args;
+
+    // Loop to find the start of the Nth argument
+    for (int i = 0; i < n; i++) {
+        // Skip leading spaces for the current argument
+        while (*p && *p == ' ') p++;
+
+        // If we're at the end of the string, the requested arg doesn't exist
+        if (*p == '\0') return nullptr;
+
+        // Skip over the content of the current argument
+        if (*p == '"') {
+            p++; // Skip opening quote
+            while (*p && *p != '"') p++;
+            if (*p == '"') p++; // Skip closing quote
+        } else {
+            while (*p && *p != ' ') p++;
+        }
+    }
+
+    // Now p is at the start of the Nth argument (or spaces before it)
+    while (*p && *p == ' ') p++;
+    if (*p == '\0') return nullptr;
+
+    char* arg_start = p;
+    if (*p == '"') {
+        arg_start++; // The actual argument starts after the quote
+        p++;
+        while (*p && *p != '"') p++;
+        if (*p == '"') *p = '\0'; // Place null terminator on the closing quote
+    } else {
+        while (*p && *p != ' ') p++;
+        if (*p) *p = '\0'; // Place null terminator on the space
+    }
+    return arg_start;
+}
 
 
     // Separate process tables
@@ -5561,119 +5263,263 @@ void list_elf_processes(TerminalWindow* terminal) {
     }
 }
 
-void handle_command() {   // ← rename to handle_command when pasting
+// --- Terminal command handler ---
+void handle_command() {
     int selected_port = 0;
     char cmd_line[120];
-    strncpy(cmd_line, current_line, 119); cmd_line[119]='\0';
+    strncpy(cmd_line, current_line, 119);
+    cmd_line[119] = '\0';
 
     char* command = cmd_line;
-    while(*command==' ') command++;
-    if(!*command) { if(!in_editor) print_prompt(); return; }
+    while (*command && *command == ' ') {
+        command++;
+    }
+
+    if (*command == '\0') {
+        if (!in_editor) print_prompt();
+        return;
+    }
 
     char* args = command;
-    while(*args&&*args!=' ') args++;
-    if(*args) { *args='\0'; args++; while(*args==' ') args++; }
+    while (*args && *args != ' ') {
+        args++;
+    }
+    if (*args) {
+        *args = '\0'; 
+        args++;       
+        while (*args && *args == ' ') {
+            args++;
+        }
+    }
 
-    
-
-    // ── Compiler / VM ─────────────────────────────────────────────────────────
-    if(strcmp(command,"compile")==0){cmd_compile(ahci_base,selected_port,get_arg(args,0));goto done;}
-    if(strcmp(command,"run")==0)    {cmd_run(ahci_base,selected_port,get_arg(args,0));goto done;}
-    if(strcmp(command,"exec")==0)   {cmd_exec(get_arg(args,0));goto done;}
-
-    // ── Process management ────────────────────────────────────────────────────
-    if(strcmp(command,"ps")==0)      {list_run_processes();list_exec_processes();goto done;}
-    if(strcmp(command,"killrun")==0) {kill_run_process(simple_atoi(get_arg(args,0)));goto done;}
-    if(strcmp(command,"killexec")==0){kill_exec_process(simple_atoi(get_arg(args,0)));goto done;}
-    if(strcmp(command,"pself")==0)   {list_elf_processes(this);goto done;}
-    if(strcmp(command,"killelf")==0) {char* a=get_arg(args,0);if(a)kill_elf_process(simple_atoi(a));else console_print("Usage: killelf <slot>\n");goto done;}
-
-    // ── Filesystem ────────────────────────────────────────────────────────────
-    if(strcmp(command,"ls")==0)     {fat32_list_files();goto done;}
-    if(strcmp(command,"clear")==0)  {line_count=0;memset(buffer,0,sizeof(buffer));goto done;}
-    if(strcmp(command,"rm")==0)     {char* f=get_arg(args,0);console_print(f&&fat32_remove_file(f)==0?"Removed.\n":"rm: failed / no such file.\n");goto done;}
-    if(strcmp(command,"cp")==0)     {char ac[120],dc[120];strncpy(ac,args,119);strncpy(dc,args,119);char* s=get_arg(ac,0);char* d=get_arg(dc,1);if(!s||!d){console_print("Usage: cp <src> <dest>\n");goto done;}console_print(fat32_copy_file(s,d)==0?"Copied.\n":"Copy failed.\n");goto done;}
-    if(strcmp(command,"mv")==0)     {char ac[120],dc[120];strncpy(ac,args,119);strncpy(dc,args,119);char* s=get_arg(ac,0);char* d=get_arg(dc,1);if(!s||!d){console_print("Usage: mv <src> <dest>\n");goto done;}console_print(fat32_rename_file(s,d)==0?"Moved.\n":"mv: failed.\n");goto done;}
-    if(strcmp(command,"formatfs")==0){fat32_format();goto done;}
-    if(strcmp(command,"chkdsk")==0) {bool f=strstr(args,"/f")||strstr(args,"/F");bool r=strstr(args,"/r")||strstr(args,"/R");if(r)f=true;chkdsk(f,true);if(r)chkdsk_full_scan(f);goto done;}
-
-    // ── Editor ────────────────────────────────────────────────────────────────
-    if(strcmp(command,"edit")==0){
-        char* fn=get_arg(args,0);
-        if(!fn){console_print("Usage: edit <filename>\n");goto done;}
-        strncpy(edit_filename,fn,31);edit_filename[31]='\0';
-        in_editor=true;edit_current_line=0;edit_cursor_col=0;edit_scroll_offset=0;
-        char* content=fat32_read_file_as_string(fn);
-        if(content){
-            int lct=1;for(char* p=content;*p;p++)if(*p=='\n')lct++;
-            edit_lines=new char*[lct];edit_line_count=0;
-            char* ls2=content;
-            for(char* p=content;*p;p++){
-                if(*p=='\n'){*p='\0';edit_lines[edit_line_count]=new char[TERM_WIDTH];memset(edit_lines[edit_line_count],0,TERM_WIDTH);strncpy(edit_lines[edit_line_count],ls2,TERM_WIDTH-1);edit_line_count++;ls2=p+1;}
+    if (strcmp(command, "help") == 0) { console_print("Commands: help, clear, busybox, pself, killelf, killexec, killrun, ps, ls, edit, aesdec, aesenc, run, rm, cp, mv, formatfs, chkdsk ( /r /f), time, version\n"); }
+        else if (strcmp(command, "aesenc") == 0 || strcmp(command, "aesdec") == 0) {
+            bool encrypt = strcmp(command, "aesenc") == 0;
+            char* key_hex = get_arg(args, 0);
+            char* infile = get_arg(args, 1);
+            char* outfile = get_arg(args, 2);
+            if (!key_hex || !infile || !outfile || strlen(key_hex) != 32) {
+                console_print(encrypt ? "Usage: aesenc <32hexkey> <in> <out>\n" : "Usage: aesdec <32hexkey> <in> <out>\n");
+                return;
             }
-            if(*ls2){edit_lines[edit_line_count]=new char[TERM_WIDTH];memset(edit_lines[edit_line_count],0,TERM_WIDTH);strncpy(edit_lines[edit_line_count],ls2,TERM_WIDTH-1);edit_line_count++;}
-            delete[]content;
-        } else {
-            edit_lines=new char*[1];edit_lines[0]=new char[TERM_WIDTH];memset(edit_lines[0],0,TERM_WIDTH);edit_line_count=1;
+            bool ok = encrypt ? aes_encrypt_file(key_hex, infile, outfile) : aes_decrypt_file(key_hex, infile, outfile);
+            console_print(ok ? "AES operation successful.\n" : "AES failed.\n");
         }
-        goto done;
-    }
-
-    // ── System info ───────────────────────────────────────────────────────────
-    if(strcmp(command,"time")==0)   {RTC_Time t=read_rtc();char b[64];snprintf(b,64,"%02d:%02d:%02d %02d/%02d/%d\n",t.hour,t.minute,t.second,t.day,t.month,t.year);console_print(b);goto done;}
-    if(strcmp(command,"version")==0){console_print("RTOS++ v1.0 | BusyBox native shell v1.36\n");goto done;}
-
-    // ── busybox <cmd> ─────────────────────────────────────────────────────────
-    if(strcmp(command,"busybox")==0){
-        if(!args||!*args){
-            console_print("\nBusyBox v1.36.1 (RTOS++ native) multi-call binary\n\n");
-            console_print("Usage: busybox [function [args...]]\n");
-            console_print("   or: busybox --list\n\n");
-            console_print("Available applets:\n");
-            console_print("  ash  cat  cksum  cp  date  df  dmesg  echo  env  expr\n");
-            console_print("  find free  grep  head  hexdump  hostname  id  ls  mv\n");
-            console_print("  ps  pwd  rm  seq  sh  sleep  sort  strings  tac  tail\n");
-            console_print("  touch  uname  uniq  uptime  wc  which  whoami  yes\n");
-        } else if(strcmp(args,"--list")==0){
-            const char* a[]={"ash","cat","cksum","cp","date","df","dmesg","echo","env","expr","find",
-                "free","grep","head","hexdump","hostname","id","ls","mv","ps","pwd","rm","seq","sh",
-                "sleep","sort","strings","tac","tail","touch","uname","uniq","uptime","wc","which","whoami","yes",nullptr};
-            for(int i=0;a[i];i++){console_print(a[i]);console_print("\n");}
+	
+	if (strcmp(command, "compile") == 0) {
+        cmd_compile(ahci_base, selected_port, get_arg(args, 0));
+    } else if (strcmp(command, "busybox") == 0) {
+        // Launch busybox with optional arguments
+        if (args && strlen(args) > 0) {
+            // Check if busybox file exists, if not extract it
+            char* test_data = fat32_read_file_as_string("busybox");
+            if (!test_data) {
+                console_print("BusyBox not found. Extracting from embedded image...\n");
+                if (extract_busybox_to_filesystem()) {
+                    console_print("BusyBox extracted successfully.\n");
+                } else {
+                    console_print("Failed to extract BusyBox.\n");
+                    return;
+                }
+            } else {
+                delete[] test_data;
+            }
+            
+            // Load and execute BusyBox ELF
+            console_print("Loading BusyBox: ");
+            console_print(args);
+            console_print("\n");
+            
+            // Build full command line
+            char full_args[256];
+            snprintf(full_args, 256, "busybox %s", args);
+            
+            int slot = load_and_execute_elf("busybox", full_args, this);
+            if (slot >= 0) {
+                console_print("BusyBox loaded successfully\n");
+            }
         } else {
-            char bb[120];strncpy(bb,args,119);bb[119]='\0';
-            char* bc=bb; char* br=bc; while(*br&&*br!=' ')br++; if(*br){*br='\0';br++;while(*br==' ')br++;}
-            if(!bb_dispatch(bc,br,this)){console_print("busybox: ");console_print(bc);console_print(": applet not found\n");}
+            console_print("Usage: busybox <command> [args]\n");
+            console_print("Example: busybox ls\n");
+            console_print("         busybox sh\n");
+            console_print("Available commands: ");
+            console_print("ls, cat, echo, sh, grep, find, etc.\n");
         }
-        goto done;
+    } else if (strcmp(command, "pself") == 0) {
+        // List ELF processes
+        list_elf_processes(this);
+    } else if (strcmp(command, "killelf") == 0) {
+        // Kill an ELF process
+        char* arg = get_arg(args, 0);
+        if (arg) {
+            int slot = simple_atoi(arg);
+            kill_elf_process(slot);
+            console_print("ELF process killed\n");
+        } else {
+            console_print("Usage: killelf <slot>\n");
+        }
+    } else if (strcmp(command, "run") == 0) {
+        cmd_run(ahci_base, selected_port, get_arg(args, 0));
     }
-
-    // ── Help ──────────────────────────────────────────────────────────────────
-    if(strcmp(command,"help")==0){
-        console_print("RTOS++ commands:\n");
-        console_print("  File/text : ls  cat  cp  mv  rm  touch  find  edit\n");
-        console_print("             grep  wc  head  tail  sort  uniq  tac  echo\n");
-        console_print("             hexdump  strings\n");
-        console_print("  System   : df  free  uname  date  uptime  dmesg  env\n");
-        console_print("             hostname  whoami  id  which  sleep  time\n");
-        console_print("  Math     : expr  seq  yes  cksum\n");
-        console_print("  Dev      : compile  run  exec  ps  killrun  killexec\n");
-        console_print("  Security : aesenc  aesdec\n");
-        console_print("  Disk     : chkdsk  formatfs  version  clear\n");
-        console_print("  Shell    : busybox sh  (or just: sh)\n");
-        goto done;
+    else if (strcmp(command, "exec") == 0) {
+        cmd_exec(get_arg(args, 0));
     }
-
-    // ── BusyBox bare commands (no prefix needed) ──────────────────────────────
-    if(bb_dispatch(command,args,this)) goto done;
-
-    // ── Unknown ───────────────────────────────────────────────────────────────
-    if(*command){console_print(command);console_print(": command not found\n");}
-
-done:
-    if(!in_editor){
-        if(g_busybox.active) push_line(g_busybox.prompt);
-        else                  print_prompt();
+    else if (strcmp(command, "ps") == 0) {
+        list_run_processes();
+        list_exec_processes();
     }
+    else if (strcmp(command, "killrun") == 0) {
+        kill_run_process(simple_atoi(get_arg(args, 0)));
+    }
+    else if (strcmp(command, "killexec") == 0) {
+        kill_exec_process(simple_atoi(get_arg(args, 0)));
+    }
+    else if (strcmp(command, "clear") == 0) { line_count = 0; memset(buffer, 0, sizeof(buffer)); }
+    else if (strcmp(command, "ls") == 0) { fat32_list_files(); }
+    else if (strcmp(command, "edit") == 0) {
+        char* filename = get_arg(args, 0);
+        if(filename) {
+            strncpy(edit_filename, filename, 31);
+            edit_filename[31] = '\0';
+            in_editor = true;
+            edit_current_line = 0;
+            edit_cursor_col = 0;
+            edit_scroll_offset = 0;
+            char* content = fat32_read_file_as_string(filename);
+            if (content) {
+                int line_count_temp = 1;
+                for (char* p = content; *p; p++) if (*p == '\n') line_count_temp++;
+                
+                edit_lines = new char*[line_count_temp];
+                edit_line_count = 0;
+                
+                char* line_start = content;
+                for (char* p = content; *p; p++) {
+                    if (*p == '\n') {
+                        *p = '\0';
+                        edit_lines[edit_line_count] = new char[120];
+                        memset(edit_lines[edit_line_count], 0, 120);
+                        strncpy(edit_lines[edit_line_count], line_start, 119);
+                        edit_line_count++;
+                        line_start = p + 1;
+                    }
+                }
+                if (*line_start) {
+                    edit_lines[edit_line_count] = new char[120];
+                    memset(edit_lines[edit_line_count], 0, 120);
+                    strncpy(edit_lines[edit_line_count], line_start, 119);
+                    edit_line_count++;
+                }
+                delete[] content;
+            } else {
+                edit_lines = new char*[1];
+                edit_lines[0] = new char[120];
+                memset(edit_lines[0], 0, 120);
+                edit_line_count = 1;
+            }
+        } else {
+            console_print("Usage: edit \"<filename>\"\n");
+        }
+    }
+    
+    else if (strcmp(command, "rm") == 0) { 
+        char* filename = get_arg(args, 0); 
+        if(filename) { 
+            if(fat32_remove_file(filename) == 0) 
+                console_print("File removed.\n"); 
+            else 
+                console_print("Failed to remove file.\n");
+        } else { 
+            console_print("Usage: rm \"<filename>\"\n");
+        }
+    }
+    else if (strcmp(command, "cp") == 0) {
+        char args_for_src[120];
+        strncpy(args_for_src, args, 119);
+        char* src = get_arg(args_for_src, 0);
+
+        char args_for_dest[120];
+        strncpy(args_for_dest, args, 119);
+        char* dest = get_arg(args_for_dest, 1);
+        
+        if(!src || !dest) { 
+            console_print("Usage: cp \"<source>\" \"<dest>\"\n"); 
+        } else {
+            fat_dir_entry_t entry;
+            uint32_t sector, offset;
+            if (fat32_find_entry(src, &entry, &sector, &offset) == 0) {
+                char* content = new char[entry.file_size];
+                if (content && read_data_from_clusters((entry.fst_clus_hi << 16) | entry.fst_clus_lo, content, entry.file_size)) {
+                    if(fat32_write_file(dest, content, entry.file_size) == 0) {
+                        console_print("Copied.\n");
+                    } else {
+                        console_print("Write failed.\n");
+                    }
+                } else {
+                    console_print("Read failed.\n");
+                }
+                if (content) delete[] content;
+            } else {
+                console_print("Source not found.\n");
+            }
+        }
+    }
+    else if (strcmp(command, "mv") == 0) {
+        char args_for_src[120];
+        strncpy(args_for_src, args, 119);
+        char* src = get_arg(args_for_src, 0);
+
+        char args_for_dest[120];
+        strncpy(args_for_dest, args, 119);
+        char* dest = get_arg(args_for_dest, 1);
+
+        if(!src || !dest) { 
+            console_print("Usage: mv \"<source>\" \"<dest>\"\n"); 
+        } else {
+            if(fat32_rename_file(src, dest) == 0) {
+                console_print("Moved.\n");
+            } else {
+                console_print("Failed. (Source not found or destination exists).\n");
+            }
+        }
+    }
+    else if (strcmp(command, "formatfs") == 0) { fat32_format(); }
+    else if (strcmp(command, "chkdsk") == 0) {
+        char* args_copy = new char[120];
+        strncpy(args_copy, args, 119);
+        args_copy[119] = '\0';
+        
+        bool fix = false;
+        bool fullscan = false;
+        
+        if (strstr(args_copy, "/f") || strstr(args_copy, "/F")) {
+            fix = true;
+        }
+        if (strstr(args_copy, "/r") || strstr(args_copy, "/R")) {
+            fix = true;
+            fullscan = true;
+        }
+        
+        chkdsk(fix, true);
+        
+        if (fullscan) {
+            chkdsk_full_scan(fix);
+        }
+        
+        delete[] args_copy;
+    }
+    else if (strcmp(command, "time") == 0) { 
+        RTC_Time t = read_rtc(); 
+        char buf[64]; 
+        snprintf(buf, 64, "%d:%d:%d %d/%d/%d\n", t.hour, t.minute, t.second, t.day, t.month, t.year); 
+        console_print(buf); 
+    }
+    else if (strcmp(command, "version") == 0) { console_print("RTOS++ v1.0 - Robust Parsing\n"); }
+    else if (strlen(command) > 0) { 
+        console_print("Unknown command.\n"); 
+    }
+    
+    if(!in_editor) print_prompt();
 }
 // ELF Loader implementation
 int load_and_execute_elf(const char* filename, const char* args, TerminalWindow* terminal) {
@@ -6471,7 +6317,7 @@ static void start_run_execution(int slot, int argc, const char* argv[], Window* 
     RunContext* ctx = &run_contexts[slot];
     ctx->vm.start_execution(ctx->prog, argc, argv, ctx->ahci_base, ctx->port, win);
     
-    // â† ADD THIS LINE:
+    // Ã¢â€ Â ADD THIS LINE:
     ctx->vm.bound_window = win;
     
     ctx->active = true;
@@ -6481,7 +6327,7 @@ static void start_exec_execution(int slot, int argc, const char* argv[], Window*
     ExecContext* ctx = &exec_contexts[slot];
     ctx->vm.start_execution(ctx->prog, argc, argv, 0, 0, win);
     
-    // â† ADD THIS LINE:
+    // Ã¢â€ Â ADD THIS LINE:
     ctx->vm.bound_window = win;
     
     ctx->active = true;
@@ -6690,10 +6536,1064 @@ void initialize_vm_subsystems() {
     init_exec_subsystem();
 }
 
+
 // =============================================================================
-// SECTION 8: OPTIONAL MANAGEMENT FUNCTIONS
+//  LINUX SYSCALL SHIM  â€”  kernel.cpp integration
+//  Implements int 0x80 dispatch so a static BusyBox ELF can run natively.
+// =============================================================================
+//
+//  HOW TO INTEGRATE  (four steps, each marked â–º)
+//
+//  â–º STEP 1  â€”  near the top of kernel.cpp, after all your #include / typedef
+//               lines but BEFORE any function definitions, paste this entire
+//               file verbatim.
+//
+//  â–º STEP 2  â€”  in kernel_main(), somewhere AFTER your existing IDT/PIC init
+//               but BEFORE you enable interrupts, add ONE line:
+//                   syscall_shim_init();
+//
+//  â–º STEP 3  â€”  if your kernel already calls  lidt  anywhere, change that
+//               call to also call  syscall_shim_install_gate()  right after,
+//               so our int 0x80 entry survives an IDT reload.
+//
+//  â–º STEP 4  â€”  in TerminalWindow::handle_command(), find the existing
+//               ELF-launch code ("exec", "busybox" etc.) and replace the
+//               body that calls load_and_execute_elf() with:
+//                   launch_elf_process(filename, args, this);
+//
+//  That's it. No other files need to change.
 // =============================================================================
 
+enum LinuxErrno {
+    LX_EPERM   =  1, LX_ENOENT  =  2, LX_ESRCH  =  3,
+    LX_EINTR   =  4, LX_EIO     =  5, LX_ENXIO  =  6, LX_EBADF = 9,
+    LX_ENOMEM  = 12, LX_EACCES  = 13, LX_EFAULT = 14,
+    LX_EBUSY   = 16, LX_EEXIST  = 17, LX_ENODEV = 19,
+    LX_EINVAL  = 22, LX_EMFILE  = 24, LX_ENOSPC = 28,
+    LX_ERANGE  = 34, LX_ENOSYS  = 38, LX_ENOTSUP= 95,
+};
+
+
+#define FAT_ATTR_DIRECTORY 0x10
+#include <cstddef>  // For offsetof
+// â”€â”€â”€ forward declarations so order doesn't matter â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+static int  sys_exit   (int pid, int code);
+static int  sys_write  (int pid, int fd, const char* buf, uint32_t n);
+static int  sys_read   (int pid, int fd, char* buf, uint32_t n);
+static int  sys_open   (int pid, const char* path, int flags, int mode);
+static int  sys_close  (int pid, int fd);
+void shim_run_process(int pid); // Added missing forward declaration
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//  SECTION 1  â€”  IDT gate installation
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+struct ShimIDTEntry {
+    uint16_t offset_lo;
+    uint16_t selector;
+    uint8_t  zero;
+    uint8_t  type_attr;   
+    uint16_t offset_hi;
+} __attribute__((packed));
+
+struct ShimIDTPtr {
+    uint16_t limit;
+    uint32_t base;
+} __attribute__((packed));
+
+static ShimIDTEntry* g_shim_idt_base = nullptr;
+static uint16_t      g_shim_idt_limit = 0;
+
+void syscall_shim_install_gate();
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//  SECTION 2  â€”  Linux ABI types (i386 32-bit)
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+struct SyscallFrame {
+    uint32_t edi, esi, ebp, esp_ignored;
+    uint32_t ebx, edx, ecx, eax;
+    uint32_t eip, cs, eflags;
+};
+
+
+#define LX_OK   0
+#define LX_ERR(e) (-(int)(e))
+
+#define LX_O_RDONLY  0
+#define LX_O_WRONLY  1
+#define LX_O_RDWR    2
+#define LX_O_CREAT   0100
+#define LX_O_TRUNC   01000
+#define LX_O_APPEND  02000
+#define LX_O_NONBLOCK 04000
+
+struct linux_stat {
+    uint16_t st_dev;      uint16_t __pad1;
+    uint32_t st_ino;
+    uint16_t st_mode;     uint16_t st_nlink;
+    uint16_t st_uid;      uint16_t st_gid;
+    uint16_t st_rdev;     uint16_t __pad2;
+    uint32_t st_size;
+    uint32_t st_blksize;
+    uint32_t st_blocks;
+    uint32_t st_atime;    uint32_t st_atime_nsec;
+    uint32_t st_mtime;    uint32_t st_mtime_nsec;
+    uint32_t st_ctime;    uint32_t st_ctime_nsec;
+    uint32_t __unused[2];
+} __attribute__((packed));
+
+struct linux_stat64 {
+    uint64_t st_dev;
+    uint8_t  __pad0[4];
+    uint32_t __st_ino;
+    uint32_t st_mode;     uint32_t st_nlink;
+    uint32_t st_uid;      uint32_t st_gid;
+    uint64_t st_rdev;
+    uint8_t  __pad3[4];
+    int64_t  st_size;
+    uint32_t st_blksize;
+    uint64_t st_blocks;
+    uint32_t st_atime;    uint32_t st_atime_nsec;
+    uint32_t st_mtime;    uint32_t st_mtime_nsec;
+    uint32_t st_ctime;    uint32_t st_ctime_nsec;
+    uint64_t st_ino;
+} __attribute__((packed));
+
+struct linux_utsname {
+    char sysname[65], nodename[65], release[65],
+         version[65], machine[65], domainname[65];
+};
+
+struct linux_winsize { uint16_t ws_row, ws_col, ws_xpixel, ws_ypixel; };
+#define LX_TIOCGWINSZ 0x5413
+#define LX_TIOCSWINSZ 0x5414
+#define LX_TCGETS     0x5401
+#define LX_TCSETS     0x5402
+#define LX_TCSETSW    0x5403
+#define LX_TCSETSF    0x5404
+#define LX_TIOCSPGRP  0x5410
+#define LX_TIOCGPGRP  0x540F
+#define LX_FIONREAD   0x541B
+
+struct linux_dirent64 {
+    uint64_t d_ino;
+    int64_t  d_off;
+    uint16_t d_reclen;
+    uint8_t  d_type;
+    char     d_name[1];
+};
+#define DT_UNKNOWN 0
+#define DT_REG     8
+#define DT_DIR     4
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//  SECTION 3  â€”  File descriptor table
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+#define SHIM_MAX_FDS   32
+#define SHIM_STDIN_BUF 1024
+
+enum FdType { FDT_FREE=0, FDT_STDIN, FDT_STDOUT, FDT_STDERR,
+              FDT_FILE_RO, FDT_FILE_RW, FDT_DIR, FDT_NULL };
+
+struct ShimFd {
+    FdType   type;
+    char     path[128];
+    uint32_t off;       
+    uint32_t size;      
+    char* data;      
+    bool     dirty;     
+};
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//  SECTION 4  â€”  Process table
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+#define SHIM_MAX_PROCS   4
+#define SHIM_HEAP_SIZE   (1 * 1024 * 1024)   
+#define SHIM_STACK_SIZE  (128 * 1024)         
+#define SHIM_MAX_LOAD    (8 * 1024 * 1024)    
+
+enum ProcState { PSTATE_FREE=0, PSTATE_RUNNING, PSTATE_BLOCKED_READ, PSTATE_ZOMBIE };
+
+struct ShimProcess {
+    ProcState state;
+    int       pid;
+    int       ppid;
+    int       exit_code;
+    uint8_t* image;        
+    uint32_t  image_sz;     
+    uint32_t  load_vaddr;   
+    uint8_t* heap;         
+    uint32_t  brk;          
+    uint8_t* stack;        
+    uint32_t  stack_sz;
+    uint32_t  entry_vaddr;  
+    uint32_t  user_esp;     
+    ShimFd    fds[SHIM_MAX_FDS];
+    char      ibuf[SHIM_STDIN_BUF];
+    int       ibuf_len;
+    int       ibuf_pos;
+    bool      ibuf_ready;   
+    Window* term;
+    char      cmdline[256];
+};
+
+static ShimProcess g_sprocs[SHIM_MAX_PROCS];
+static int         g_cur_pid   = -1;
+static int         g_pid_seq   = 100;
+
+static ShimProcess* shim_proc_find(int pid) {
+    for (int i = 0; i < SHIM_MAX_PROCS; i++)
+        if (g_sprocs[i].state != PSTATE_FREE && g_sprocs[i].pid == pid)
+            return &g_sprocs[i];
+    return nullptr;
+}
+
+static ShimProcess* shim_proc_alloc() {
+    for (int i = 0; i < SHIM_MAX_PROCS; i++) {
+        if (g_sprocs[i].state == PSTATE_FREE) {
+            ShimProcess* p = &g_sprocs[i];
+            memset(p, 0, sizeof(ShimProcess));
+            p->pid  = g_pid_seq++;
+            p->ppid = 1;
+            p->fds[0].type = FDT_STDIN;
+            p->fds[1].type = FDT_STDOUT;
+            p->fds[2].type = FDT_STDERR;
+            return p;
+        }
+    }
+    return nullptr;
+}
+
+static void shim_proc_free(ShimProcess* p) {
+    if (!p) return;
+    for (int i = 3; i < SHIM_MAX_FDS; i++) {
+        if (p->fds[i].data) {
+            if (p->fds[i].dirty && p->fds[i].path[0])
+                fat32_write_file(p->fds[i].path, p->fds[i].data, p->fds[i].size);
+            delete[] p->fds[i].data;
+            p->fds[i].data = nullptr;
+        }
+        p->fds[i].type = FDT_FREE;
+    }
+    if (p->image) { delete[] p->image; p->image = nullptr; }
+    if (p->heap)  { delete[] p->heap;  p->heap  = nullptr; }
+    if (p->stack) { delete[] p->stack; p->stack = nullptr; }
+    p->state = PSTATE_FREE;
+}
+
+static void shim_term_write(ShimProcess* p, const char* s, int n) {
+    if (!p || !p->term || !s || n <= 0) return;
+    char tmp[257];
+    while (n > 0) {
+        int chunk = n < 256 ? n : 256;
+        memcpy(tmp, s, chunk);
+        tmp[chunk] = '\0';
+        p->term->console_print(tmp);
+        s += chunk; n -= chunk;
+    }
+}
+
+static int shim_fd_alloc(ShimProcess* p) {
+    for (int i = 3; i < SHIM_MAX_FDS; i++)
+        if (p->fds[i].type == FDT_FREE) return i;
+    return LX_ERR(LX_EMFILE);
+}
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//  SECTION 5  â€”  Syscall implementations
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+static int sys_exit(int pid, int code) {
+    ShimProcess* p = shim_proc_find(pid);
+    if (!p) return 0;
+    p->exit_code = code;
+    if (p->term) {
+        char msg[64];
+        snprintf(msg, 64, "\n[pid %d exited: %d]\n", pid, code);
+        p->term->console_print(msg);
+
+    }
+    shim_proc_free(p);
+    if (g_cur_pid == pid) g_cur_pid = -1;
+    return 0;
+}
+
+static int sys_write(int pid, int fd, const char* buf, uint32_t n) {
+    ShimProcess* p = shim_proc_find(pid);
+    if (!p || !buf) return LX_ERR(LX_EFAULT);
+    if (n == 0) return 0;
+    if (n > 65536) n = 65536;
+
+    if (fd == 1 || fd == 2) {
+        shim_term_write(p, buf, (int)n);
+        return (int)n;
+    }
+    if (fd < 3 || fd >= SHIM_MAX_FDS) return LX_ERR(LX_EBADF);
+    ShimFd* f = &p->fds[fd];
+    if (f->type == FDT_FREE) return LX_ERR(LX_EBADF);
+    if (f->type == FDT_NULL) return (int)n;
+
+    uint32_t need = f->off + n + 1;
+    if (!f->data || need > f->size + 1) {
+        uint32_t new_cap = need + 4096;
+        char* nb = new char[new_cap];
+        if (!nb) return LX_ERR(LX_ENOMEM);
+        if (f->data && f->off) memcpy(nb, f->data, f->off);
+        if (f->data) delete[] f->data;
+        f->data = nb;
+    }
+    memcpy(f->data + f->off, buf, n);
+    f->off  += n;
+    if (f->off > f->size) f->size = f->off;
+    f->data[f->size] = '\0';
+    f->dirty = true;
+    return (int)n;
+}
+
+static int sys_read(int pid, int fd, char* buf, uint32_t n) {
+    ShimProcess* p = shim_proc_find(pid);
+    if (!p || !buf) return LX_ERR(LX_EFAULT);
+    if (n == 0) return 0;
+
+    if (fd == 0) {
+        if (!p->ibuf_ready) {
+            p->state = PSTATE_BLOCKED_READ;
+            return LX_ERR(LX_EINTR);  
+        }
+        int avail = p->ibuf_len - p->ibuf_pos;
+        int take  = (int)n < avail ? (int)n : avail;
+        memcpy(buf, p->ibuf + p->ibuf_pos, take);
+        p->ibuf_pos += take;
+        if (p->ibuf_pos >= p->ibuf_len) {
+            p->ibuf_ready = false;
+            p->ibuf_pos = p->ibuf_len = 0;
+        }
+        return take;
+    }
+
+    if (fd < 3 || fd >= SHIM_MAX_FDS) return LX_ERR(LX_EBADF);
+    ShimFd* f = &p->fds[fd];
+    if (f->type == FDT_FREE) return LX_ERR(LX_EBADF);
+    if (f->type == FDT_NULL || !f->data) return 0;
+
+    uint32_t avail = f->size > f->off ? f->size - f->off : 0;
+    if (!avail) return 0;
+    uint32_t take = n < avail ? n : avail;
+    memcpy(buf, f->data + f->off, take);
+    f->off += take;
+    return (int)take;
+}
+
+static int sys_open(int pid, const char* path, int flags, int mode) {
+    (void)mode;
+    ShimProcess* p = shim_proc_find(pid);
+    if (!p || !path) return LX_ERR(LX_EFAULT);
+
+    if (strcmp(path, "/dev/null") == 0 || strcmp(path, "/dev/zero") == 0) {
+        int fd = shim_fd_alloc(p);
+        if (fd < 0) return fd;
+        p->fds[fd].type = FDT_NULL;
+        return fd;
+    }
+
+    if (strncmp(path, "/proc", 5) == 0) return LX_ERR(LX_ENOENT);
+
+    if (flags & (LX_O_WRONLY | LX_O_RDWR | LX_O_CREAT)) {
+        int fd = shim_fd_alloc(p);
+        if (fd < 0) return fd;
+        ShimFd* f = &p->fds[fd];
+        f->type  = FDT_FILE_RW;
+        f->off   = 0;
+        f->size  = 0;
+        f->dirty = false;
+        f->data  = new char[1]; f->data[0] = '\0';
+        strncpy(f->path, path, 127);
+        if (flags & LX_O_TRUNC) fat32_remove_file(path);
+        return fd;
+    }
+
+    fat_dir_entry_t entry; uint32_t sec, off2;
+    if (fat32_find_entry(path, &entry, &sec, &off2) != 0)
+        return LX_ERR(LX_ENOENT);
+
+    char* content = fat32_read_file_as_string(path);
+    if (!content) return LX_ERR(LX_EIO);
+
+    int fd = shim_fd_alloc(p);
+    if (fd < 0) { delete[] content; return fd; }
+    ShimFd* f = &p->fds[fd];
+    f->type = FDT_FILE_RO;
+    f->data = content;
+    f->size = entry.file_size;
+    f->off  = 0;
+    strncpy(f->path, path, 127);
+    return fd;
+}
+
+static int sys_close(int pid, int fd) {
+    ShimProcess* p = shim_proc_find(pid);
+    if (!p) return LX_ERR(LX_EBADF);
+    if (fd < 3) return 0;  
+    if (fd >= SHIM_MAX_FDS) return LX_ERR(LX_EBADF);
+    ShimFd* f = &p->fds[fd];
+    if (f->type == FDT_FREE) return LX_ERR(LX_EBADF);
+    if (f->dirty && f->path[0] && f->data)
+        fat32_write_file(f->path, f->data, f->size);
+    if (f->data) { delete[] f->data; f->data = nullptr; }
+    f->type = FDT_FREE;
+    return 0;
+}
+
+static int sys_lseek(int pid, int fd, int32_t offset, int whence) {
+    ShimProcess* p = shim_proc_find(pid);
+    if (!p || fd < 0 || fd >= SHIM_MAX_FDS) return LX_ERR(LX_EBADF);
+    ShimFd* f = &p->fds[fd];
+    if (f->type == FDT_FREE) return LX_ERR(LX_EBADF);
+    uint32_t noff;
+    switch (whence) {
+        case 0: noff = (uint32_t)offset; break;
+        case 1: noff = f->off + (uint32_t)offset; break;
+        case 2: noff = f->size + (uint32_t)offset; break;
+        default: return LX_ERR(LX_EINVAL);
+    }
+    f->off = noff;
+    return (int)noff;
+}
+
+static int sys_brk(int pid, uint32_t addr) {
+    ShimProcess* p = shim_proc_find(pid);
+    if (!p) return LX_ERR(LX_ENOMEM);
+    if (!p->heap) {
+        p->heap = new uint8_t[SHIM_HEAP_SIZE];
+        if (!p->heap) return LX_ERR(LX_ENOMEM);
+        memset(p->heap, 0, SHIM_HEAP_SIZE);
+        p->brk = 0;
+    }
+    if (addr == 0)
+        return (int)(uintptr_t)(p->heap);
+    uintptr_t heap_start = (uintptr_t)p->heap;
+    if (addr < heap_start) return (int)heap_start;
+    uint32_t new_brk = addr - (uint32_t)heap_start;
+    if (new_brk > SHIM_HEAP_SIZE) return LX_ERR(LX_ENOMEM);
+    p->brk = new_brk;
+    return (int)addr;
+}
+
+static int sys_mmap(int pid, uint32_t length, int fd, uint32_t offset) {
+    ShimProcess* p = shim_proc_find(pid);
+    if (!p) return LX_ERR(LX_ENOMEM);
+    if (!p->heap) {
+        p->heap = new uint8_t[SHIM_HEAP_SIZE];
+        if (!p->heap) return LX_ERR(LX_ENOMEM);
+        memset(p->heap, 0, SHIM_HEAP_SIZE);
+        p->brk = 0;
+    }
+    length = (length + 4095) & ~4095u;
+    if (p->brk + length > SHIM_HEAP_SIZE) return LX_ERR(LX_ENOMEM);
+    int ret = (int)(uintptr_t)(p->heap + p->brk);
+    p->brk += length;
+    if (fd >= 3 && fd < SHIM_MAX_FDS && p->fds[fd].data) {
+        ShimFd* f = &p->fds[fd];
+        uint32_t copy_off = offset;
+        uint32_t copy_len = length < (f->size - copy_off) ? length : (f->size - copy_off);
+        if (copy_off < f->size)
+            memcpy((void*)(uintptr_t)ret, f->data + copy_off, copy_len);
+    }
+    return ret;
+}
+
+static int sys_uname(linux_utsname* buf) {
+    if (!buf) return LX_ERR(LX_EFAULT);
+    memset(buf, 0, sizeof(*buf));
+    strncpy(buf->sysname,    "Linux",       64);
+    strncpy(buf->nodename,   "rtos-box",    64);
+    strncpy(buf->release,    "3.10.108",    64);  
+    strncpy(buf->version,    "#1 RTOS++",   64);
+    strncpy(buf->machine,    "i686",        64);
+    strncpy(buf->domainname, "(none)",      64);
+    return 0;
+}
+
+static int sys_ioctl(int pid, int fd, uint32_t req, void* arg) {
+    (void)fd;
+    switch (req) {
+        case LX_TIOCGWINSZ:
+            if (arg) {
+                linux_winsize* ws = (linux_winsize*)arg;
+                ws->ws_row    = 40;
+                ws->ws_col    = 80;
+                ws->ws_xpixel = fb_info.width;
+                ws->ws_ypixel = fb_info.height;
+                return 0;
+            }
+            return LX_ERR(LX_EFAULT);
+        case LX_TCGETS:
+        case LX_TCSETS:
+        case LX_TCSETSW:
+        case LX_TCSETSF:
+            return 0;
+        case LX_TIOCSPGRP:
+        case LX_TIOCGPGRP:
+            if (arg) { *(int*)arg = pid; } return 0;
+        case LX_FIONREAD:
+            if (arg) {
+                ShimProcess* pp = shim_proc_find(pid);
+                *(int*)arg = (pp && pp->ibuf_ready) ? pp->ibuf_len - pp->ibuf_pos : 0;
+            }
+            return 0;
+        default:
+            return LX_ERR(LX_EINVAL);
+    }
+}
+
+static void fill_linux_stat(linux_stat* st, uint32_t size, bool is_dir) {
+    memset(st, 0, sizeof(*st));
+    st->st_dev    = 1;
+    st->st_ino    = 1;
+    st->st_mode   = is_dir ? (uint16_t)0x41ED : (uint16_t)0x81A4;
+    st->st_nlink  = is_dir ? 2 : 1;
+    st->st_size   = size;
+    st->st_blksize= 512;
+    st->st_blocks = (size + 511) / 512;
+    st->st_atime  = st->st_mtime = st->st_ctime = g_timer_ticks / 30;
+}
+
+static void fill_linux_stat64(linux_stat64* st, uint32_t size, bool is_dir) {
+    memset(st, 0, sizeof(*st));
+    st->st_dev    = 1;
+    st->st_ino    = 1;
+    st->st_mode   = is_dir ? 0x41EDu : 0x81A4u;
+    st->st_nlink  = is_dir ? 2 : 1;
+    st->st_size   = size;
+    st->st_blksize= 512;
+    st->st_blocks = (size + 511) / 512;
+    st->st_atime  = st->st_mtime = st->st_ctime = g_timer_ticks / 30;
+}
+
+static int sys_stat(const char* path, linux_stat* buf) {
+    if (!path || !buf) return LX_ERR(LX_EFAULT);
+    if (path[0]=='/'&&path[1]=='\0') { fill_linux_stat(buf,0,true); return 0; }
+    if (strcmp(path,".")==0||strcmp(path,"..")==0) { fill_linux_stat(buf,0,true); return 0; }
+    fat_dir_entry_t e; uint32_t s,o;
+    if (fat32_find_entry(path,&e,&s,&o)!=0) return LX_ERR(LX_ENOENT);
+    bool dir = (e.attr & FAT_ATTR_DIRECTORY) != 0;
+    fill_linux_stat(buf, dir ? 0 : e.file_size, dir);
+    return 0;
+}
+
+static int sys_stat64(const char* path, linux_stat64* buf) {
+    if (!path || !buf) return LX_ERR(LX_EFAULT);
+    if (path[0]=='/'&&path[1]=='\0') { fill_linux_stat64(buf,0,true); return 0; }
+    if (strcmp(path,".")==0||strcmp(path,"..")==0) { fill_linux_stat64(buf,0,true); return 0; }
+    fat_dir_entry_t e; uint32_t s,o;
+    if (fat32_find_entry(path,&e,&s,&o)!=0) return LX_ERR(LX_ENOENT);
+    bool dir = (e.attr & FAT_ATTR_DIRECTORY) != 0;
+    fill_linux_stat64(buf, dir ? 0 : e.file_size, dir);
+    return 0;
+}
+
+static int sys_fstat(int pid, int fd, linux_stat* buf) {
+    ShimProcess* p = shim_proc_find(pid);
+    if (!buf) return LX_ERR(LX_EFAULT);
+    if (fd == 0 || fd == 1 || fd == 2) {
+        fill_linux_stat(buf, 0, false);
+        buf->st_mode = 0x2190;  
+        return 0;
+    }
+    if (!p || fd < 0 || fd >= SHIM_MAX_FDS) return LX_ERR(LX_EBADF);
+    ShimFd* f = &p->fds[fd];
+    if (f->type == FDT_FREE) return LX_ERR(LX_EBADF);
+    fill_linux_stat(buf, f->size, f->type == FDT_DIR);
+    return 0;
+}
+
+static int sys_fstat64(int pid, int fd, linux_stat64* buf) {
+    ShimProcess* p = shim_proc_find(pid);
+    if (!buf) return LX_ERR(LX_EFAULT);
+    if (fd == 0 || fd == 1 || fd == 2) {
+        fill_linux_stat64(buf, 0, false);
+        buf->st_mode = 0x2190;
+        return 0;
+    }
+    if (!p || fd < 0 || fd >= SHIM_MAX_FDS) return LX_ERR(LX_EBADF);
+    ShimFd* f = &p->fds[fd];
+    if (f->type == FDT_FREE) return LX_ERR(LX_EBADF);
+    fill_linux_stat64(buf, f->size, f->type == FDT_DIR);
+    return 0;
+}
+
+static int sys_access(const char* path) {
+    if (!path) return LX_ERR(LX_EFAULT);
+    if (strcmp(path,"/")==0||strcmp(path,".")==0) return 0;
+    fat_dir_entry_t e; uint32_t s,o;
+    return fat32_find_entry(path,&e,&s,&o)==0 ? 0 : LX_ERR(LX_ENOENT);
+}
+
+static int sys_getdents64(linux_dirent64* buf, uint32_t count) {
+    if (!buf) return LX_ERR(LX_EFAULT);
+    static fat_dir_entry_t ents[256];
+    int num = fat32_list_directory("/", ents, 256);
+
+    uint8_t* out = (uint8_t*)buf;
+    uint32_t written = 0;
+
+    const char* dots[2] = {".", ".."};
+    for (int d = 0; d < 2; d++) {
+        int nlen  = strlen(dots[d]);
+        int rlen  = (int)((offsetof(linux_dirent64, d_name) + nlen + 1 + 7) & ~7u);
+        if (written + (uint32_t)rlen > count) break;
+        linux_dirent64* ent = (linux_dirent64*)out;
+        ent->d_ino    = (d == 0) ? 1 : 2;
+        ent->d_off    = written + rlen;
+        ent->d_reclen = (uint16_t)rlen;
+        ent->d_type   = DT_DIR;
+        strcpy(ent->d_name, dots[d]);
+        out += rlen; written += rlen;
+    }
+
+    for (int i = 0; i < num; i++) {
+        char fname[13]; fat32_get_fne_from_entry(&ents[i], fname);
+        bool is_dir = (ents[i].attr & FAT_ATTR_DIRECTORY) != 0;
+        int  nlen  = strlen(fname);
+        int  rlen  = (int)((offsetof(linux_dirent64, d_name) + nlen + 1 + 7) & ~7u);
+        if (written + (uint32_t)rlen > count) break;
+        linux_dirent64* ent = (linux_dirent64*)out;
+        ent->d_ino    = (uint64_t)(i + 3);
+        ent->d_off    = written + rlen;
+        ent->d_reclen = (uint16_t)rlen;
+        ent->d_type   = is_dir ? DT_DIR : DT_REG;
+        strcpy(ent->d_name, fname);
+        out += rlen; written += rlen;
+    }
+    return (int)written;
+}
+
+static int sys_readlink(int pid, const char* path, char* buf, uint32_t sz) {
+    ShimProcess* p = shim_proc_find(pid);
+    if (!path || !buf) return LX_ERR(LX_EFAULT);
+    if (strstr(path, "proc/self/exe") || strstr(path, "proc/self/fd")) {
+        const char* target = p ? p->cmdline : "/busybox";
+        int n = (int)strlen(target);
+        if ((uint32_t)n >= sz) n = (int)sz - 1;
+        memcpy(buf, target, n);
+        return n;
+    }
+    return LX_ERR(LX_ENOENT);
+}
+
+static int sys_getcwd(char* buf, uint32_t sz) {
+    if (!buf || sz < 2) return LX_ERR(LX_EINVAL);
+    buf[0] = '/'; buf[1] = '\0';
+    return 1;
+}
+
+static int sys_gettimeofday(void* tv) {
+    if (tv) {
+        uint32_t* t = (uint32_t*)tv;
+        t[0] = g_timer_ticks / 30;
+        t[1] = (g_timer_ticks % 30) * 33333;
+    }
+    return 0;
+}
+
+static int sys_nanosleep(const uint32_t* req) {
+    if (!req) return LX_ERR(LX_EFAULT);
+    uint32_t secs = req[0];
+    if (secs > 2) secs = 2;
+    uint32_t tgt = g_timer_ticks + secs * 30;
+    while (g_timer_ticks < tgt) asm volatile("pause");
+    return 0;
+}
+
+static int sys_rt_sigaction(void* oact) {
+    if (oact) memset(oact, 0, 16);
+    return 0;
+}
+static int sys_rt_sigprocmask(void* oset) {
+    if (oset) memset(oset, 0, 8);
+    return 0;
+}
+
+static int sys_fork(int pid) {
+    ShimProcess* parent = shim_proc_find(pid);
+    ShimProcess* child  = shim_proc_alloc();
+    if (!parent || !child) return LX_ERR(LX_ENOMEM);
+    child->ppid  = pid;
+    child->term  = parent->term;
+    for (int i = 0; i < SHIM_MAX_FDS; i++) child->fds[i] = parent->fds[i];
+    child->state = PSTATE_RUNNING;
+    return child->pid;
+}
+
+static int sys_waitpid(int pid, int wpid, int* status) {
+    for (int i = 0; i < SHIM_MAX_PROCS; i++) {
+        ShimProcess* c = &g_sprocs[i];
+        if (c->state == PSTATE_ZOMBIE &&
+            c->ppid == pid &&
+            (wpid == -1 || c->pid == wpid)) {
+            int cpid = c->pid;
+            if (status) *status = (c->exit_code & 0xFF) << 8;
+            shim_proc_free(c);
+            return cpid;
+        }
+    }
+    return LX_ERR(LX_EINTR);  
+}
+
+// Forward Declaration for sys_execve to use
+static int elf_load(ShimProcess* p, const char* filename);
+static uint32_t build_stack_frame(ShimProcess* p, int argc, char** argv, char** envp);
+
+static int sys_execve(int pid, const char* path, char** argv, char** envp) {
+    ShimProcess* p = shim_proc_find(pid);
+    if (!p || !path) return LX_ERR(LX_EFAULT);
+
+    const char* fname = path;
+    if (fname[0]=='.' && fname[1]=='/') fname += 2;
+    if (fname[0]=='/') fname++;  
+
+    int r = elf_load(p, fname);
+    if (r != 0) return r;
+
+    int argc = 0;
+    char* my_argv[32];
+    if (argv) while (argv[argc] && argc < 31) { my_argv[argc] = argv[argc]; argc++; }
+    my_argv[argc] = nullptr;
+
+    if (argc == 0) { my_argv[0] = const_cast<char*>(fname); argc = 1; }
+
+    p->user_esp = build_stack_frame(p, argc, my_argv, envp);
+    strncpy(p->cmdline, fname, 255);
+    p->state = PSTATE_RUNNING;
+    return 0;
+}
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//  SECTION 6  â€”  ELF loader
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+static int elf_load(ShimProcess* p, const char* filename) {
+    fat_dir_entry_t fent; uint32_t sec, foff;
+    if (fat32_find_entry(filename, &fent, &sec, &foff) != 0) return LX_ERR(LX_ENOENT);
+
+    uint32_t filesz = fent.file_size;
+    if (filesz < sizeof(Elf32_Ehdr) || filesz > SHIM_MAX_LOAD) return LX_ERR(LX_EINVAL);
+
+    char* elf = fat32_read_file_as_string(filename);
+    if (!elf) return LX_ERR(LX_EIO);
+
+    Elf32_Ehdr* eh = (Elf32_Ehdr*)elf;
+
+    if (eh->e_ident[0] != 0x7F || eh->e_ident[1] != 'E' ||
+        eh->e_ident[2] != 'L'  || eh->e_ident[3] != 'F') {
+        delete[] elf; return LX_ERR(LX_EINVAL);
+    }
+    if (eh->e_machine != 3 && eh->e_machine != 0) {
+        delete[] elf; return LX_ERR(LX_EINVAL);
+    }
+
+    Elf32_Phdr* ph = (Elf32_Phdr*)(elf + eh->e_phoff);
+    uint32_t lo = 0xFFFFFFFFu, hi = 0;
+    for (int i = 0; i < eh->e_phnum; i++) {
+        if (ph[i].p_type == 1) {
+            if (ph[i].p_vaddr < lo) lo = ph[i].p_vaddr;
+            uint32_t end = ph[i].p_vaddr + ph[i].p_memsz;
+            if (end > hi) hi = end;
+        }
+    }
+    if (hi <= lo) { delete[] elf; return LX_ERR(LX_EINVAL); }
+
+    uint32_t img_sz = hi - lo;
+
+    if (p->image) { delete[] p->image; p->image = nullptr; }
+    if (p->heap)  { delete[] p->heap;  p->heap  = nullptr; }
+    if (p->stack) { delete[] p->stack; p->stack = nullptr; }
+
+    p->image     = new uint8_t[img_sz + SHIM_HEAP_SIZE];
+    if (!p->image) { delete[] elf; return LX_ERR(LX_ENOMEM); }
+    memset(p->image, 0, img_sz + SHIM_HEAP_SIZE);
+
+    p->image_sz   = img_sz;
+    p->load_vaddr = lo;
+    p->heap       = p->image + img_sz;
+    p->brk        = 0;
+
+    for (int i = 0; i < eh->e_phnum; i++) {
+        if (ph[i].p_type == 1) {
+            uint32_t dst = ph[i].p_vaddr - lo;
+            if (ph[i].p_filesz > 0)
+                memcpy(p->image + dst, elf + ph[i].p_offset, ph[i].p_filesz);
+        }
+    }
+
+    p->stack    = new uint8_t[SHIM_STACK_SIZE];
+    p->stack_sz = SHIM_STACK_SIZE;
+    memset(p->stack, 0, SHIM_STACK_SIZE);
+
+    p->entry_vaddr = eh->e_entry;
+
+    delete[] elf;
+    return 0;
+}
+
+static uint32_t build_stack_frame(ShimProcess* p, int argc, char** argv, char** envp) {
+    (void)envp;
+    uint8_t* stk_top = p->stack + p->stack_sz;
+    char* str_area = (char*)p->stack + 256;  
+    int   str_off  = 0;
+
+    char* argv_addrs[32];
+    for (int i = 0; i < argc && i < 31; i++) {
+        argv_addrs[i] = str_area + str_off;
+        strcpy(argv_addrs[i], argv[i]);
+        str_off += strlen(argv[i]) + 1;
+    }
+
+    uint32_t* sp = (uint32_t*)(stk_top - 64);
+
+    sp[0] = (uint32_t)argc;
+    for (int i = 0; i < argc; i++)
+        sp[1 + i] = (uint32_t)(uintptr_t)argv_addrs[i];
+    sp[1 + argc] = 0;     
+    sp[2 + argc] = 0;     
+    sp[3 + argc] = 0;     
+
+    return (uint32_t)(uintptr_t)sp;
+}
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//  SECTION 7  â€”  Central dispatcher
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+extern "C" int shim_syscall_dispatch(SyscallFrame* f) {
+    uint32_t nr = f->eax;
+    uint32_t a1 = f->ebx, a2 = f->ecx, a3 = f->edx,
+             a4 = f->esi, a5 = f->edi;
+    int pid = g_cur_pid;
+
+    switch (nr) {
+        case   1: return sys_exit(pid, (int)a1);
+        case   2: return sys_fork(pid);
+        case   3: return sys_read(pid, (int)a1, (char*)a2, a3);
+        case   4: return sys_write(pid, (int)a1, (const char*)a2, a3);
+        case   5: return sys_open(pid, (const char*)a1, (int)a2, (int)a3);
+        case   6: return sys_close(pid, (int)a1);
+        case   7: return sys_waitpid(pid, (int)a1, (int*)a2);
+        case  11: return sys_execve(pid, (const char*)a1, (char**)a2, (char**)a3);
+        case  12: return sys_getcwd((char*)a1, a2);
+        case  19: return sys_lseek(pid, (int)a1, (int32_t)a2, (int)a3);
+        case  20: { ShimProcess* p=shim_proc_find(pid); return p?p->pid:1; }
+        case  33: return sys_access((const char*)a1);
+        case  45: return sys_brk(pid, a1);
+        case  54: return sys_ioctl(pid, (int)a1, a2, (void*)a3);
+        case  78: return sys_gettimeofday((void*)a1);
+        case  85: return sys_readlink(pid, (const char*)a1, (char*)a2, a3);
+        case  90: return sys_mmap(pid, a2, (int)a5, 0);
+        case 106: return sys_stat((const char*)a1, (linux_stat*)a2);
+        case 108: return sys_fstat(pid, (int)a1, (linux_stat*)a2);
+        case 122: return sys_uname((linux_utsname*)a1);
+        case 141: return sys_getdents64((linux_dirent64*)a2, a3);
+        case 162: return sys_nanosleep((uint32_t*)a1);
+        case 174: return sys_rt_sigaction((void*)a3);
+        case 175: return sys_rt_sigprocmask((void*)a3);
+        case 183: return sys_getcwd((char*)a1, a2);
+        case 192: return sys_mmap(pid, a2, (int)a5, a5);
+        case 195: return sys_stat64((const char*)a1, (linux_stat64*)a2);
+        case 197: return sys_fstat64(pid, (int)a1, (linux_stat64*)a2);
+        case 252: return sys_exit(pid, (int)a1);  
+        default:
+            return LX_ERR(LX_ENOSYS);
+    }
+}
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//  SECTION 8  â€”  ISR naked stub
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+__attribute__((naked)) static void isr_int80() {
+    asm volatile(
+        "pusha\n\t"
+        "push  %%esp\n\t"             
+        "call  shim_syscall_dispatch\n\t"
+        "add   $4, %%esp\n\t"
+        "mov   %%eax, 28(%%esp)\n\t"  
+        "popa\n\t"
+        "iret\n\t"
+        ::: "memory"
+    );
+}
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//  SECTION 9  â€”  IDT management
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+void syscall_shim_install_gate() {
+    ShimIDTPtr cur;
+    asm volatile("sidt %0" : "=m"(cur));
+
+    ShimIDTEntry* idt = (ShimIDTEntry*)(uintptr_t)cur.base;
+    uint32_t      lim = cur.limit;
+
+    if (lim < (0x80 + 1) * sizeof(ShimIDTEntry) - 1) {
+        static ShimIDTEntry new_idt[256];
+        memset(new_idt, 0, sizeof(new_idt));
+        uint32_t copy_entries = (lim + 1) / sizeof(ShimIDTEntry);
+        if (copy_entries > 256) copy_entries = 256;
+        memcpy(new_idt, idt, copy_entries * sizeof(ShimIDTEntry));
+        idt = new_idt;
+        cur.base  = (uint32_t)(uintptr_t)new_idt;
+        cur.limit = sizeof(new_idt) - 1;
+        g_shim_idt_base  = new_idt;
+        g_shim_idt_limit = (uint16_t)cur.limit;
+    }
+
+    uint16_t cs;
+    asm volatile("mov %%cs, %0" : "=r"(cs));
+
+    uint32_t handler = (uint32_t)(uintptr_t)isr_int80;
+    idt[0x80].offset_lo = handler & 0xFFFF;
+    idt[0x80].offset_hi = (handler >> 16) & 0xFFFF;
+    idt[0x80].selector  = cs;
+    idt[0x80].zero      = 0;
+    idt[0x80].type_attr = 0xEF;  
+
+    asm volatile("lidt %0" : : "m"(cur));
+}
+
+void syscall_shim_init() {
+    memset(g_sprocs, 0, sizeof(g_sprocs));
+    g_cur_pid = -1;
+    g_pid_seq = 100;
+    syscall_shim_install_gate();
+}
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//  SECTION 10  â€”  Public launch API
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+int launch_elf_process(const char* filename, const char* cmdline_args, Window* terminal) {
+    ShimProcess* p = shim_proc_alloc();
+    if (!p) {
+        terminal->console_print("Error: process table full\n");
+        return -1;
+    }
+    p->term = terminal;
+
+    const char* fname = filename;
+    while (fname[0]=='.' && fname[1]=='/') fname += 2;
+    if (fname[0]=='/') fname++;
+
+    int r = elf_load(p, fname);
+    if (r != 0) {
+        char msg[128];
+        snprintf(msg, 128, "%s: cannot load ELF (err %d)\n", fname, r);
+        terminal->console_print(msg);
+        shim_proc_free(p);
+        return -1;
+    }
+
+    char argv0_buf[128];
+    strncpy(argv0_buf, fname, 127);
+    char arg1_buf[256] = {0};
+    char* my_argv[3];
+    int   argc = 1;
+    my_argv[0] = argv0_buf;
+    if (cmdline_args && *cmdline_args) {
+        strncpy(arg1_buf, cmdline_args, 255);
+        my_argv[1] = arg1_buf;
+        argc = 2;
+    }
+    my_argv[argc] = nullptr;
+
+    p->user_esp = build_stack_frame(p, argc, my_argv, nullptr);
+    strncpy(p->cmdline, fname, 255);
+    p->state = PSTATE_RUNNING;
+
+    char msg[80];
+    snprintf(msg, 80, "Starting %s (pid %d)\n", fname, p->pid);
+    terminal->console_print(msg);
+
+    shim_run_process(p->pid);
+    return p->pid;
+}
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//  SECTION 11  â€”  Process execution engine
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+void shim_run_process(int pid) {
+    ShimProcess* p = shim_proc_find(pid);
+    if (!p || p->state != PSTATE_RUNNING) return;
+
+    g_cur_pid = pid;
+
+    uint32_t entry_off = p->entry_vaddr - p->load_vaddr;
+    void* entry_ptr = (void*)(uintptr_t)(p->image + entry_off);
+    uint32_t proc_esp  = p->user_esp;
+
+    typedef void (*entry_t)(void);
+    entry_t fn = (entry_t)entry_ptr;
+
+    uint32_t saved_esp;
+    asm volatile(
+        "mov  %%esp, %0    \n\t"   
+        "mov  %1,    %%esp \n\t"   
+        "call *%2          \n\t"   
+        "mov  %0,    %%esp \n\t"   
+        : "=m"(saved_esp)
+        : "r"(proc_esp), "r"(fn)
+        : "eax","ecx","edx","memory"
+    );
+
+    if (g_cur_pid == pid) {
+        sys_exit(pid, 0);
+    }
+}
+
+void shim_feed_input(const char* line, Window* terminal) {
+    for (int i = 0; i < SHIM_MAX_PROCS; i++) {
+        ShimProcess* p = &g_sprocs[i];
+        if (p->state == PSTATE_BLOCKED_READ && p->term == terminal) {
+            int len = (int)strlen(line);
+            if (len >= SHIM_STDIN_BUF - 2) len = SHIM_STDIN_BUF - 2;
+            memcpy(p->ibuf, line, len);
+            p->ibuf[len]   = '\n';
+            p->ibuf[len+1] = '\0';
+            p->ibuf_len   = len + 1;
+            p->ibuf_pos   = 0;
+            p->ibuf_ready = true;
+            p->state      = PSTATE_RUNNING;
+            shim_run_process(p->pid);
+            return;
+        }
+    }
+}
+
+bool shim_process_wants_input(Window* terminal) {
+    for (int i = 0; i < SHIM_MAX_PROCS; i++)
+        if (g_sprocs[i].state == PSTATE_BLOCKED_READ &&
+            g_sprocs[i].term == terminal) return true;
+    return false;
+}
+
+bool shim_process_active(Window* terminal) {
+    for (int i = 0; i < SHIM_MAX_PROCS; i++)
+        if ((g_sprocs[i].state == PSTATE_RUNNING ||
+             g_sprocs[i].state == PSTATE_BLOCKED_READ) &&
+             g_sprocs[i].term == terminal) return true;
+    return false;
+}
+
+void shim_kill_terminal(Window* terminal) {
+    for (int i = 0; i < SHIM_MAX_PROCS; i++)
+        if (g_sprocs[i].term == terminal &&
+            g_sprocs[i].state != PSTATE_FREE)
+            shim_proc_free(&g_sprocs[i]);
+    g_cur_pid = -1;
+}
 
 
 // =============================================================================
