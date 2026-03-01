@@ -398,6 +398,10 @@ namespace FileSecurityMonitor
                 if (!File.Exists(filePath))
                     return;
 
+                // Skip monitor's own files
+                if (IsMonitorFile(filePath))
+                    return;
+
                 var fileInfo = _fileInspector.AnalyzeFile(filePath);
                 if (fileInfo == null)
                     return;
@@ -416,6 +420,10 @@ namespace FileSecurityMonitor
                 if (!File.Exists(filePath))
                     return;
 
+                // Skip monitor's own files
+                if (IsMonitorFile(filePath))
+                    return;
+
                 var fileInfo = _fileInspector.AnalyzeFile(filePath);
                 if (fileInfo == null)
                     return;
@@ -430,6 +438,34 @@ namespace FileSecurityMonitor
                 }
             }
             catch { }
+        }
+
+        /// <summary>
+        /// Check if file belongs to the monitor application
+        /// </summary>
+        private bool IsMonitorFile(string filePath)
+        {
+            string lowerPath = filePath.ToLower();
+            string fileName = Path.GetFileName(lowerPath);
+
+            // Exclude monitor's own files
+            string[] monitorFiles = new[]
+            {
+                "filesecuritymonitor.exe",
+                "filesecuritymonitor.dll",
+                "security_monitor.log",
+                "security_policies.json",
+                "filesecuritymonitor.pdb",
+                "filesecuritymonitor.csproj",
+                "newtonsoft.json.dll",
+                "system.management.dll",
+                "system.diagnostics.eventlog.dll"
+            };
+
+            return monitorFiles.Any(f => fileName == f) ||
+                   lowerPath.Contains("\\bin\\") ||
+                   lowerPath.Contains("\\obj\\") ||
+                   lowerPath.Contains("\\.vs\\");
         }
 
         public void Stop()
