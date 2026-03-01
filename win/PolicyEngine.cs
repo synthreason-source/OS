@@ -149,31 +149,72 @@ namespace FileSecurityMonitor
         {
             try
             {
+                // Try to resolve the full path if only filename given
+                string resolvedPath = filePath;
                 if (!File.Exists(filePath))
+                {
+                    // Try common system paths
+                    string[] searchPaths = new[]
+                    {
+                        Path.Combine(Environment.SystemDirectory, filePath),
+                        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), filePath),
+                        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), filePath),
+                        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), filePath)
+                    };
+
+                    foreach (var path in searchPaths)
+                    {
+                        if (File.Exists(path))
+                        {
+                            resolvedPath = path;
+                            break;
+                        }
+                    }
+
+                    // If still not found, try searching in PATH environment variable
+                    if (!File.Exists(resolvedPath))
+                    {
+                        string pathEnv = Environment.GetEnvironmentVariable("PATH");
+                        if (pathEnv != null)
+                        {
+                            foreach (string dir in pathEnv.Split(Path.PathSeparator))
+                            {
+                                string fullPath = Path.Combine(dir, filePath);
+                                if (File.Exists(fullPath))
+                                {
+                                    resolvedPath = fullPath;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (!File.Exists(resolvedPath))
                     return null;
 
-                var fileInfo = new FileInfo(filePath);
+                var fileInfo = new FileInfo(resolvedPath);
                 var result = new FileAnalysisResult
                 {
-                    FilePath = filePath,
+                    FilePath = resolvedPath,
                     Extension = fileInfo.Extension.ToLower(),
                     FileSizeBytes = fileInfo.Length
                 };
 
                 // Detect actual file type from magic bytes
-                DetectFileTypeFromMagicBytes(filePath, result);
+                DetectFileTypeFromMagicBytes(resolvedPath, result);
 
                 // Check code signature (for executables)
                 if (IsExecutable(result.Extension))
                 {
-                    CheckCodeSignature(filePath, result);
+                    CheckCodeSignature(resolvedPath, result);
                 }
 
                 return result;
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[!] Error analyzing file {filePath}: {ex.Message}");
+                // Silently return null instead of logging, reduces noise
                 return null;
             }
         }
