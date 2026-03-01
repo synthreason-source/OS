@@ -1,13 +1,14 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Diagnostics.Eventing.Reader;
 using System.IO;
 using System.Linq;
 using System.Management;
 using System.Threading;
 using System.Threading.Tasks;
 using Newtonsoft.Json;
-using System.Diagnostics.Eventing.Reader;
+
 namespace FileSecurityMonitor
 {
     /// <summary>
@@ -21,6 +22,9 @@ namespace FileSecurityMonitor
         private SecurityLogger _logger;
         private CancellationTokenSource _cancellationTokenSource;
 
+        private FileExecutionMonitor _fileExecutionMonitor;
+        private FileSystemWatcherMonitor _fileSystemWatcher;
+
         public SecurityMonitor(string policyFilePath, string logFilePath)
         {
             _policyEngine = new PolicyEngine(policyFilePath);
@@ -28,6 +32,8 @@ namespace FileSecurityMonitor
             _processMonitor = new ProcessMonitor();
             _logger = new SecurityLogger(logFilePath);
             _cancellationTokenSource = new CancellationTokenSource();
+            _fileExecutionMonitor = new FileExecutionMonitor(_logger, _policyEngine, _fileInspector);
+            _fileSystemWatcher = new FileSystemWatcherMonitor(_logger, _policyEngine, _fileInspector);
         }
 
         /// <summary>
@@ -41,11 +47,17 @@ namespace FileSecurityMonitor
             
             _logger.Log("Monitor started");
 
+            // Start file system monitoring
+            _fileSystemWatcher.Start();
+
             // Start ETW monitoring for process creation
             Task etwTask = StartETWMonitoring(_cancellationTokenSource.Token);
             
             // Alternative/fallback: WMI monitoring for process creation
             Task wmiTask = StartWMIMonitoring(_cancellationTokenSource.Token);
+
+            // Start file execution monitoring (document access, script execution, etc.)
+            Task fileExecTask = Task.Run(() => _fileExecutionMonitor.Start(_cancellationTokenSource.Token));
 
             Console.WriteLine("[+] Monitoring active. Press Ctrl+C to stop.");
             Console.CancelKeyPress += (sender, e) => 
@@ -56,7 +68,7 @@ namespace FileSecurityMonitor
 
             try
             {
-                Task.WaitAll(etwTask, wmiTask);
+                Task.WaitAll(etwTask, wmiTask, fileExecTask);
             }
             catch (OperationCanceledException)
             {
@@ -156,16 +168,16 @@ namespace FileSecurityMonitor
                 if (IsSystemProcess(processPath))
                     return;
 
-                Console.WriteLine($"\n[+] Process created: {processPath} (PID: {processId})");
-
                 // Analyze the file
                 var fileInfo = _fileInspector.AnalyzeFile(processPath);
 
                 if (fileInfo == null)
                 {
-                    _logger.LogWarning($"Could not analyze file: {processPath}");
+                    // Silently skip if can't analyze - reduces noise
                     return;
                 }
+
+                Console.WriteLine($"\n[+] Process created: {fileInfo.FilePath} (PID: {processId})");
 
                 // Get applicable security policy
                 var policy = _policyEngine.GetPolicy(fileInfo.Extension);
@@ -178,7 +190,7 @@ namespace FileSecurityMonitor
                 _logger.LogProcessExecution(new ProcessExecutionEvent
                 {
                     Timestamp = DateTime.Now,
-                    ProcessPath = processPath,
+                    ProcessPath = fileInfo.FilePath,
                     ProcessId = processId,
                     ParentProcessId = parentProcessId,
                     FileExtension = fileInfo.Extension,
@@ -189,7 +201,7 @@ namespace FileSecurityMonitor
                 });
 
                 // Enforce policy
-                EnforcePolicy(fileInfo, policy, processPath, processId);
+                EnforcePolicy(fileInfo, policy, fileInfo.FilePath, processId);
             }
             catch (Exception ex)
             {
@@ -294,8 +306,9 @@ namespace FileSecurityMonitor
         private bool IsSystemProcess(string processPath)
         {
             string lowerPath = processPath.ToLower();
+            string fileName = Path.GetFileName(lowerPath);
             
-            // Skip common system processes to reduce noise
+            // Skip common system and utility processes to reduce noise
             string[] systemProcesses = 
             {
                 "system32\\csrss.exe",
@@ -308,15 +321,29 @@ namespace FileSecurityMonitor
                 "system32\\taskhostw.exe",
                 "windows\\explorer.exe",
                 "system32\\rundll32.exe",
-                "syswow64\\rundll32.exe"
+                "syswow64\\rundll32.exe",
+                "dllhost.exe",
+                "rg.exe",
+                "conhost.exe",
+                "openswith.exe",
+                "searchfilterhost.exe",
+                "windowspackagemanagerserver.exe",
+                "audiodg.exe",
+                "werfault.exe",
+                "ctfmon.exe",
+                "fontdrvhost.exe",
+                "nvcontainer.exe",
+                "nvidia-smi.exe"
             };
 
-            return systemProcesses.Any(sp => lowerPath.Contains(sp));
+            return systemProcesses.Any(sp => lowerPath.Contains(sp)) || 
+                   systemProcesses.Any(sp => fileName == sp);
         }
 
         public void Stop()
         {
             Console.WriteLine("\n[*] Shutting down monitor...");
+            _fileSystemWatcher.Stop();
             _cancellationTokenSource.Cancel();
             _logger.Log("Monitor stopped");
         }
