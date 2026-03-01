@@ -1,0 +1,66 @@
+{
+  "policies": {
+    "executable": {
+      "name": "Executable Files",
+      "extensions": [".exe", ".com", ".scr", ".msi"],
+      "level": 5,
+      "rules": ["require_signature", "require_reputation_check", "log_only"],
+      "description": "Highest security level - requires valid code signature and reputation check"
+    },
+    "library": {
+      "name": "Dynamic Libraries",
+      "extensions": [".dll", ".sys", ".drv"],
+      "level": 4,
+      "rules": ["require_signature", "log_only"],
+      "description": "High security - system libraries must be signed"
+    },
+    "script": {
+      "name": "Script Files",
+      "extensions": [".bat", ".vbs", ".ps1", ".cmd"],
+      "level": 3,
+      "rules": ["warn_user", "log_only"],
+      "description": "Moderate security - scripts trigger warning dialog"
+    },
+    "archive": {
+      "name": "Archive Files",
+      "extensions": [".zip", ".7z", ".rar", ".tar"],
+      "level": 2,
+      "rules": ["log_only"],
+      "description": "Low security - archives are monitored but allowed"
+    },
+    "document": {
+      "name": "Document Files",
+      "extensions": [".txt", ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt"],
+      "level": 1,
+      "rules": ["log_only"],
+      "description": "Minimal security - documents are logged only"
+    },
+    "image": {
+      "name": "Image Files",
+      "extensions": [".jpg", ".jpeg", ".png", ".gif", ".bmp"],
+      "level": 1,
+      "rules": ["log_only"],
+      "description": "Minimal security - image files allowed"
+    },
+    "video": {
+      "name": "Video Files",
+      "extensions": [".mp4", ".avi", ".mkv", ".mov", ".wmv"],
+      "level": 1,
+      "rules": ["log_only"],
+      "description": "Minimal security - video files allowed"
+    },
+    "audio": {
+      "name": "Audio Files",
+      "extensions": [".mp3", ".wav", ".flac", ".aac", ".m4a"],
+      "level": 1,
+      "rules": ["log_only"],
+      "description": "Minimal security - audio files allowed"
+    }
+  },
+  "metadata": {
+    "version": "1.0",
+    "description": "Standard security policy with 5 security levels",
+    "created": "2024-01-15",
+    "author": "Security Team"
+  }
+}
