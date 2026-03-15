@@ -2,20 +2,6 @@
 
 A lightweight, production-ready process watchdog for Windows built with .NET 8.
 
-## Features
-
-- **Auto-restart** on crash (non-zero exit code)
-- **Restart rate limiting** — stops infinite crash loops (e.g. 5 restarts in 60s)
-- **Memory limit** — kills and restarts if working set exceeds threshold
-- **CPU threshold** — kills and restarts if CPU usage is sustained too high
-- **HTTP health check** — kills and restarts if your app stops responding
-- **Attach mode** — monitor an already-running process by PID
-- **Crash script** — run a custom script (.bat, .ps1, .exe) on each crash
-- **Graceful exit codes** — don't restart on clean shutdown (exit code 0)
-- **File + console logging** with timestamps
-
----
-
 ## Build
 
 Requirements: .NET 8 SDK
