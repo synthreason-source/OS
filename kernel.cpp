@@ -5362,6 +5362,12 @@ bool validate_elf_header(const Elf32_Ehdr* ehdr) {
 
 
 
+bool disk_has_password() {
+    if (!ahci_base || !current_directory_cluster) return false;
+    fat_dir_entry_t entry;
+    uint32_t sector, offset;
+    return fat32_find_entry(g_disk_password_file, &entry, &sector, &offset) == 0;
+}
 // Kill an ELF process
 void kill_elf_process(int slot) {
     if (slot >= 0 && slot < MAX_ELF_PROCESSES && elf_processes[slot].active) {
@@ -5423,12 +5429,7 @@ static void hash_to_hex(uint32_t hash, char* out) {
     out[8] = '\0';
 }
 
-bool disk_has_password() {
-    if (!ahci_base || !current_directory_cluster) return false;
-    fat_dir_entry_t entry;
-    uint32_t sector, offset;
-    return fat32_find_entry(g_disk_password_file, &entry, &sector, &offset) == 0;
-}bool disk_check_password(const char* attempt) {
+bool disk_check_password(const char* attempt) {
     // Read the password file WITHOUT decryption (it was written encrypted,
     // so we decrypt it ourselves using the candidate key)
     bool was_enabled = g_fs_encryption_enabled;
@@ -6940,29 +6941,23 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
         wm.print_to_focused("WARNING: Mouse initialization failed.\n");
     }
 
-    disk_init();
-    if(ahci_base) fat32_init();
-    
-    if(ahci_base) 
-        wm.print_to_focused("AHCI disk found.\n"); 
-    else 
-        wm.print_to_focused("AHCI disk NOT found.\n");
-    
-    if(current_directory_cluster) {
-        wm.print_to_focused("FAT32 FS initialized.\n"); 
-        
-        // Extract BusyBox to filesystem
-        wm.print_to_focused("Extracting BusyBox...\n");
-        if (extract_busybox_to_filesystem()) {
-            wm.print_to_focused("BusyBox extracted successfully.\n");
-        } else {
-            wm.print_to_focused("BusyBox extraction failed.\n");
-        }
-        
-        wm.load_desktop_items();
-    }
-    else 
-        wm.print_to_focused("FAT32 init failed.\n");
+    // Replace the block after disk_init():
+	disk_init();
+	if (ahci_base) {
+		// Read BPB raw (fat32_init disables crypto for sector 0 itself now)
+		fat32_init();
+		wm.print_to_focused("AHCI disk found.\n");
+	} else {
+		wm.print_to_focused("AHCI disk NOT found.\n");
+	}
+
+	if (current_directory_cluster) {
+		
+		wm.load_desktop_items();
+
+	} else {
+		wm.print_to_focused("FAT32 init failed.\n");
+	}
 
     init_screen_timer(30);
 
