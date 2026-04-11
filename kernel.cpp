@@ -5361,12 +5361,16 @@ bool validate_elf_header(const Elf32_Ehdr* ehdr) {
 }
 
 
-
 bool disk_has_password() {
     if (!ahci_base || !current_directory_cluster) return false;
+    // Probe raw — directory must be readable before unlock.
+    bool was_enabled = g_fs_encryption_enabled;
+    g_fs_encryption_enabled = false;
     fat_dir_entry_t entry;
     uint32_t sector, offset;
-    return fat32_find_entry(g_disk_password_file, &entry, &sector, &offset) == 0;
+    bool found = (fat32_find_entry(g_disk_password_file, &entry, &sector, &offset) == 0);
+    g_fs_encryption_enabled = was_enabled;
+    return found;
 }
 // Kill an ELF process
 void kill_elf_process(int slot) {
@@ -5428,62 +5432,59 @@ static void hash_to_hex(uint32_t hash, char* out) {
     }
     out[8] = '\0';
 }
-
 bool disk_check_password(const char* attempt) {
-    // Read the password file WITHOUT decryption (it was written encrypted,
-    // so we decrypt it ourselves using the candidate key)
+    // Read raw — the password file is always plaintext on disk.
     bool was_enabled = g_fs_encryption_enabled;
     g_fs_encryption_enabled = false;
-    char* stored_enc = fat32_read_file_as_string(g_disk_password_file);
+    char* stored = fat32_read_file_as_string(g_disk_password_file);
     g_fs_encryption_enabled = was_enabled;
 
-    if (!stored_enc) return false;
+    if (!stored) return false;
 
-    // Derive candidate keystream and manually decrypt the 8-byte hash
-    uint8_t candidate_key[64];
-    int candidate_key_len = 0;
-    derive_xor_key(attempt, candidate_key, &candidate_key_len);
-
-    // The password file is exactly 8 bytes, stored at some LBA.
-    // For simplicity, XOR-decrypt the stored bytes with key only (no LBA tweak
-    // for the password file — we use a fixed tweak of 0 for the auth record).
-    uint8_t decrypted[9] = {0};
-    for (int i = 0; i < 8 && stored_enc[i]; i++) {
-        uint8_t k = candidate_key[i % candidate_key_len];
-        // tweak byte for lba=0 is 0, so just XOR with key
-        decrypted[i] = (uint8_t)stored_enc[i] ^ k;
-    }
-    decrypted[8] = '\0';
-    delete[] stored_enc;
-
-    // Compute hash of attempt and compare
     uint32_t hash = simple_hash(attempt);
     char hex[9];
     hash_to_hex(hash, hex);
-    bool match = (strncmp((char*)decrypted, hex, 8) == 0);
+    bool match = (strncmp(stored, hex, 8) == 0);
+    delete[] stored;
 
     if (match) fs_crypto_init(attempt);
     return match;
 }
-
 bool disk_set_password(const char* password) {
     if (!password || password[0] == '\0') return false;
+    if (strlen(password) < 4) return false;
 
-    // Arm encryption first so the password file itself is written encrypted
-    fs_crypto_init(password);
+    // 1. Make sure crypto is OFF so the write goes to disk plaintext.
+    //    The password file must always be written unencrypted because
+    //    disk_has_password() and disk_check_password() probe it raw.
+    bool was_enabled = g_fs_encryption_enabled;
+    g_fs_encryption_enabled = false;
 
+    // 2. Compute and write the hash record unencrypted.
     uint32_t hash = simple_hash(password);
     char hex[9];
     hash_to_hex(hash, hex);
     bool ok = (fat32_write_file(g_disk_password_file, hex, 8) == 0);
-    if (!ok) fs_crypto_clear();   // roll back if write failed
+
+    // 3. Only arm encryption if the write succeeded.
+    if (ok) {
+        fs_crypto_init(password);
+        g_fs_encryption_enabled = true;
+    } else {
+        g_fs_encryption_enabled = was_enabled;
+        fs_crypto_clear();
+    }
+
     return ok;
 }
-
 bool disk_remove_password(const char* current_password) {
     if (!disk_check_password(current_password)) return false;
-    fat32_remove_file(g_disk_password_file);
+
+    // Disarm crypto first so the remove operates on the plaintext directory.
     fs_crypto_clear();
+    g_fs_encryption_enabled = false;
+
+    fat32_remove_file(g_disk_password_file);
     g_disk_unlocked = false;
     return true;
 }
