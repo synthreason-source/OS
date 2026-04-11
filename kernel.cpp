@@ -5672,7 +5672,7 @@ void handle_command() {
 	}
     else if (strcmp(command, "clear") == 0) { line_count = 0; memset(buffer, 0, sizeof(buffer)); }
     else if (strcmp(command, "ls") == 0) { fat32_list_files(); }
-    else if (strcmp(command, "edit") == 0 && g_disk_unlocked) {
+    else if (strcmp(command, "edit") == 0) {
         char* filename = get_arg(args, 0);
         if(filename) {
             strncpy(edit_filename, filename, 31);
@@ -5718,7 +5718,7 @@ void handle_command() {
         }
     }
     
-    else if (strcmp(command, "rm") == 0 && g_disk_unlocked) { 
+    else if (strcmp(command, "rm") == 0) { 
         char* filename = get_arg(args, 0); 
         if(filename) { 
             if(fat32_remove_file(filename) == 0) 
@@ -5729,7 +5729,7 @@ void handle_command() {
             console_print("Usage: rm \"<filename>\"\n");
         }
     }
-    else if (strcmp(command, "cp") == 0 && g_disk_unlocked) {
+    else if (strcmp(command, "cp") == 0) {
         char args_for_src[120];
         strncpy(args_for_src, args, 119);
         char* src = get_arg(args_for_src, 0);
@@ -5760,7 +5760,7 @@ void handle_command() {
             }
         }
     }
-    else if (strcmp(command, "mv") == 0 && g_disk_unlocked) {
+    else if (strcmp(command, "mv") == 0) {
         char args_for_src[120];
         strncpy(args_for_src, args, 119);
         char* src = get_arg(args_for_src, 0);
@@ -5786,7 +5786,7 @@ void handle_command() {
 		fat32_format();
 		g_fs_encryption_enabled = saved;
 	}
-    else if (strcmp(command, "chkdsk") == 0 && g_disk_unlocked) {
+    else if (strcmp(command, "chkdsk") == 0) {
         char* args_copy = new char[120];
         strncpy(args_copy, args, 119);
         args_copy[119] = '\0';
