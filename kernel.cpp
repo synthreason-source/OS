@@ -1862,7 +1862,7 @@ void disk_init() {
     // Find the AHCI controller's base address
     for (uint16_t bus = 0; bus < 256; bus++) for (uint8_t dev = 0; dev < 32; dev++) if ((pci_read_config_dword(bus, dev, 0, 0) & 0xFFFF) != 0xFFFF && (pci_read_config_dword(bus, dev, 0, 0x08) >> 16) == 0x0106) { ahci_base = pci_read_config_dword(bus, dev, 0, 0x24) & 0xFFFFFFF0; goto found; }
 found:
-    if (!ahci_base || !g_disk_unlocked) return;
+    if (!ahci_base) return;
 
     cmd_list = (HBA_CMD_HEADER*)alloc_aligned(32 * sizeof(HBA_CMD_HEADER), 1024);
     cmd_table_buffer = (char*)alloc_aligned(32 * 256, 128);
@@ -1899,14 +1899,23 @@ found:
             return;
         }
     }
-}
-bool fat32_init() {
-    if(!ahci_base) return false;
+}bool fat32_init() {
+    if (!ahci_base) return false;
     char* buffer = new char[SECTOR_SIZE];
-    if (read_write_sectors(g_ahci_port, 0, 1, false, buffer) != 0) { delete[] buffer; return false; }
+
+    // Boot sector is always plaintext — read it raw regardless of crypto state
+    bool was_enabled = g_fs_encryption_enabled;
+    g_fs_encryption_enabled = false;
+    int result = read_write_sectors(g_ahci_port, 0, 1, false, buffer);
+    g_fs_encryption_enabled = was_enabled;
+
+    if (result != 0) { delete[] buffer; return false; }
     memcpy(&bpb, buffer, sizeof(bpb));
     delete[] buffer;
-    if (strncmp(bpb.fil_sys_type, "FAT32", 5) != 0) { current_directory_cluster = 0; return false; }
+    if (strncmp(bpb.fil_sys_type, "FAT32", 5) != 0) {
+        current_directory_cluster = 0;
+        return false;
+    }
     fat_start_sector = bpb.rsvd_sec_cnt;
     data_start_sector = fat_start_sector + (bpb.num_fats * bpb.fat_sz32);
     current_directory_cluster = bpb.root_clus;
@@ -5419,19 +5428,40 @@ bool disk_has_password() {
     fat_dir_entry_t entry;
     uint32_t sector, offset;
     return fat32_find_entry(g_disk_password_file, &entry, &sector, &offset) == 0;
-}
-bool disk_check_password(const char* attempt) {
-    // Temporarily derive candidate key and decrypt the stored hash to compare
-    char* stored = fat32_read_file_as_string(g_disk_password_file);
-    if (!stored) return false;
+}bool disk_check_password(const char* attempt) {
+    // Read the password file WITHOUT decryption (it was written encrypted,
+    // so we decrypt it ourselves using the candidate key)
+    bool was_enabled = g_fs_encryption_enabled;
+    g_fs_encryption_enabled = false;
+    char* stored_enc = fat32_read_file_as_string(g_disk_password_file);
+    g_fs_encryption_enabled = was_enabled;
 
+    if (!stored_enc) return false;
+
+    // Derive candidate keystream and manually decrypt the 8-byte hash
+    uint8_t candidate_key[64];
+    int candidate_key_len = 0;
+    derive_xor_key(attempt, candidate_key, &candidate_key_len);
+
+    // The password file is exactly 8 bytes, stored at some LBA.
+    // For simplicity, XOR-decrypt the stored bytes with key only (no LBA tweak
+    // for the password file — we use a fixed tweak of 0 for the auth record).
+    uint8_t decrypted[9] = {0};
+    for (int i = 0; i < 8 && stored_enc[i]; i++) {
+        uint8_t k = candidate_key[i % candidate_key_len];
+        // tweak byte for lba=0 is 0, so just XOR with key
+        decrypted[i] = (uint8_t)stored_enc[i] ^ k;
+    }
+    decrypted[8] = '\0';
+    delete[] stored_enc;
+
+    // Compute hash of attempt and compare
     uint32_t hash = simple_hash(attempt);
     char hex[9];
     hash_to_hex(hash, hex);
-    bool match = (strncmp(stored, hex, 8) == 0);
-    delete[] stored;
+    bool match = (strncmp((char*)decrypted, hex, 8) == 0);
 
-    if (match) fs_crypto_init(attempt);   // arm XOR layer on success
+    if (match) fs_crypto_init(attempt);
     return match;
 }
 
@@ -5747,7 +5777,13 @@ void handle_command() {
             }
         }
     }
-    else if (strcmp(command, "formatfs") == 0) { fat32_format(); }
+    // CORRECT — format always writes plaintext; encryption is a post-format concern:
+	else if (strcmp(command, "formatfs") == 0) {
+		bool saved = g_fs_encryption_enabled;
+		g_fs_encryption_enabled = false;   // format always writes raw
+		fat32_format();
+		g_fs_encryption_enabled = saved;
+	}
     else if (strcmp(command, "chkdsk") == 0 && g_disk_unlocked) {
         char* args_copy = new char[120];
         strncpy(args_copy, args, 119);
