@@ -11,6 +11,7 @@
 // =============================================================================
 // SECTION 1: TYPE DEFS, STDLIB/CXX STUBS, AND LOW-LEVEL FUNCTIONS
 // =============================================================================
+#define SECTOR_SIZE 512
 
 // --- Type Definitions ---
 typedef unsigned char uint8_t;
@@ -115,8 +116,61 @@ static inline uint32_t pci_read_config_dword(uint16_t bus, uint8_t device, uint8
 
 // --- Type Definitions for FAT32 ---
 // Moved here to be visible to all classes and functions
+static bool    g_fs_encryption_enabled = false;
+static uint8_t g_fs_xor_key[64]        = {0};  // 64-byte keystream
+static int     g_fs_xor_key_len        = 0;
 
+// =============================================================================
+// FILESYSTEM XOR ENCRYPTION LAYER
+// =============================================================================
 
+// Derive a 64-byte keystream from password using FNV-1a mixing
+static void derive_xor_key(const char* password, uint8_t key_out[64], int* key_len_out) {
+    uint32_t h = 2166136261u;
+    const char* p = password;
+    while (*p) {
+        h ^= (uint8_t)*p++;
+        h *= 16777619u;
+    }
+
+    // Expand hash into 64 bytes by re-mixing with position
+    for (int i = 0; i < 64; i++) {
+        h ^= (uint32_t)i * 2654435761u;
+        h *= 16777619u;
+        key_out[i] = (uint8_t)(h ^ (h >> 16));
+    }
+    *key_len_out = 64;
+}
+
+// XOR a 512-byte sector buffer in place.
+// LBA is mixed into each block so identical plaintext sectors at different
+// locations produce different ciphertext (poor-man's sector tweak).
+static void xor_sector(uint8_t* buf, uint64_t lba) {
+    if (!g_fs_encryption_enabled || g_fs_xor_key_len == 0) return;
+
+    // Build a per-sector tweak from the LBA
+    uint8_t tweak[8];
+    for (int i = 0; i < 8; i++) tweak[i] = (uint8_t)(lba >> (i * 8));
+
+    for (int i = 0; i < SECTOR_SIZE; i++) {
+        uint8_t k = g_fs_xor_key[i % g_fs_xor_key_len];
+        uint8_t t = tweak[i % 8];
+        buf[i] ^= (k ^ t);
+    }
+}
+
+// Call after successful unlock to arm the encryption layer
+static void fs_crypto_init(const char* password) {
+    derive_xor_key(password, g_fs_xor_key, &g_fs_xor_key_len);
+    g_fs_encryption_enabled = true;
+}
+
+// Call on lock/disk-switch to wipe key material from memory
+static void fs_crypto_clear() {
+    g_fs_encryption_enabled = false;
+    memset(g_fs_xor_key, 0, sizeof(g_fs_xor_key));
+    g_fs_xor_key_len = 0;
+}
 // --- Global State Variables ---
 // Moved here to be visible to all classes
 static volatile uint32_t g_timer_ticks = 0;
@@ -1543,7 +1597,6 @@ void draw_cursor(int x, int y, uint32_t color) {
 #define TFD_STS_BSY 0x80
 #define TFD_STS_DRQ 0x08
 #define FIS_TYPE_REG_H2D 0x27
-#define SECTOR_SIZE 512
 #define DELETED_ENTRY 0xE5
 #define ATTR_LONG_NAME 0x0F
 #define ATTR_VOLUME_ID 0x08
@@ -1619,7 +1672,8 @@ uint8_t lfn_checksum(const unsigned char *p_fname) {
 
 static int g_ahci_port = -1; // Will store the first active port number
 static int g_selected_port = -1; // User-selected disk port (-1 = use g_ahci_port)
-
+static bool g_disk_unlocked = false;
+static char g_disk_password_file[] = ".diskpass";
 typedef struct { uint8_t cfl:5, a:1, w:1, p:1, r:1, b:1, c:1, res0:1; uint16_t prdtl; volatile uint32_t prdbc; uint64_t ctba; uint32_t res1[4]; } __attribute__((packed)) HBA_CMD_HEADER;
 typedef struct { uint64_t dba; uint32_t res0; uint32_t dbc:22, res1:9, i:1; } __attribute__((packed)) HBA_PRDT_ENTRY;
 typedef struct { uint8_t fis_type, pmport:4, res0:3, c:1, command, featurel; uint8_t lba0, lba1, lba2, device; uint8_t lba3, lba4, lba5, featureh; uint8_t countl, counth, icc, control; uint8_t res1[4]; } __attribute__((packed)) FIS_REG_H2D;
@@ -1647,7 +1701,6 @@ void free_aligned(void* ptr) {
     if (ptr == nullptr) return;
     operator delete(((void**)ptr)[-1]);
 }
-
 void cmd_list_and_select_disk(const char* arg) {
     // List all detected AHCI ports
     if (!ahci_base) {
@@ -1712,74 +1765,82 @@ void cmd_list_and_select_disk(const char* arg) {
     wm.print_to_focused(msg);
 
     if (ok) wm.load_desktop_items();      // refresh desktop icons from new disk
-}
-int read_write_sectors(int port_num, uint64_t lba, uint16_t count, bool write, void* buffer) {
+}int read_write_sectors(int port_num, uint64_t lba, uint16_t count,
+                       bool write, void* buffer) {
     if (port_num == -1 || !ahci_base) return -1;
 
     HBA_PORT* port = (HBA_PORT*)(ahci_base + 0x100 + (port_num * 0x80));
-    
-    port->is = 0xFFFFFFFF; // Clear any pending interrupt flags
+    port->is = 0xFFFFFFFF;
 
-    // Find a free command slot
     uint32_t slots = (port->sact | port->ci);
     int slot = -1;
-    for (int i=0; i<32; i++) {
-        if ((slots & (1 << i)) == 0) {
-            slot = i;
-            break;
-        }
+    for (int i = 0; i < 32; i++) {
+        if ((slots & (1 << i)) == 0) { slot = i; break; }
     }
     if (slot == -1) return -1;
 
+    // --- WRITE PATH: encrypt a copy before sending to disk ---
+    uint8_t* enc_buf = nullptr;
+    void*    io_buf  = buffer;
+
+    if (write && g_fs_encryption_enabled) {
+        enc_buf = new uint8_t[count * SECTOR_SIZE];
+        if (!enc_buf) return -1;
+        memcpy(enc_buf, buffer, count * SECTOR_SIZE);
+        for (int s = 0; s < count; s++) {
+            xor_sector(enc_buf + s * SECTOR_SIZE, lba + s);
+        }
+        io_buf = enc_buf;
+    }
+
     HBA_CMD_HEADER* cmd_header = &cmd_list[slot];
-    cmd_header->cfl = sizeof(FIS_REG_H2D) / sizeof(uint32_t);
-    cmd_header->w = write;
-    cmd_header->prdtl = 1;
+    cmd_header->cfl    = sizeof(FIS_REG_H2D) / sizeof(uint32_t);
+    cmd_header->w      = write;
+    cmd_header->prdtl  = 1;
 
-    uintptr_t cmd_table_addr = (uintptr_t)cmd_header->ctba;
-    FIS_REG_H2D* cmd_fis = (FIS_REG_H2D*)(cmd_table_addr);
-    HBA_PRDT_ENTRY* prdt = (HBA_PRDT_ENTRY*)(cmd_table_addr + 128);
-    
-    prdt->dba = (uint64_t)(uintptr_t)buffer;
+    uintptr_t       cmd_table_addr = (uintptr_t)cmd_header->ctba;
+    FIS_REG_H2D*    cmd_fis        = (FIS_REG_H2D*)(cmd_table_addr);
+    HBA_PRDT_ENTRY* prdt           = (HBA_PRDT_ENTRY*)(cmd_table_addr + 128);
+
+    prdt->dba = (uint64_t)(uintptr_t)io_buf;
     prdt->dbc = (count * SECTOR_SIZE) - 1;
-    
-    prdt->i = 0;
+    prdt->i   = 0;
 
-    // Configure the command FIS
     memset(cmd_fis, 0, sizeof(FIS_REG_H2D));
     cmd_fis->fis_type = FIS_TYPE_REG_H2D;
-    cmd_fis->c = 1;
-    cmd_fis->command = write ? ATA_CMD_WRITE_DMA_EXT : ATA_CMD_READ_DMA_EXT;
-    
-    cmd_fis->lba0 = (uint8_t)lba; cmd_fis->lba1 = (uint8_t)(lba >> 8); cmd_fis->lba2 = (uint8_t)(lba >> 16);
-    cmd_fis->device = 1 << 6;
-    cmd_fis->lba3 = (uint8_t)(lba >> 24); cmd_fis->lba4 = (uint8_t)(lba >> 32); cmd_fis->lba5 = (uint8_t)(lba >> 40);
-    cmd_fis->countl = count & 0xFF; cmd_fis->counth = (count >> 8) & 0xFF;
+    cmd_fis->c        = 1;
+    cmd_fis->command  = write ? ATA_CMD_WRITE_DMA_EXT : ATA_CMD_READ_DMA_EXT;
+    cmd_fis->lba0     = (uint8_t)lba;
+    cmd_fis->lba1     = (uint8_t)(lba >> 8);
+    cmd_fis->lba2     = (uint8_t)(lba >> 16);
+    cmd_fis->device   = 1 << 6;
+    cmd_fis->lba3     = (uint8_t)(lba >> 24);
+    cmd_fis->lba4     = (uint8_t)(lba >> 32);
+    cmd_fis->lba5     = (uint8_t)(lba >> 40);
+    cmd_fis->countl   = count & 0xFF;
+    cmd_fis->counth   = (count >> 8) & 0xFF;
 
-    // Wait for the port to not be busy
-    while((port->tfd & (TFD_STS_BSY | TFD_STS_DRQ)));
-
-    // Issue the command
+    while (port->tfd & (TFD_STS_BSY | TFD_STS_DRQ));
     port->ci = (1 << slot);
 
     int spin = 0;
     while (spin < 1000000) {
-        if ((port->ci & (1 << slot)) == 0) {
-             break; // Command completed successfully
-        }
+        if ((port->ci & (1 << slot)) == 0) break;
         spin++;
     }
-    
-    // Check if the loop timed out
-    if (spin == 1000000) {
-        return -1; // Timeout error
+
+    if (enc_buf) { delete[] enc_buf; enc_buf = nullptr; }
+    if (spin == 1000000) return -1;
+    if (port->is & (1 << 30)) return -1;
+
+    // --- READ PATH: decrypt in place after receiving from disk ---
+    if (!write && g_fs_encryption_enabled) {
+        for (int s = 0; s < count; s++) {
+            xor_sector((uint8_t*)buffer + s * SECTOR_SIZE, lba + s);
+        }
     }
 
-    if (port->is & (1 << 30)) {
-        return -1; // The drive reported a task file error
-    }
-    
-    return 0; // Success
+    return 0;
 }
 void stop_cmd(HBA_PORT *port) {
     port->cmd &= ~0x0001; // Clear ST (Start)
@@ -1801,7 +1862,7 @@ void disk_init() {
     // Find the AHCI controller's base address
     for (uint16_t bus = 0; bus < 256; bus++) for (uint8_t dev = 0; dev < 32; dev++) if ((pci_read_config_dword(bus, dev, 0, 0) & 0xFFFF) != 0xFFFF && (pci_read_config_dword(bus, dev, 0, 0x08) >> 16) == 0x0106) { ahci_base = pci_read_config_dword(bus, dev, 0, 0x24) & 0xFFFFFFF0; goto found; }
 found:
-    if (!ahci_base) return;
+    if (!ahci_base || !g_disk_unlocked) return;
 
     cmd_list = (HBA_CMD_HEADER*)alloc_aligned(32 * sizeof(HBA_CMD_HEADER), 1024);
     cmd_table_buffer = (char*)alloc_aligned(32 * 256, 128);
@@ -1880,6 +1941,7 @@ void fat32_get_fne_from_entry(fat_dir_entry_t* entry, char* out) {
 uint32_t read_fat_entry(uint32_t cluster) {
     uint8_t* fat_sector = new uint8_t[SECTOR_SIZE];
     uint32_t fat_offset = cluster * 4;
+
     read_write_sectors(g_ahci_port, fat_start_sector + (fat_offset / SECTOR_SIZE), 1, false, fat_sector);
     uint32_t value = *(uint32_t*)(fat_sector + (fat_offset % SECTOR_SIZE)) & 0x0FFFFFFF;
     delete[] fat_sector;
@@ -5329,6 +5391,82 @@ void list_elf_processes(TerminalWindow* terminal) {
     }
 }
 
+
+// =============================================================================
+// DISK PASSWORD SYSTEM
+// =============================================================================
+
+static uint32_t simple_hash(const char* str) {
+    uint32_t hash = 2166136261u;
+    while (*str) {
+        hash ^= (uint8_t)*str++;
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+static void hash_to_hex(uint32_t hash, char* out) {
+    const char* hex = "0123456789abcdef";
+    for (int i = 7; i >= 0; i--) {
+        out[i] = hex[hash & 0xF];
+        hash >>= 4;
+    }
+    out[8] = '\0';
+}
+
+bool disk_has_password() {
+    if (!ahci_base || !current_directory_cluster) return false;
+    fat_dir_entry_t entry;
+    uint32_t sector, offset;
+    return fat32_find_entry(g_disk_password_file, &entry, &sector, &offset) == 0;
+}
+bool disk_check_password(const char* attempt) {
+    // Temporarily derive candidate key and decrypt the stored hash to compare
+    char* stored = fat32_read_file_as_string(g_disk_password_file);
+    if (!stored) return false;
+
+    uint32_t hash = simple_hash(attempt);
+    char hex[9];
+    hash_to_hex(hash, hex);
+    bool match = (strncmp(stored, hex, 8) == 0);
+    delete[] stored;
+
+    if (match) fs_crypto_init(attempt);   // arm XOR layer on success
+    return match;
+}
+
+bool disk_set_password(const char* password) {
+    if (!password || password[0] == '\0') return false;
+
+    // Arm encryption first so the password file itself is written encrypted
+    fs_crypto_init(password);
+
+    uint32_t hash = simple_hash(password);
+    char hex[9];
+    hash_to_hex(hash, hex);
+    bool ok = (fat32_write_file(g_disk_password_file, hex, 8) == 0);
+    if (!ok) fs_crypto_clear();   // roll back if write failed
+    return ok;
+}
+
+bool disk_remove_password(const char* current_password) {
+    if (!disk_check_password(current_password)) return false;
+    fat32_remove_file(g_disk_password_file);
+    fs_crypto_clear();
+    g_disk_unlocked = false;
+    return true;
+}
+
+
+// Guards all disk-touching commands — returns true if access is allowed
+bool disk_access_allowed(TerminalWindow* term) {
+    if (!disk_has_password()) return true;   // no password set → open
+    if (g_disk_unlocked) return true;         // already authenticated this session
+    if (term) term->console_print("Disk is locked. Use: unlock <password>\n");
+    return false;
+}
+
+
 // --- Terminal command handler ---
 void handle_command() {
     int selected_port = 0;
@@ -5358,21 +5496,48 @@ void handle_command() {
         }
     }
 
-		if (strcmp(command, "help") == 0) { console_print("Commands: help, clear, busybox, pself, killelf, killexec, killrun, ps, ls, edit, aesdec, aesenc, run, rm, cp, mv, formatfs, chkdsk (/r /f), select_disk, time, version\n"); }
-        else if (strcmp(command, "aesenc") == 0 || strcmp(command, "aesdec") == 0) {
-            bool encrypt = strcmp(command, "aesenc") == 0;
-            char* key_hex = get_arg(args, 0);
-            char* infile = get_arg(args, 1);
-            char* outfile = get_arg(args, 2);
-            if (!key_hex || !infile || !outfile || strlen(key_hex) != 32) {
-                console_print(encrypt ? "Usage: aesenc <32hexkey> <in> <out>\n" : "Usage: aesdec <32hexkey> <in> <out>\n");
-                return;
-            }
-            bool ok = encrypt ? aes_encrypt_file(key_hex, infile, outfile) : aes_decrypt_file(key_hex, infile, outfile);
-            console_print(ok ? "AES operation successful.\n" : "AES failed.\n");
+	if (strcmp(command, "help") == 0) {
+		console_print("Commands: help, clear, version, time, ps, ls, edit, run, exec,\n"
+					  "  compile, rm, cp, mv, formatfs, chkdsk (/r /f), select_disk,\n"
+					  "  setpass, removepass, unlock, busybox, pself, killelf,\n"
+					  "  killexec, killrun, aesenc, aesdec\n");
+	}
+	else if (strcmp(command, "aesenc") == 0 || strcmp(command, "aesdec") == 0) {
+        bool encrypt = strcmp(command, "aesenc") == 0;
+        char* key_hex = get_arg(args, 0);
+        char* infile = get_arg(args, 1);
+        char* outfile = get_arg(args, 2);
+        if (!key_hex || !infile || !outfile || strlen(key_hex) != 32) {
+            console_print(encrypt ? "Usage: aesenc <32hexkey> <in> <out>\n" : "Usage: aesdec <32hexkey> <in> <out>\n");
+            return;
         }
+        bool ok = encrypt ? aes_encrypt_file(key_hex, infile, outfile) : aes_decrypt_file(key_hex, infile, outfile);
+        console_print(ok ? "AES operation successful.\n" : "AES failed.\n");
+    }
 	else if (strcmp(command, "select_disk") == 0) {
+		g_disk_unlocked = false;
+		fs_crypto_clear();                   // wipe key on disk switch
 		cmd_list_and_select_disk(args);
+		if (disk_has_password())
+			console_print("This disk is password protected. Use: unlock <password>\n");
+	}
+
+	else if (strcmp(command, "unlock") == 0) {
+		if (!disk_has_password()) {
+			console_print("No password set. Use: setpass <password>\n");
+		} else if (g_disk_unlocked) {
+			console_print("Disk already unlocked.\n");
+		} else {
+			char* pw = get_arg(args, 0);
+			if (!pw) {
+				console_print("Usage: unlock <password>\n");
+			} else if (disk_check_password(pw)) {  // arms crypto internally
+				g_disk_unlocked = true;
+				console_print("Disk unlocked and decryption armed.\n");
+			} else {
+				console_print("Wrong password.\n");
+			}
+		}
 	}
 	if (strcmp(command, "compile") == 0) {
         cmd_compile(ahci_base, selected_port, get_arg(args, 0));
@@ -5442,9 +5607,40 @@ void handle_command() {
     else if (strcmp(command, "killexec") == 0) {
         kill_exec_process(simple_atoi(get_arg(args, 0)));
     }
+	
+	else if (strcmp(command, "setpass") == 0) {
+		// Allowed even when locked so the first password can be set,
+		// but changing an existing password requires unlock first.
+		if (disk_has_password() && !g_disk_unlocked) {
+			console_print("Disk locked. Unlock before changing password.\n");
+		} else {
+			char* pw = get_arg(args, 0);
+			if (!pw || strlen(pw) < 4) {
+				console_print("Usage: setpass <password>  (min 4 chars)\n");
+			} else {
+				if (disk_set_password(pw)) {
+					g_disk_unlocked = true; // creator is implicitly unlocked
+					console_print("Password set. Disk is now protected.\n");
+				} else {
+					console_print("Failed to write password file.\n");
+				}
+			}
+		}
+	}
+	else if (strcmp(command, "removepass") == 0) {
+		char* pw = get_arg(args, 0);
+		if (!pw) {
+			console_print("Usage: removepass <current_password>\n");
+		} else if (disk_remove_password(pw)) {
+			g_disk_unlocked = false; // reset session state
+			console_print("Password removed. Disk is now open.\n");
+		} else {
+			console_print("Wrong password.\n");
+		}
+	}
     else if (strcmp(command, "clear") == 0) { line_count = 0; memset(buffer, 0, sizeof(buffer)); }
     else if (strcmp(command, "ls") == 0) { fat32_list_files(); }
-    else if (strcmp(command, "edit") == 0) {
+    else if (strcmp(command, "edit") == 0 && g_disk_unlocked) {
         char* filename = get_arg(args, 0);
         if(filename) {
             strncpy(edit_filename, filename, 31);
@@ -5490,7 +5686,7 @@ void handle_command() {
         }
     }
     
-    else if (strcmp(command, "rm") == 0) { 
+    else if (strcmp(command, "rm") == 0 && g_disk_unlocked) { 
         char* filename = get_arg(args, 0); 
         if(filename) { 
             if(fat32_remove_file(filename) == 0) 
@@ -5501,7 +5697,7 @@ void handle_command() {
             console_print("Usage: rm \"<filename>\"\n");
         }
     }
-    else if (strcmp(command, "cp") == 0) {
+    else if (strcmp(command, "cp") == 0 && g_disk_unlocked) {
         char args_for_src[120];
         strncpy(args_for_src, args, 119);
         char* src = get_arg(args_for_src, 0);
@@ -5532,7 +5728,7 @@ void handle_command() {
             }
         }
     }
-    else if (strcmp(command, "mv") == 0) {
+    else if (strcmp(command, "mv") == 0 && g_disk_unlocked) {
         char args_for_src[120];
         strncpy(args_for_src, args, 119);
         char* src = get_arg(args_for_src, 0);
@@ -5551,8 +5747,8 @@ void handle_command() {
             }
         }
     }
-    else if (strcmp(command, "formatfs") == 0) { fat32_format(); }
-    else if (strcmp(command, "chkdsk") == 0) {
+    else if (strcmp(command, "formatfs") == 0 && g_disk_unlocked) { fat32_format(); }
+    else if (strcmp(command, "chkdsk") == 0 && g_disk_unlocked) {
         char* args_copy = new char[120];
         strncpy(args_copy, args, 119);
         args_copy[119] = '\0';
