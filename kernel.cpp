@@ -5747,7 +5747,7 @@ void handle_command() {
             }
         }
     }
-    else if (strcmp(command, "formatfs") == 0 && g_disk_unlocked) { fat32_format(); }
+    else if (strcmp(command, "formatfs") == 0) { fat32_format(); }
     else if (strcmp(command, "chkdsk") == 0 && g_disk_unlocked) {
         char* args_copy = new char[120];
         strncpy(args_copy, args, 119);
