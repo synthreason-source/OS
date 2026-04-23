@@ -132,23 +132,24 @@ int fat32_list_directory(const char* path, fat_dir_entry_t* buffer, int max_entr
 int fat32_find_entry(const char* filename, fat_dir_entry_t* entry_out, uint32_t* sector_out, uint32_t* offset_out);
 bool fat32_init();
 
-// --- BusyBox Extraction Function ---
+
+// To match objcopy output:
+// CHANGE TO:
 extern "C" uint8_t ramdisk_start;
 extern "C" uint8_t ramdisk_end;
+
+
+// CHANGE TO:
 bool extract_busybox_to_filesystem() {
     uint8_t* start = &ramdisk_start;
-    uint8_t* end = &ramdisk_end;
-    uint32_t size = (uint32_t)(end - start);
-    
-    if (size == 0 || size > 10 * 1024 * 1024) { // Sanity check: max 10MB
+    uint8_t* end   = &ramdisk_end;
+    uint32_t size  = (uint32_t)(end - start);
+    if (size == 0 || size > 32 * 1024 * 1024) {
         return false;
     }
-    
-    // Write the embedded BusyBox binary to the FAT32 filesystem
     int result = fat32_write_file("busybox", start, size);
     return (result == 0);
 }
-
 // --- Global Clipboard ---
 static char g_clipboard_buffer[1024] = {0}; // New
 
