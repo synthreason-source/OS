@@ -6844,6 +6844,13 @@ static void elf_write8 (ElfProcess* p, uint32_t a, uint8_t  v) { elf_mem_write(p
 static void elf_write16(ElfProcess* p, uint32_t a, uint16_t v) { elf_mem_write(p,a,&v,2); }
 static void elf_write32(ElfProcess* p, uint32_t a, uint32_t v) { elf_mem_write(p,a,&v,4); }
 
+
+static inline void elf_trap(const char* msg) {
+    (void)msg;
+    asm volatile("cli; hlt");
+}
+
+
 // Stack helpers
 static void x86_push(ElfProcess* proc, X86State& cpu, uint32_t val) {
     cpu.esp -= 4;
@@ -7652,58 +7659,6 @@ static bool x86_tick(int slot, int steps) {
                 }
                 break;
             }
-
-            // --- MUL eax, r/m32 (F7 /4) ---
-            // --- DIV eax, r/m32 (F7 /6) ---
-            // --- NEG r/m32 (F7 /3) ---
-            case 0xF7: {
-                uint8_t modrm = elf_read8(proc, cpu.eip++);
-                uint8_t op = (modrm >> 3) & 7;
-                uint8_t rm = modrm & 7;
-                uint32_t* regs[8] = {
-                    &cpu.eax,&cpu.ecx,&cpu.edx,&cpu.ebx,
-                    &cpu.esp,&cpu.ebp,&cpu.esi,&cpu.edi
-                };
-                uint32_t val = ((modrm >> 6) == 3) ? *regs[rm] : elf_read32(proc, decode_modrm(proc, cpu, modrm, nullptr, nullptr));
-                switch (op) {
-                    case 2: { // NOT
-                        if ((modrm >> 6) == 3) *regs[rm] = ~val;
-                        break;
-                    }
-                    case 3: { // NEG
-                        if ((modrm >> 6) == 3) { *regs[rm] = (uint32_t)(-(int32_t)val); set_flags_logic(cpu, *regs[rm]); }
-                        break;
-                    }
-                    case 4: { // MUL  — unsigned
-						uint64_t result = (uint64_t)cpu.eax * (uint64_t)val;
-						cpu.eax = (uint32_t)(result & 0xFFFFFFFF);
-						cpu.edx = (uint32_t)(result >> 32);
-						break;
-					}
-					case 5: { // IMUL — signed, needs int64_t
-						int64_t result = (int64_t)(int32_t)cpu.eax * (int64_t)(int32_t)val;
-						cpu.eax = (uint32_t)((uint64_t)result & 0xFFFFFFFF);
-						cpu.edx = (uint32_t)((uint64_t)result >> 32);
-						break;
-					}
-					case 6: { // DIV  — unsigned
-						if (val == 0) { proc->completed = true; proc->active = false; break; }
-						uint64_t dividend = ((uint64_t)cpu.edx << 32) | cpu.eax;
-						cpu.eax = (uint32_t)(dividend / val);
-						cpu.edx = (uint32_t)(dividend % val);
-						break;
-					}
-					case 7: { // IDIV — signed
-						if (val == 0) { proc->completed = true; proc->active = false; break; }
-						int64_t dividend = ((int64_t)(int32_t)cpu.edx << 32) | (uint64_t)cpu.eax;
-						cpu.eax = (uint32_t)((int32_t)(dividend / (int32_t)val));
-						cpu.edx = (uint32_t)((int32_t)(dividend % (int32_t)val));
-						break;
-					}
-                }
-                break;
-            }
-
             // --- XCHG eax, r32 (91-97) ---
             case 0x91: case 0x92: case 0x93: case 0x94:
             case 0x95: case 0x96: case 0x97: {
@@ -7754,7 +7709,88 @@ static bool x86_tick(int slot, int steps) {
                 proc->active    = false;
                 return false;
             }
+			case 0xF7: {
+				uint8_t modrm = elf_read8(proc, cpu.eip++);
+				uint8_t reg = (modrm >> 3) & 7;
+				uint8_t mod = (modrm >> 6) & 3;
+				uint8_t rm  = modrm & 7;
 
+				uint32_t* regs[8] = {
+					&cpu.eax,&cpu.ecx,&cpu.edx,&cpu.ebx,
+					&cpu.esp,&cpu.ebp,&cpu.esi,&cpu.edi
+				};
+
+				uint32_t val = 0;
+				if (mod == 3) {
+					val = *regs[rm];
+				} else {
+					// If you already have effective-address decode, use it here.
+					// Example:
+					// uint32_t ridx; uint32_t* rp;
+					// uint32_t ea = decode_modrm(proc, cpu, modrm, &ridx, &rp);
+					// val = elf_read32(proc, ea);
+					// For now, if memory operands aren't implemented yet, trap clearly.
+					elf_trap("F7 memory operand not implemented");
+				}
+
+				switch (reg) {
+					case 0: { // TEST r/m32, imm32
+						uint32_t imm = elf_read32(proc, cpu.eip); cpu.eip += 4;
+						set_flags_logic(cpu, val & imm);
+						break;
+					}
+					case 2: { // NOT r/m32
+						if (mod == 3) *regs[rm] = ~val;
+						else elf_trap("F7 /2 memory operand not implemented");
+						break;
+					}
+					case 3: { // NEG r/m32
+						if (mod == 3) {
+							uint32_t result = (uint32_t)(0u - val);
+							set_flags_sub(cpu, 0, val, result);
+							*regs[rm] = result;
+						} else {
+							elf_trap("F7 /3 memory operand not implemented");
+						}
+						break;
+					}
+					case 4: { // MUL r/m32 => EDX:EAX = EAX * r/m32
+						uint64_t prod = (uint64_t)cpu.eax * (uint64_t)val;
+						cpu.eax = (uint32_t)(prod & 0xFFFFFFFFu);
+						cpu.edx = (uint32_t)(prod >> 32);
+						if (cpu.edx) cpu.eflags |= FLAG_CF | FLAG_OF;
+						else cpu.eflags &= ~(FLAG_CF | FLAG_OF);
+						break;
+					}
+					case 5: { // IMUL r/m32 => EDX:EAX = EAX * signed(r/m32)
+						int64_t prod = (int64_t)(int32_t)cpu.eax * (int64_t)(int32_t)val;
+						cpu.eax = (uint32_t)(prod & 0xFFFFFFFFu);
+						cpu.edx = (uint32_t)((uint64_t)prod >> 32);
+						int64_t signext = (int64_t)(int32_t)cpu.eax;
+						if (prod != signext) cpu.eflags |= FLAG_CF | FLAG_OF;
+						else cpu.eflags &= ~(FLAG_CF | FLAG_OF);
+						break;
+					}
+					case 6: { // DIV r/m32 => EDX:EAX / r/m32
+						if (val == 0) elf_trap("divide by zero");
+						uint64_t dividend = ((uint64_t)cpu.edx << 32) | cpu.eax;
+						cpu.eax = (uint32_t)(dividend / val);
+						cpu.edx = (uint32_t)(dividend % val);
+						break;
+					}
+					case 7: { // IDIV r/m32 => signed EDX:EAX / r/m32
+						if (val == 0) elf_trap("divide by zero");
+						int64_t dividend = ((int64_t)(int32_t)cpu.edx << 32) | (uint32_t)cpu.eax;
+						int32_t divisor = (int32_t)val;
+						cpu.eax = (uint32_t)(dividend / divisor);
+						cpu.edx = (uint32_t)(dividend % divisor);
+						break;
+					}
+					default:
+						elf_trap("unsupported F7 subopcode");
+				}
+				break;
+			}
             default: {
                 // Unknown opcode - log and halt process
                 char msg[64];
