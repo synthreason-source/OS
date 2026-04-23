@@ -5,7 +5,7 @@
  * Unified color palette prevents inconsistencies
  * State machine ensures complete frames with no trailing
  */
-
+#include <cstddef>
 #include <cstdarg>
 #include <cstdint>
 // =============================================================================
@@ -6806,21 +6806,28 @@ static void set_flags_logic(X86State& cpu, uint32_t result) {
     if (result & 0x80000000) cpu.eflags |= FLAG_SF;
 }
 
-// Safe memory read from process address space
+
+
+static inline void elf_trap(const char* msg) {
+    (void)msg;
+	wm.print_to_focused(msg);
+
+    //asm volatile("cli; hlt");
+}
 static bool elf_mem_read(ElfProcess* proc, uint32_t addr, void* out, uint32_t size) {
-    // Check main memory
+    // Main image (loaded ELF segments)
     if (addr + size <= proc->memory_size) {
         memcpy(out, proc->memory_base + addr, size);
         return true;
     }
-    // Check stack (mapped above memory_size)
-    uint32_t stack_base = 0x80000000;
-    uint32_t stack_top  = stack_base + ELF_STACK_SIZE;
-    if (addr >= stack_base && addr + size <= stack_top) {
-        memcpy(out, proc->stack + (addr - stack_base), size);
+    // Stack (mapped at 0x80000000)
+    const uint32_t SB = 0x80000000u;
+    if (addr >= SB && addr + size <= SB + (uint32_t)ELF_STACK_SIZE) {
+        memcpy(out, proc->stack + (addr - SB), size);
         return true;
     }
-    return false;
+    memset(out, 0, size);
+    return true;
 }
 
 static bool elf_mem_write(ElfProcess* proc, uint32_t addr, const void* in, uint32_t size) {
@@ -6828,29 +6835,19 @@ static bool elf_mem_write(ElfProcess* proc, uint32_t addr, const void* in, uint3
         memcpy(proc->memory_base + addr, in, size);
         return true;
     }
-    uint32_t stack_base = 0x80000000;
-    uint32_t stack_top  = stack_base + ELF_STACK_SIZE;
-    if (addr >= stack_base && addr + size <= stack_top) {
-        memcpy(proc->stack + (addr - stack_base), in, size);
+    const uint32_t SB = 0x80000000u;
+    if (addr >= SB && addr + size <= SB + (uint32_t)ELF_STACK_SIZE) {
+        memcpy(proc->stack + (addr - SB), in, size);
         return true;
     }
-    return false;
+    return true; // silently ignore out-of-range writes
 }
-
 static uint8_t  elf_read8 (ElfProcess* p, uint32_t a) { uint8_t  v=0; elf_mem_read(p,a,&v,1); return v; }
 static uint16_t elf_read16(ElfProcess* p, uint32_t a) { uint16_t v=0; elf_mem_read(p,a,&v,2); return v; }
 static uint32_t elf_read32(ElfProcess* p, uint32_t a) { uint32_t v=0; elf_mem_read(p,a,&v,4); return v; }
 static void elf_write8 (ElfProcess* p, uint32_t a, uint8_t  v) { elf_mem_write(p,a,&v,1); }
 static void elf_write16(ElfProcess* p, uint32_t a, uint16_t v) { elf_mem_write(p,a,&v,2); }
 static void elf_write32(ElfProcess* p, uint32_t a, uint32_t v) { elf_mem_write(p,a,&v,4); }
-
-
-static inline void elf_trap(const char* msg) {
-    (void)msg;
-	wm.print_to_focused(msg);
-
-    asm volatile("cli; hlt");
-}
 
 
 // Stack helpers
@@ -6979,922 +6976,1508 @@ static bool handle_syscall(ElfProcess* proc, X86State& cpu) {
     }
     return true;
 }
+// =============================================================================
+// COMPLETE x86-32 EMULATOR — drop-in replacement for x86_tick()
+// Covers the full primary opcode map (0x00-0xFF) plus essential 0x0F two-byte
+// opcodes. Designed for flat 32-bit memory model (no segments, no paging).
+// =============================================================================
 
-// Main x86 decode/execute - runs 'steps' instructions
-// Returns false if process should stop
+// ── Flag bit positions ────────────────────────────────────────────────────
+#define FLAG_CF  (1u <<  0)   // Carry
+#define FLAG_PF  (1u <<  2)   // Parity
+#define FLAG_AF  (1u <<  4)   // Auxiliary carry
+#define FLAG_ZF  (1u <<  6)   // Zero
+#define FLAG_SF  (1u <<  7)   // Sign
+#define FLAG_TF  (1u <<  8)   // Trap
+#define FLAG_IF  (1u <<  9)   // Interrupt enable
+#define FLAG_DF  (1u << 10)   // Direction
+#define FLAG_OF  (1u << 11)   // Overflow
+
+// ── Memory helpers ────────────────────────────────────────────────────────
+// Replace your existing elf_mem_read/write with these — they never crash on
+// out-of-range access (silently return 0 on read, ignore on write).
+
+
+
+
+// ── Flag helpers ──────────────────────────────────────────────────────────
+static inline uint8_t parity8(uint8_t v) {
+    v ^= v >> 4; v ^= v >> 2; v ^= v >> 1; return (~v) & 1;
+}
+
+static void set_flags_add32(X86State& cpu, uint32_t a, uint32_t b, uint32_t r) {
+    cpu.eflags &= ~(FLAG_CF|FLAG_OF|FLAG_SF|FLAG_ZF|FLAG_PF|FLAG_AF);
+    if (r == 0)           cpu.eflags |= FLAG_ZF;
+    if (r & 0x80000000u)  cpu.eflags |= FLAG_SF;
+    if (r < a)            cpu.eflags |= FLAG_CF;
+    if ((~(a^b) & (a^r)) & 0x80000000u) cpu.eflags |= FLAG_OF;
+    if (parity8(r & 0xFF)) cpu.eflags |= FLAG_PF;
+    if ((a & 0xF) + (b & 0xF) > 0xF) cpu.eflags |= FLAG_AF;
+}
+
+static void set_flags_sub32(X86State& cpu, uint32_t a, uint32_t b, uint32_t r) {
+    cpu.eflags &= ~(FLAG_CF|FLAG_OF|FLAG_SF|FLAG_ZF|FLAG_PF|FLAG_AF);
+    if (r == 0)           cpu.eflags |= FLAG_ZF;
+    if (r & 0x80000000u)  cpu.eflags |= FLAG_SF;
+    if (a < b)            cpu.eflags |= FLAG_CF;
+    if (((a^b) & (a^r)) & 0x80000000u) cpu.eflags |= FLAG_OF;
+    if (parity8(r & 0xFF)) cpu.eflags |= FLAG_PF;
+    if ((a & 0xF) < (b & 0xF)) cpu.eflags |= FLAG_AF;
+}
+
+static void set_flags_log32(X86State& cpu, uint32_t r) {
+    cpu.eflags &= ~(FLAG_CF|FLAG_OF|FLAG_SF|FLAG_ZF|FLAG_PF);
+    if (r == 0)          cpu.eflags |= FLAG_ZF;
+    if (r & 0x80000000u) cpu.eflags |= FLAG_SF;
+    if (parity8(r & 0xFF)) cpu.eflags |= FLAG_PF;
+}
+
+static void set_flags_add8(X86State& cpu, uint8_t a, uint8_t b, uint8_t r) {
+    cpu.eflags &= ~(FLAG_CF|FLAG_OF|FLAG_SF|FLAG_ZF|FLAG_PF|FLAG_AF);
+    if (r == 0)       cpu.eflags |= FLAG_ZF;
+    if (r & 0x80)     cpu.eflags |= FLAG_SF;
+    if (r < a)        cpu.eflags |= FLAG_CF;
+    if ((~(a^b)&(a^r)) & 0x80) cpu.eflags |= FLAG_OF;
+    if (parity8(r))   cpu.eflags |= FLAG_PF;
+    if ((a&0xF)+(b&0xF) > 0xF) cpu.eflags |= FLAG_AF;
+}
+
+static void set_flags_sub8(X86State& cpu, uint8_t a, uint8_t b, uint8_t r) {
+    cpu.eflags &= ~(FLAG_CF|FLAG_OF|FLAG_SF|FLAG_ZF|FLAG_PF|FLAG_AF);
+    if (r == 0)   cpu.eflags |= FLAG_ZF;
+    if (r & 0x80) cpu.eflags |= FLAG_SF;
+    if (a < b)    cpu.eflags |= FLAG_CF;
+    if (((a^b)&(a^r)) & 0x80) cpu.eflags |= FLAG_OF;
+    if (parity8(r)) cpu.eflags |= FLAG_PF;
+    if ((a&0xF) < (b&0xF)) cpu.eflags |= FLAG_AF;
+}
+
+static void set_flags_log8(X86State& cpu, uint8_t r) {
+    cpu.eflags &= ~(FLAG_CF|FLAG_OF|FLAG_SF|FLAG_ZF|FLAG_PF);
+    if (r == 0)   cpu.eflags |= FLAG_ZF;
+    if (r & 0x80) cpu.eflags |= FLAG_SF;
+    if (parity8(r)) cpu.eflags |= FLAG_PF;
+}
+
+// ── Register file ─────────────────────────────────────────────────────────
+// Helper — maps ModRM reg/rm field to 32-bit register pointer
+static inline uint32_t* REG32(X86State& cpu, int n) {
+    static const size_t offsets[8] = {
+        offsetof(X86State,eax), offsetof(X86State,ecx),
+        offsetof(X86State,edx), offsetof(X86State,ebx),
+        offsetof(X86State,esp), offsetof(X86State,ebp),
+        offsetof(X86State,esi), offsetof(X86State,edi)
+    };
+    return (uint32_t*)((char*)&cpu + offsets[n & 7]);
+}
+
+// Low byte of eax/ecx/edx/ebx, high byte of eax/ecx/edx/ebx
+static inline uint8_t* REG8(X86State& cpu, int n) {
+    uint32_t* r32 = REG32(cpu, n & 3);
+    uint8_t* p = (uint8_t*)r32;
+    return (n & 4) ? p + 1 : p;  // AH/CH/DH/BH vs AL/CL/DL/BL
+}
+
+// ── ModRM / SIB / displacement decoder ───────────────────────────────────
+// Returns effective address for memory operands (mod != 3).
+// For mod == 3 returns 0 — caller must use REG32 instead.
+// Advances cpu.eip past ModRM, SIB, and displacement.
+struct ModRM {
+    uint8_t mod, reg, rm;
+    uint32_t ea;       // effective address (valid when mod != 3)
+    bool is_mem;       // true when mod != 3
+};
+
+static ModRM decode_modrm32(ElfProcess* proc, X86State& cpu) {
+    ModRM m;
+    uint8_t byte = elf_read8(proc, cpu.eip++);
+    m.mod = (byte >> 6) & 3;
+    m.reg = (byte >> 3) & 7;
+    m.rm  = byte & 7;
+    m.is_mem = (m.mod != 3);
+    m.ea = 0;
+
+    if (!m.is_mem) return m;
+
+    // SIB byte
+    uint32_t base = 0, index = 0, scale = 0;
+    bool has_sib = (m.rm == 4);
+    if (has_sib) {
+        uint8_t sib = elf_read8(proc, cpu.eip++);
+        scale = (sib >> 6) & 3;
+        uint8_t idx  = (sib >> 3) & 7;
+        uint8_t bas  = sib & 7;
+        base = *REG32(cpu, bas);
+        if (idx != 4) index = *REG32(cpu, idx) << scale;
+    }
+
+    // Base
+    if (!has_sib) {
+        if (m.mod == 0 && m.rm == 5) {
+            // disp32 only
+            m.ea = elf_read32(proc, cpu.eip); cpu.eip += 4;
+            return m;
+        }
+        base = *REG32(cpu, m.rm);
+    } else if (m.mod == 0 && (m.rm == 4) && (byte & 7) == 5) {
+        // SIB with mod==0, base==5 => disp32 instead of EBP
+        base = elf_read32(proc, cpu.eip); cpu.eip += 4;
+    }
+
+    m.ea = base + index;
+
+    // Displacement
+    if (m.mod == 1) { m.ea += (int32_t)(int8_t)elf_read8(proc, cpu.eip++); }
+    if (m.mod == 2) { m.ea += (int32_t)(int32_t)elf_read32(proc, cpu.eip); cpu.eip += 4; }
+
+    return m;
+}
+
+// ── Read/write through ModRM (32-bit) ────────────────────────────────────
+static uint32_t modrm_read32(ElfProcess* proc, X86State& cpu, const ModRM& m) {
+    return m.is_mem ? elf_read32(proc, m.ea) : *REG32(cpu, m.rm);
+}
+static void modrm_write32(ElfProcess* proc, X86State& cpu, const ModRM& m, uint32_t v) {
+    if (m.is_mem) elf_write32(proc, m.ea, v);
+    else *REG32(cpu, m.rm) = v;
+}
+
+// ── Read/write through ModRM (8-bit) ─────────────────────────────────────
+static uint8_t modrm_read8(ElfProcess* proc, X86State& cpu, const ModRM& m) {
+    return m.is_mem ? elf_read8(proc, m.ea) : *REG8(cpu, m.rm);
+}
+static void modrm_write8(ElfProcess* proc, X86State& cpu, const ModRM& m, uint8_t v) {
+    if (m.is_mem) elf_write8(proc, m.ea, v);
+    else *REG8(cpu, m.rm) = v;
+}
+
+// ── Stack helpers ─────────────────────────────────────────────────────────
+static void push32(ElfProcess* proc, X86State& cpu, uint32_t v) {
+    cpu.esp -= 4;
+    elf_write32(proc, cpu.esp, v);
+}
+static uint32_t pop32(ElfProcess* proc, X86State& cpu) {
+    uint32_t v = elf_read32(proc, cpu.esp);
+    cpu.esp += 4;
+    return v;
+}
+
+// ── Linux syscall handler ─────────────────────────────────────────────────
+// Returns false if process should stop executing.
+static bool handle_linux_syscall(ElfProcess* proc, X86State& cpu) {
+    switch (cpu.eax) {
+        case 1: // exit(ebx)
+            proc->exit_code = cpu.ebx;
+            proc->completed = true;
+            proc->active    = false;
+            return false;
+
+        case 3: { // read(fd, buf, count)
+            if (cpu.ebx == 0) { // stdin
+                proc->waiting_for_input = true;
+                // Will resume when feed_elf_input() is called
+            }
+            cpu.eax = 0;
+            break;
+        }
+
+        case 4: { // write(fd, buf, count)
+            if (cpu.ebx == 1 || cpu.ebx == 2) {
+                uint32_t addr  = cpu.ecx;
+                uint32_t count = cpu.edx;
+                if (count > 65536) count = 65536;
+                for (uint32_t i = 0; i < count; i++) {
+                    char c = (char)elf_read8(proc, addr + i);
+                    proc->push_output(c);
+                }
+                cpu.eax = count;
+            } else {
+                cpu.eax = (uint32_t)-9; // EBADF
+            }
+            break;
+        }
+
+        case 6:  // close
+            cpu.eax = 0;
+            break;
+
+        case 20: // getpid
+            cpu.eax = 1;
+            break;
+
+        case 33: // access
+            cpu.eax = (uint32_t)-1;
+            break;
+
+        case 45: { // brk
+            static uint32_t brk_ptr = 0;
+            if (brk_ptr == 0) brk_ptr = proc->memory_size;
+            if (cpu.ebx == 0 || cpu.ebx < proc->memory_size) {
+                cpu.eax = brk_ptr;
+            } else {
+                brk_ptr = cpu.ebx;
+                cpu.eax = brk_ptr;
+            }
+            break;
+        }
+
+        case 54:  // ioctl
+            cpu.eax = (uint32_t)-1;
+            break;
+
+        case 90:  // mmap (old)
+        case 192: { // mmap2
+            // Return a fake mapping in the heap area
+            static uint32_t mmap_bump = 0x40000000u;
+            cpu.eax = mmap_bump;
+            mmap_bump += (cpu.edx + 4095) & ~4095u; // round up page
+            break;
+        }
+
+        case 91:  // munmap - ignore
+            cpu.eax = 0;
+            break;
+
+        case 122: // uname
+            cpu.eax = 0;
+            break;
+
+        case 125: // mprotect - ignore
+            cpu.eax = 0;
+            break;
+
+        case 174: // rt_sigaction - ignore
+            cpu.eax = 0;
+            break;
+
+        case 175: // rt_sigprocmask - ignore
+            cpu.eax = 0;
+            break;
+
+        case 197: // fstat64
+            cpu.eax = (uint32_t)-1;
+            break;
+
+        case 199: // getuid32
+        case 200: // getgid32
+        case 201: // geteuid32
+        case 202: // getegid32
+            cpu.eax = 0;
+            break;
+
+        case 252: // exit_group
+            proc->exit_code = cpu.ebx;
+            proc->completed = true;
+            proc->active    = false;
+            return false;
+
+        default:
+            cpu.eax = (uint32_t)-38; // ENOSYS
+            break;
+    }
+    return true;
+}
+
+// ── Group-1 ALU (0x80/0x81/0x83) inner dispatch ──────────────────────────
+// op: 0=ADD 1=OR 2=ADC 3=SBB 4=AND 5=SUB 6=XOR 7=CMP
+static uint32_t alu32(X86State& cpu, uint8_t op, uint32_t a, uint32_t b, bool store) {
+    uint32_t cf = (cpu.eflags & FLAG_CF) ? 1 : 0;
+    uint32_t r = a;
+    switch (op & 7) {
+        case 0: r = a + b;      set_flags_add32(cpu, a, b, r); break;
+        case 1: r = a | b;      set_flags_log32(cpu, r); break;
+        case 2: r = a + b + cf; set_flags_add32(cpu, a, b+cf, r); break;
+        case 3: r = a - b - cf; set_flags_sub32(cpu, a, b+cf, r); break;
+        case 4: r = a & b;      set_flags_log32(cpu, r); break;
+        case 5: r = a - b;      set_flags_sub32(cpu, a, b, r); break;
+        case 6: r = a ^ b;      set_flags_log32(cpu, r); break;
+        case 7: r = a - b;      set_flags_sub32(cpu, a, b, r); r = a; break; // CMP
+    }
+    return r;
+}
+
+static uint8_t alu8(X86State& cpu, uint8_t op, uint8_t a, uint8_t b) {
+    uint8_t cf = (cpu.eflags & FLAG_CF) ? 1 : 0;
+    uint8_t r = a;
+    switch (op & 7) {
+        case 0: r = a + b;      set_flags_add8(cpu, a, b, r); break;
+        case 1: r = a | b;      set_flags_log8(cpu, r); break;
+        case 2: r = a + b + cf; set_flags_add8(cpu, a, b+cf, r); break;
+        case 3: r = a - b - cf; set_flags_sub8(cpu, a, b+cf, r); break;
+        case 4: r = a & b;      set_flags_log8(cpu, r); break;
+        case 5: r = a - b;      set_flags_sub8(cpu, a, b, r); break;
+        case 6: r = a ^ b;      set_flags_log8(cpu, r); break;
+        case 7: r = a - b;      set_flags_sub8(cpu, a, b, r); r = a; break;
+    }
+    return r;
+}
+
+// ── Shift/rotate helpers ──────────────────────────────────────────────────
+static uint32_t shift32(X86State& cpu, uint8_t op, uint32_t v, uint8_t count) {
+    if (count == 0) return v;
+    count &= 31;
+    uint32_t r = v;
+    uint32_t cf_in = (cpu.eflags & FLAG_CF) ? 1 : 0;
+    cpu.eflags &= ~(FLAG_CF|FLAG_OF|FLAG_SF|FLAG_ZF|FLAG_PF);
+    switch (op & 7) {
+        case 0: // ROL
+            r = (v << count) | (v >> (32 - count));
+            if (r & 1) cpu.eflags |= FLAG_CF;
+            if (count == 1 && ((r >> 31) ^ (r & 1))) cpu.eflags |= FLAG_OF;
+            break;
+        case 1: // ROR
+            r = (v >> count) | (v << (32 - count));
+            if (r >> 31) cpu.eflags |= FLAG_CF;
+            if (count == 1 && ((r >> 31) ^ ((r >> 30) & 1))) cpu.eflags |= FLAG_OF;
+            break;
+        case 2: // RCL
+            for (uint8_t i = 0; i < count; i++) {
+                uint32_t new_cf = v >> 31;
+                v = (v << 1) | cf_in;
+                cf_in = new_cf;
+            }
+            r = v;
+            if (cf_in) cpu.eflags |= FLAG_CF;
+            break;
+        case 3: // RCR
+            for (uint8_t i = 0; i < count; i++) {
+                uint32_t new_cf = v & 1;
+                v = (v >> 1) | (cf_in << 31);
+                cf_in = new_cf;
+            }
+            r = v;
+            if (cf_in) cpu.eflags |= FLAG_CF;
+            break;
+        case 4: case 6: // SHL/SAL
+            if (count <= 32) {
+                if (count == 32) cpu.eflags |= (v & 1) ? FLAG_CF : 0;
+                else if ((v >> (32 - count)) & 1) cpu.eflags |= FLAG_CF;
+            }
+            r = v << count;
+            if (count == 1 && ((r >> 31) ^ ((cpu.eflags & FLAG_CF) ? 1u : 0u)))
+                cpu.eflags |= FLAG_OF;
+            break;
+        case 5: // SHR
+            if (count <= 32) {
+                if ((v >> (count - 1)) & 1) cpu.eflags |= FLAG_CF;
+            }
+            r = v >> count;
+            if (count == 1 && (v >> 31)) cpu.eflags |= FLAG_OF;
+            break;
+        case 7: // SAR
+            if (count <= 32) {
+                if ((v >> (count - 1)) & 1) cpu.eflags |= FLAG_CF;
+            }
+            r = (uint32_t)((int32_t)v >> count);
+            break;
+    }
+    if (r == 0)          cpu.eflags |= FLAG_ZF;
+    if (r & 0x80000000u) cpu.eflags |= FLAG_SF;
+    if (parity8(r & 0xFF)) cpu.eflags |= FLAG_PF;
+    return r;
+}
+
+static uint8_t shift8(X86State& cpu, uint8_t op, uint8_t v, uint8_t count) {
+    if (count == 0) return v;
+    count &= 7;
+    uint8_t r = v;
+    uint8_t cf_in = (cpu.eflags & FLAG_CF) ? 1 : 0;
+    cpu.eflags &= ~(FLAG_CF|FLAG_OF|FLAG_SF|FLAG_ZF|FLAG_PF);
+    switch (op & 7) {
+        case 0: r = (v << count) | (v >> (8 - count)); if (r & 1) cpu.eflags|=FLAG_CF; break; // ROL
+        case 1: r = (v >> count) | (v << (8 - count)); if (r>>7) cpu.eflags|=FLAG_CF; break;  // ROR
+        case 4: case 6: // SHL
+            if (count && (v >> (8 - count)) & 1) cpu.eflags |= FLAG_CF;
+            r = v << count; break;
+        case 5: // SHR
+            if (count && (v >> (count - 1)) & 1) cpu.eflags |= FLAG_CF;
+            r = v >> count; break;
+        case 7: // SAR
+            if (count && (v >> (count - 1)) & 1) cpu.eflags |= FLAG_CF;
+            r = (uint8_t)((int8_t)v >> count); break;
+    }
+    if (r == 0)   cpu.eflags |= FLAG_ZF;
+    if (r & 0x80) cpu.eflags |= FLAG_SF;
+    if (parity8(r)) cpu.eflags |= FLAG_PF;
+    return r;
+}
+
+// ── Condition code evaluator ──────────────────────────────────────────────
+static bool eval_cc(const X86State& cpu, uint8_t cc) {
+    bool CF = cpu.eflags & FLAG_CF;
+    bool ZF = cpu.eflags & FLAG_ZF;
+    bool SF = cpu.eflags & FLAG_SF;
+    bool OF = cpu.eflags & FLAG_OF;
+    bool PF = cpu.eflags & FLAG_PF;
+    switch (cc & 0xF) {
+        case 0x0: return  OF;          // O
+        case 0x1: return !OF;          // NO
+        case 0x2: return  CF;          // B/NAE/C
+        case 0x3: return !CF;          // NB/AE/NC
+        case 0x4: return  ZF;          // E/Z
+        case 0x5: return !ZF;          // NE/NZ
+        case 0x6: return  CF || ZF;    // BE/NA
+        case 0x7: return !CF && !ZF;   // NBE/A
+        case 0x8: return  SF;          // S
+        case 0x9: return !SF;          // NS
+        case 0xA: return  PF;          // P/PE
+        case 0xB: return !PF;          // NP/PO
+        case 0xC: return  SF != OF;    // L/NGE
+        case 0xD: return  SF == OF;    // NL/GE
+        case 0xE: return  ZF || (SF != OF); // LE/NG
+        case 0xF: return !ZF && (SF == OF); // NLE/G
+    }
+    return false;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// MAIN TICK FUNCTION — runs up to `steps` instructions, returns true if
+// process is still running.
+// ─────────────────────────────────────────────────────────────────────────
 static bool x86_tick(int slot, int steps) {
     ElfProcess* proc = &elf_processes[slot];
     X86State&   cpu  = elf_cpu[slot];
 
     if (!proc->active || proc->completed) return false;
-    if (proc->waiting_for_input) return true;
+    if (proc->waiting_for_input)          return true;
 
-    // Initialize CPU state on first run
+    // First-time CPU init
     if (!cpu.initialized) {
         cpu.eax = cpu.ebx = cpu.ecx = cpu.edx = 0;
         cpu.esi = cpu.edi = cpu.ebp = 0;
         cpu.eip    = proc->entry_point;
-        cpu.esp    = 0x80000000 + ELF_STACK_SIZE - 16; // top of stack
-        cpu.eflags = 0x202; // IF set
+        cpu.esp    = 0x80000000u + ELF_STACK_SIZE - 16;
+        cpu.eflags = 0x202u;
         cpu.initialized = true;
-
-        // Push argc=0, argv=null onto stack (minimal startup)
-        x86_push(proc, cpu, 0); // null envp
-        x86_push(proc, cpu, 0); // null argv
-        x86_push(proc, cpu, 0); // argc = 0
+        // Minimal Linux startup stack: argc=0, argv=null, envp=null
+        push32(proc, cpu, 0); // envp end
+        push32(proc, cpu, 0); // argv end
+        push32(proc, cpu, 0); // argc
     }
 
     for (int step = 0; step < steps; step++) {
         if (proc->waiting_for_input || proc->completed) break;
+        if (cpu.eip >= proc->memory_size + ELF_STACK_SIZE) {
+            proc->completed = proc->active = false; break;
+        }
 
-        // Bounds check EIP
-        if (cpu.eip >= proc->memory_size) {
-            proc->completed = true;
-            proc->active    = false;
+        // ── Prefix accumulation ───────────────────────────────────────────
+        bool pfx_66  = false; // operand size override (16-bit)
+        bool pfx_67  = false; // address size override
+        bool pfx_rep = false; // REP
+        bool pfx_repn= false; // REPNE
+        bool pfx_lock= false;
+        uint8_t seg_pfx = 0;  // segment override (ignored in flat model)
+
+    next_byte:
+        uint8_t op = elf_read8(proc, cpu.eip++);
+
+        switch (op) {
+            case 0x26: case 0x2E: case 0x36: case 0x3E:
+            case 0x64: case 0x65: seg_pfx = op; goto next_byte;
+            case 0x66: pfx_66  = true; goto next_byte;
+            case 0x67: pfx_67  = true; goto next_byte;
+            case 0xF0: pfx_lock= true; goto next_byte;
+            case 0xF2: pfx_repn= true; goto next_byte;
+            case 0xF3: pfx_rep = true; goto next_byte;
+            default: break;
+        }
+
+        // ── Instruction dispatch ──────────────────────────────────────────
+        switch (op) {
+
+        // ── 0x00-0x05: ADD ────────────────────────────────────────────────
+        case 0x00: { // ADD r/m8, r8
+            ModRM m = decode_modrm32(proc, cpu);
+            uint8_t a = modrm_read8(proc, cpu, m), b = *REG8(cpu, m.reg);
+            modrm_write8(proc, cpu, m, alu8(cpu, 0, a, b)); break;
+        }
+        case 0x01: { // ADD r/m32, r32
+            ModRM m = decode_modrm32(proc, cpu);
+            uint32_t a = modrm_read32(proc, cpu, m), b = *REG32(cpu, m.reg);
+            modrm_write32(proc, cpu, m, alu32(cpu, 0, a, b, true)); break;
+        }
+        case 0x02: { // ADD r8, r/m8
+            ModRM m = decode_modrm32(proc, cpu);
+            uint8_t a = *REG8(cpu, m.reg), b = modrm_read8(proc, cpu, m);
+            *REG8(cpu, m.reg) = alu8(cpu, 0, a, b); break;
+        }
+        case 0x03: { // ADD r32, r/m32
+            ModRM m = decode_modrm32(proc, cpu);
+            uint32_t a = *REG32(cpu, m.reg), b = modrm_read32(proc, cpu, m);
+            *REG32(cpu, m.reg) = alu32(cpu, 0, a, b, true); break;
+        }
+        case 0x04: { uint8_t i=elf_read8(proc,cpu.eip++); *REG8(cpu,0)=alu8(cpu,0,*REG8(cpu,0),i); break; } // ADD AL,imm8
+        case 0x05: { uint32_t i=elf_read32(proc,cpu.eip); cpu.eip+=4; cpu.eax=alu32(cpu,0,cpu.eax,i,true); break; } // ADD eAX,imm32
+
+        // ── 0x06/07: PUSH/POP ES (no-op in flat) ─────────────────────────
+        case 0x06: push32(proc, cpu, 0); break;
+        case 0x07: pop32(proc, cpu); break;
+
+        // ── 0x08-0x0D: OR ────────────────────────────────────────────────
+        case 0x08: { ModRM m=decode_modrm32(proc,cpu); modrm_write8(proc,cpu,m, alu8(cpu,1,modrm_read8(proc,cpu,m),*REG8(cpu,m.reg))); break; }
+        case 0x09: { ModRM m=decode_modrm32(proc,cpu); modrm_write32(proc,cpu,m, alu32(cpu,1,modrm_read32(proc,cpu,m),*REG32(cpu,m.reg),true)); break; }
+        case 0x0A: { ModRM m=decode_modrm32(proc,cpu); *REG8(cpu,m.reg)=alu8(cpu,1,*REG8(cpu,m.reg),modrm_read8(proc,cpu,m)); break; }
+        case 0x0B: { ModRM m=decode_modrm32(proc,cpu); *REG32(cpu,m.reg)=alu32(cpu,1,*REG32(cpu,m.reg),modrm_read32(proc,cpu,m),true); break; }
+        case 0x0C: { uint8_t i=elf_read8(proc,cpu.eip++); *REG8(cpu,0)=alu8(cpu,1,*REG8(cpu,0),i); break; }
+        case 0x0D: { uint32_t i=elf_read32(proc,cpu.eip); cpu.eip+=4; cpu.eax=alu32(cpu,1,cpu.eax,i,true); break; }
+
+        // ── 0x0E/0F: PUSH CS / two-byte escape ───────────────────────────
+        case 0x0E: push32(proc, cpu, 0); break;
+        case 0x0F: goto two_byte;
+
+        // ── 0x10-0x15: ADC ───────────────────────────────────────────────
+        case 0x10: { ModRM m=decode_modrm32(proc,cpu); modrm_write8(proc,cpu,m, alu8(cpu,2,modrm_read8(proc,cpu,m),*REG8(cpu,m.reg))); break; }
+        case 0x11: { ModRM m=decode_modrm32(proc,cpu); modrm_write32(proc,cpu,m, alu32(cpu,2,modrm_read32(proc,cpu,m),*REG32(cpu,m.reg),true)); break; }
+        case 0x12: { ModRM m=decode_modrm32(proc,cpu); *REG8(cpu,m.reg)=alu8(cpu,2,*REG8(cpu,m.reg),modrm_read8(proc,cpu,m)); break; }
+        case 0x13: { ModRM m=decode_modrm32(proc,cpu); *REG32(cpu,m.reg)=alu32(cpu,2,*REG32(cpu,m.reg),modrm_read32(proc,cpu,m),true); break; }
+        case 0x14: { uint8_t i=elf_read8(proc,cpu.eip++); *REG8(cpu,0)=alu8(cpu,2,*REG8(cpu,0),i); break; }
+        case 0x15: { uint32_t i=elf_read32(proc,cpu.eip); cpu.eip+=4; cpu.eax=alu32(cpu,2,cpu.eax,i,true); break; }
+
+        // ── 0x16/17: PUSH/POP SS ─────────────────────────────────────────
+        case 0x16: push32(proc, cpu, 0); break;
+        case 0x17: pop32(proc, cpu); break;
+
+        // ── 0x18-0x1D: SBB ───────────────────────────────────────────────
+        case 0x18: { ModRM m=decode_modrm32(proc,cpu); modrm_write8(proc,cpu,m, alu8(cpu,3,modrm_read8(proc,cpu,m),*REG8(cpu,m.reg))); break; }
+        case 0x19: { ModRM m=decode_modrm32(proc,cpu); modrm_write32(proc,cpu,m, alu32(cpu,3,modrm_read32(proc,cpu,m),*REG32(cpu,m.reg),true)); break; }
+        case 0x1A: { ModRM m=decode_modrm32(proc,cpu); *REG8(cpu,m.reg)=alu8(cpu,3,*REG8(cpu,m.reg),modrm_read8(proc,cpu,m)); break; }
+        case 0x1B: { ModRM m=decode_modrm32(proc,cpu); *REG32(cpu,m.reg)=alu32(cpu,3,*REG32(cpu,m.reg),modrm_read32(proc,cpu,m),true); break; }
+        case 0x1C: { uint8_t i=elf_read8(proc,cpu.eip++); *REG8(cpu,0)=alu8(cpu,3,*REG8(cpu,0),i); break; }
+        case 0x1D: { uint32_t i=elf_read32(proc,cpu.eip); cpu.eip+=4; cpu.eax=alu32(cpu,3,cpu.eax,i,true); break; }
+
+        // ── 0x1E/1F: PUSH/POP DS ─────────────────────────────────────────
+        case 0x1E: push32(proc, cpu, 0); break;
+        case 0x1F: pop32(proc, cpu); break;
+
+        // ── 0x20-0x25: AND ───────────────────────────────────────────────
+        case 0x20: { ModRM m=decode_modrm32(proc,cpu); modrm_write8(proc,cpu,m, alu8(cpu,4,modrm_read8(proc,cpu,m),*REG8(cpu,m.reg))); break; }
+        case 0x21: { ModRM m=decode_modrm32(proc,cpu); modrm_write32(proc,cpu,m, alu32(cpu,4,modrm_read32(proc,cpu,m),*REG32(cpu,m.reg),true)); break; }
+        case 0x22: { ModRM m=decode_modrm32(proc,cpu); *REG8(cpu,m.reg)=alu8(cpu,4,*REG8(cpu,m.reg),modrm_read8(proc,cpu,m)); break; }
+        case 0x23: { ModRM m=decode_modrm32(proc,cpu); *REG32(cpu,m.reg)=alu32(cpu,4,*REG32(cpu,m.reg),modrm_read32(proc,cpu,m),true); break; }
+        case 0x24: { uint8_t i=elf_read8(proc,cpu.eip++); *REG8(cpu,0)=alu8(cpu,4,*REG8(cpu,0),i); break; }
+        case 0x25: { uint32_t i=elf_read32(proc,cpu.eip); cpu.eip+=4; cpu.eax=alu32(cpu,4,cpu.eax,i,true); break; }
+
+        // ── 0x26: ES segment prefix (handled above) ───────────────────────
+
+        // ── 0x27: DAA ────────────────────────────────────────────────────
+        case 0x27: {
+            uint8_t al = cpu.eax & 0xFF;
+            if ((al & 0xF) > 9 || (cpu.eflags & FLAG_AF)) {
+                al += 6; cpu.eflags |= FLAG_AF;
+            } else cpu.eflags &= ~FLAG_AF;
+            if (al > 0x9F || (cpu.eflags & FLAG_CF)) {
+                al += 0x60; cpu.eflags |= FLAG_CF;
+            } else cpu.eflags &= ~FLAG_CF;
+            cpu.eax = (cpu.eax & 0xFFFFFF00) | al;
+            set_flags_log8(cpu, al);
             break;
         }
 
-        uint8_t opcode = elf_read8(proc, cpu.eip++);
+        // ── 0x28-0x2D: SUB ───────────────────────────────────────────────
+        case 0x28: { ModRM m=decode_modrm32(proc,cpu); modrm_write8(proc,cpu,m, alu8(cpu,5,modrm_read8(proc,cpu,m),*REG8(cpu,m.reg))); break; }
+        case 0x29: { ModRM m=decode_modrm32(proc,cpu); modrm_write32(proc,cpu,m, alu32(cpu,5,modrm_read32(proc,cpu,m),*REG32(cpu,m.reg),true)); break; }
+        case 0x2A: { ModRM m=decode_modrm32(proc,cpu); *REG8(cpu,m.reg)=alu8(cpu,5,*REG8(cpu,m.reg),modrm_read8(proc,cpu,m)); break; }
+        case 0x2B: { ModRM m=decode_modrm32(proc,cpu); *REG32(cpu,m.reg)=alu32(cpu,5,*REG32(cpu,m.reg),modrm_read32(proc,cpu,m),true); break; }
+        case 0x2C: { uint8_t i=elf_read8(proc,cpu.eip++); *REG8(cpu,0)=alu8(cpu,5,*REG8(cpu,0),i); break; }
+        case 0x2D: { uint32_t i=elf_read32(proc,cpu.eip); cpu.eip+=4; cpu.eax=alu32(cpu,5,cpu.eax,i,true); break; }
 
-        // Handle prefixes
-        bool prefix_66 = false; // operand size override
-        while (opcode == 0x66) { prefix_66 = true; opcode = elf_read8(proc, cpu.eip++); }
+        // ── 0x2F: DAS ────────────────────────────────────────────────────
+        case 0x2F: {
+            uint8_t al = cpu.eax & 0xFF;
+            if ((al & 0xF) > 9 || (cpu.eflags & FLAG_AF)) { al -= 6; cpu.eflags |= FLAG_AF; }
+            if (al > 0x9F || (cpu.eflags & FLAG_CF))       { al -= 0x60; cpu.eflags |= FLAG_CF; }
+            cpu.eax = (cpu.eax & 0xFFFFFF00) | al;
+            set_flags_log8(cpu, al); break;
+        }
 
-        switch (opcode) {
+        // ── 0x30-0x35: XOR ───────────────────────────────────────────────
+        case 0x30: { ModRM m=decode_modrm32(proc,cpu); modrm_write8(proc,cpu,m, alu8(cpu,6,modrm_read8(proc,cpu,m),*REG8(cpu,m.reg))); break; }
+        case 0x31: { ModRM m=decode_modrm32(proc,cpu); modrm_write32(proc,cpu,m, alu32(cpu,6,modrm_read32(proc,cpu,m),*REG32(cpu,m.reg),true)); break; }
+        case 0x32: { ModRM m=decode_modrm32(proc,cpu); *REG8(cpu,m.reg)=alu8(cpu,6,*REG8(cpu,m.reg),modrm_read8(proc,cpu,m)); break; }
+        case 0x33: { ModRM m=decode_modrm32(proc,cpu); *REG32(cpu,m.reg)=alu32(cpu,6,*REG32(cpu,m.reg),modrm_read32(proc,cpu,m),true); break; }
+        case 0x34: { uint8_t i=elf_read8(proc,cpu.eip++); *REG8(cpu,0)=alu8(cpu,6,*REG8(cpu,0),i); break; }
+        case 0x35: { uint32_t i=elf_read32(proc,cpu.eip); cpu.eip+=4; cpu.eax=alu32(cpu,6,cpu.eax,i,true); break; }
 
-            // --- MOV r32, imm32 ---
-            case 0xB8: case 0xB9: case 0xBA: case 0xBB:
-            case 0xBC: case 0xBD: case 0xBE: case 0xBF: {
-                uint32_t* regs[8] = {
-                    &cpu.eax,&cpu.ecx,&cpu.edx,&cpu.ebx,
-                    &cpu.esp,&cpu.ebp,&cpu.esi,&cpu.edi
-                };
-                *regs[opcode - 0xB8] = elf_read32(proc, cpu.eip);
-                cpu.eip += 4;
+        // ── 0x37: AAA ────────────────────────────────────────────────────
+        case 0x37: {
+            if ((cpu.eax & 0xF) > 9 || (cpu.eflags & FLAG_AF)) {
+                cpu.eax += 0x106; cpu.eflags |= FLAG_CF | FLAG_AF;
+            } else cpu.eflags &= ~(FLAG_CF | FLAG_AF);
+            cpu.eax &= 0xFF0F; break;
+        }
+
+        // ── 0x38-0x3D: CMP ───────────────────────────────────────────────
+        case 0x38: { ModRM m=decode_modrm32(proc,cpu); alu8(cpu,7,modrm_read8(proc,cpu,m),*REG8(cpu,m.reg)); break; }
+        case 0x39: { ModRM m=decode_modrm32(proc,cpu); alu32(cpu,7,modrm_read32(proc,cpu,m),*REG32(cpu,m.reg),false); break; }
+        case 0x3A: { ModRM m=decode_modrm32(proc,cpu); alu8(cpu,7,*REG8(cpu,m.reg),modrm_read8(proc,cpu,m)); break; }
+        case 0x3B: { ModRM m=decode_modrm32(proc,cpu); alu32(cpu,7,*REG32(cpu,m.reg),modrm_read32(proc,cpu,m),false); break; }
+        case 0x3C: { uint8_t i=elf_read8(proc,cpu.eip++); alu8(cpu,7,cpu.eax&0xFF,i); break; }
+        case 0x3D: { uint32_t i=elf_read32(proc,cpu.eip); cpu.eip+=4; alu32(cpu,7,cpu.eax,i,false); break; }
+
+        // ── 0x3F: AAS ────────────────────────────────────────────────────
+        case 0x3F: {
+            if ((cpu.eax & 0xF) > 9 || (cpu.eflags & FLAG_AF)) {
+                cpu.eax -= 6; cpu.eax = (cpu.eax - 0x100) & 0xFFFF;
+                cpu.eflags |= FLAG_CF | FLAG_AF;
+            } else cpu.eflags &= ~(FLAG_CF | FLAG_AF);
+            cpu.eax &= 0xFF0F; break;
+        }
+
+        // ── 0x40-0x47: INC r32 ───────────────────────────────────────────
+        case 0x40: case 0x41: case 0x42: case 0x43:
+        case 0x44: case 0x45: case 0x46: case 0x47: {
+            uint32_t* r = REG32(cpu, op & 7);
+            uint32_t old = *r; (*r)++;
+            uint32_t sc = cpu.eflags & FLAG_CF;
+            set_flags_add32(cpu, old, 1, *r);
+            cpu.eflags = (cpu.eflags & ~FLAG_CF) | sc;
+            break;
+        }
+
+        // ── 0x48-0x4F: DEC r32 ───────────────────────────────────────────
+        case 0x48: case 0x49: case 0x4A: case 0x4B:
+        case 0x4C: case 0x4D: case 0x4E: case 0x4F: {
+            uint32_t* r = REG32(cpu, op & 7);
+            uint32_t old = *r; (*r)--;
+            uint32_t sc = cpu.eflags & FLAG_CF;
+            set_flags_sub32(cpu, old, 1, *r);
+            cpu.eflags = (cpu.eflags & ~FLAG_CF) | sc;
+            break;
+        }
+
+        // ── 0x50-0x57: PUSH r32 ──────────────────────────────────────────
+        case 0x50: case 0x51: case 0x52: case 0x53:
+        case 0x54: case 0x55: case 0x56: case 0x57:
+            push32(proc, cpu, *REG32(cpu, op & 7)); break;
+
+        // ── 0x58-0x5F: POP r32 ───────────────────────────────────────────
+        case 0x58: case 0x59: case 0x5A: case 0x5B:
+        case 0x5C: case 0x5D: case 0x5E: case 0x5F:
+            *REG32(cpu, op & 7) = pop32(proc, cpu); break;
+
+        // ── 0x60: PUSHA ──────────────────────────────────────────────────
+        case 0x60: {
+            uint32_t esp = cpu.esp;
+            push32(proc,cpu,cpu.eax); push32(proc,cpu,cpu.ecx);
+            push32(proc,cpu,cpu.edx); push32(proc,cpu,cpu.ebx);
+            push32(proc,cpu,esp);     push32(proc,cpu,cpu.ebp);
+            push32(proc,cpu,cpu.esi); push32(proc,cpu,cpu.edi);
+            break;
+        }
+
+        // ── 0x61: POPA ───────────────────────────────────────────────────
+        case 0x61: {
+            cpu.edi=pop32(proc,cpu); cpu.esi=pop32(proc,cpu);
+            cpu.ebp=pop32(proc,cpu); pop32(proc,cpu); // skip esp
+            cpu.ebx=pop32(proc,cpu); cpu.edx=pop32(proc,cpu);
+            cpu.ecx=pop32(proc,cpu); cpu.eax=pop32(proc,cpu);
+            break;
+        }
+
+        // ── 0x62: BOUND — ignore ─────────────────────────────────────────
+        case 0x62: { decode_modrm32(proc,cpu); break; }
+
+        // ── 0x63: ARPL — ignore ──────────────────────────────────────────
+        case 0x63: { decode_modrm32(proc,cpu); break; }
+
+        // ── 0x68: PUSH imm32 ─────────────────────────────────────────────
+        case 0x68: { uint32_t i=elf_read32(proc,cpu.eip); cpu.eip+=4; push32(proc,cpu,i); break; }
+
+        // ── 0x69: IMUL r32, r/m32, imm32 ─────────────────────────────────
+        case 0x69: {
+            ModRM m=decode_modrm32(proc,cpu);
+            int32_t a=(int32_t)modrm_read32(proc,cpu,m);
+            int32_t b=(int32_t)(int32_t)elf_read32(proc,cpu.eip); cpu.eip+=4;
+            *REG32(cpu,m.reg)=(uint32_t)(a*b); break;
+        }
+
+        // ── 0x6A: PUSH imm8 (sign-extended) ─────────────────────────────
+        case 0x6A: { int32_t i=(int8_t)elf_read8(proc,cpu.eip++); push32(proc,cpu,(uint32_t)i); break; }
+
+        // ── 0x6B: IMUL r32, r/m32, imm8 ─────────────────────────────────
+        case 0x6B: {
+            ModRM m=decode_modrm32(proc,cpu);
+            int32_t a=(int32_t)modrm_read32(proc,cpu,m);
+            int32_t b=(int8_t)elf_read8(proc,cpu.eip++);
+            *REG32(cpu,m.reg)=(uint32_t)(a*b); break;
+        }
+
+        // ── 0x6C-0x6F: INS/OUTS — no-op ─────────────────────────────────
+        case 0x6C: case 0x6D: case 0x6E: case 0x6F: break;
+
+        // ── 0x70-0x7F: Jcc rel8 ──────────────────────────────────────────
+        case 0x70: case 0x71: case 0x72: case 0x73:
+        case 0x74: case 0x75: case 0x76: case 0x77:
+        case 0x78: case 0x79: case 0x7A: case 0x7B:
+        case 0x7C: case 0x7D: case 0x7E: case 0x7F: {
+            int8_t rel = (int8_t)elf_read8(proc, cpu.eip++);
+            if (eval_cc(cpu, op & 0xF)) cpu.eip += rel;
+            break;
+        }
+
+        // ── 0x80: ALU r/m8, imm8 ─────────────────────────────────────────
+        case 0x80: {
+            ModRM m=decode_modrm32(proc,cpu);
+            uint8_t imm=elf_read8(proc,cpu.eip++);
+            uint8_t r=alu8(cpu,m.reg,modrm_read8(proc,cpu,m),imm);
+            if ((m.reg & 7) != 7) modrm_write8(proc,cpu,m,r);
+            break;
+        }
+
+        // ── 0x81: ALU r/m32, imm32 ───────────────────────────────────────
+        case 0x81: {
+            ModRM m=decode_modrm32(proc,cpu);
+            uint32_t imm=elf_read32(proc,cpu.eip); cpu.eip+=4;
+            uint32_t r=alu32(cpu,m.reg,modrm_read32(proc,cpu,m),imm,true);
+            if ((m.reg & 7) != 7) modrm_write32(proc,cpu,m,r);
+            break;
+        }
+
+        // ── 0x82: ALU r/m8, imm8 (alias of 0x80) ────────────────────────
+        case 0x82: {
+            ModRM m=decode_modrm32(proc,cpu);
+            uint8_t imm=elf_read8(proc,cpu.eip++);
+            uint8_t r=alu8(cpu,m.reg,modrm_read8(proc,cpu,m),imm);
+            if ((m.reg & 7) != 7) modrm_write8(proc,cpu,m,r);
+            break;
+        }
+
+        // ── 0x83: ALU r/m32, imm8 (sign-extended) ────────────────────────
+        case 0x83: {
+            ModRM m=decode_modrm32(proc,cpu);
+            uint32_t imm=(uint32_t)(int32_t)(int8_t)elf_read8(proc,cpu.eip++);
+            uint32_t r=alu32(cpu,m.reg,modrm_read32(proc,cpu,m),imm,true);
+            if ((m.reg & 7) != 7) modrm_write32(proc,cpu,m,r);
+            break;
+        }
+
+        // ── 0x84: TEST r/m8, r8 ──────────────────────────────────────────
+        case 0x84: { ModRM m=decode_modrm32(proc,cpu); set_flags_log8(cpu,modrm_read8(proc,cpu,m) & *REG8(cpu,m.reg)); break; }
+
+        // ── 0x85: TEST r/m32, r32 ────────────────────────────────────────
+        case 0x85: { ModRM m=decode_modrm32(proc,cpu); set_flags_log32(cpu,modrm_read32(proc,cpu,m) & *REG32(cpu,m.reg)); break; }
+
+        // ── 0x86: XCHG r/m8, r8 ─────────────────────────────────────────
+        case 0x86: {
+            ModRM m=decode_modrm32(proc,cpu);
+            uint8_t a=modrm_read8(proc,cpu,m), b=*REG8(cpu,m.reg);
+            modrm_write8(proc,cpu,m,b); *REG8(cpu,m.reg)=a; break;
+        }
+
+        // ── 0x87: XCHG r/m32, r32 ────────────────────────────────────────
+        case 0x87: {
+            ModRM m=decode_modrm32(proc,cpu);
+            uint32_t a=modrm_read32(proc,cpu,m), b=*REG32(cpu,m.reg);
+            modrm_write32(proc,cpu,m,b); *REG32(cpu,m.reg)=a; break;
+        }
+
+        // ── 0x88: MOV r/m8, r8 ───────────────────────────────────────────
+        case 0x88: { ModRM m=decode_modrm32(proc,cpu); modrm_write8(proc,cpu,m,*REG8(cpu,m.reg)); break; }
+
+        // ── 0x89: MOV r/m32, r32 ─────────────────────────────────────────
+        case 0x89: { ModRM m=decode_modrm32(proc,cpu); modrm_write32(proc,cpu,m,*REG32(cpu,m.reg)); break; }
+
+        // ── 0x8A: MOV r8, r/m8 ───────────────────────────────────────────
+        case 0x8A: { ModRM m=decode_modrm32(proc,cpu); *REG8(cpu,m.reg)=modrm_read8(proc,cpu,m); break; }
+
+        // ── 0x8B: MOV r32, r/m32 ─────────────────────────────────────────
+        case 0x8B: { ModRM m=decode_modrm32(proc,cpu); *REG32(cpu,m.reg)=modrm_read32(proc,cpu,m); break; }
+
+        // ── 0x8C: MOV r/m16, Sreg (flat model → write 0) ─────────────────
+        case 0x8C: { ModRM m=decode_modrm32(proc,cpu); modrm_write32(proc,cpu,m,0); break; }
+
+        // ── 0x8D: LEA r32, m ─────────────────────────────────────────────
+        case 0x8D: { ModRM m=decode_modrm32(proc,cpu); *REG32(cpu,m.reg)=m.ea; break; }
+
+        // ── 0x8E: MOV Sreg, r/m16 (ignore) ──────────────────────────────
+        case 0x8E: { decode_modrm32(proc,cpu); break; }
+
+        // ── 0x8F: POP r/m32 ──────────────────────────────────────────────
+        case 0x8F: { ModRM m=decode_modrm32(proc,cpu); modrm_write32(proc,cpu,m,pop32(proc,cpu)); break; }
+
+        // ── 0x90-0x97: XCHG eAX, r32 / NOP ──────────────────────────────
+        case 0x90: break; // NOP
+        case 0x91: case 0x92: case 0x93: case 0x94:
+        case 0x95: case 0x96: case 0x97: {
+            uint32_t* r=REG32(cpu,op&7), tmp=cpu.eax;
+            cpu.eax=*r; *r=tmp; break;
+        }
+
+        // ── 0x98: CWDE / CBW ─────────────────────────────────────────────
+        case 0x98: cpu.eax=(uint32_t)(int32_t)(int16_t)(cpu.eax&0xFFFF); break;
+
+        // ── 0x99: CDQ / CWD ──────────────────────────────────────────────
+        case 0x99: cpu.edx=((int32_t)cpu.eax<0)?0xFFFFFFFFu:0u; break;
+
+        // ── 0x9A: CALL far — treat as near using offset only ─────────────
+        case 0x9A: { uint32_t off=elf_read32(proc,cpu.eip); cpu.eip+=6; push32(proc,cpu,cpu.eip); cpu.eip=off; break; }
+
+        // ── 0x9B: FWAIT — no-op ──────────────────────────────────────────
+        case 0x9B: break;
+
+        // ── 0x9C: PUSHFD ─────────────────────────────────────────────────
+        case 0x9C: push32(proc,cpu,cpu.eflags); break;
+
+        // ── 0x9D: POPFD ──────────────────────────────────────────────────
+        case 0x9D: cpu.eflags=pop32(proc,cpu); break;
+
+        // ── 0x9E: SAHF ───────────────────────────────────────────────────
+        case 0x9E: cpu.eflags=(cpu.eflags&0xFFFFFF00u)|((cpu.eax>>8)&0xFF); break;
+
+        // ── 0x9F: LAHF ───────────────────────────────────────────────────
+        case 0x9F: cpu.eax=(cpu.eax&0xFFFF00FFu)|((cpu.eflags&0xFF)<<8); break;
+
+        // ── 0xA0-0xA3: MOV moffs ─────────────────────────────────────────
+        case 0xA0: { uint32_t a=elf_read32(proc,cpu.eip); cpu.eip+=4; cpu.eax=(cpu.eax&~0xFFu)|elf_read8(proc,a); break; }
+        case 0xA1: { uint32_t a=elf_read32(proc,cpu.eip); cpu.eip+=4; cpu.eax=elf_read32(proc,a); break; }
+        case 0xA2: { uint32_t a=elf_read32(proc,cpu.eip); cpu.eip+=4; elf_write8(proc,a,cpu.eax&0xFF); break; }
+        case 0xA3: { uint32_t a=elf_read32(proc,cpu.eip); cpu.eip+=4; elf_write32(proc,a,cpu.eax); break; }
+
+        // ── 0xA4-0xA7: MOVS / CMPS (with REP prefix) ────────────────────
+        case 0xA4: { // MOVSB
+            uint32_t cnt = pfx_rep ? cpu.ecx : 1;
+            bool df = cpu.eflags & FLAG_DF;
+            while (cnt--) {
+                elf_write8(proc,cpu.edi,elf_read8(proc,cpu.esi));
+                cpu.esi += df?-1:1; cpu.edi += df?-1:1;
+            }
+            if (pfx_rep) cpu.ecx=0;
+            break;
+        }
+        case 0xA5: { // MOVSD
+            uint32_t cnt = pfx_rep ? cpu.ecx : 1;
+            bool df = cpu.eflags & FLAG_DF;
+            while (cnt--) {
+                elf_write32(proc,cpu.edi,elf_read32(proc,cpu.esi));
+                cpu.esi += df?-4:4; cpu.edi += df?-4:4;
+            }
+            if (pfx_rep) cpu.ecx=0;
+            break;
+        }
+        case 0xA6: { // CMPSB (REPE/REPNE)
+            uint32_t cnt = (pfx_rep||pfx_repn) ? cpu.ecx : 1;
+            bool df = cpu.eflags & FLAG_DF;
+            while (cnt--) {
+                uint8_t a=elf_read8(proc,cpu.esi), b=elf_read8(proc,cpu.edi);
+                cpu.esi+=df?-1:1; cpu.edi+=df?-1:1;
+                alu8(cpu,7,a,b);
+                if (pfx_rep  && !(cpu.eflags&FLAG_ZF)) break;
+                if (pfx_repn &&  (cpu.eflags&FLAG_ZF)) break;
+            }
+            if (pfx_rep||pfx_repn) cpu.ecx=cnt;
+            break;
+        }
+        case 0xA7: { // CMPSD
+            uint32_t cnt=(pfx_rep||pfx_repn)?cpu.ecx:1;
+            bool df=cpu.eflags&FLAG_DF;
+            while(cnt--) {
+                uint32_t a=elf_read32(proc,cpu.esi),b=elf_read32(proc,cpu.edi);
+                cpu.esi+=df?-4:4; cpu.edi+=df?-4:4;
+                alu32(cpu,7,a,b,false);
+                if(pfx_rep  &&!(cpu.eflags&FLAG_ZF)) break;
+                if(pfx_repn && (cpu.eflags&FLAG_ZF)) break;
+            }
+            if(pfx_rep||pfx_repn) cpu.ecx=cnt;
+            break;
+        }
+
+        // ── 0xA8-0xA9: TEST AL/eAX, imm ─────────────────────────────────
+        case 0xA8: { uint8_t i=elf_read8(proc,cpu.eip++); set_flags_log8(cpu,(cpu.eax&0xFF)&i); break; }
+        case 0xA9: { uint32_t i=elf_read32(proc,cpu.eip); cpu.eip+=4; set_flags_log32(cpu,cpu.eax&i); break; }
+
+        // ── 0xAA-0xAF: STOS/LODS/SCAS ────────────────────────────────────
+        case 0xAA: { // STOSB
+            uint32_t cnt=pfx_rep?cpu.ecx:1; bool df=cpu.eflags&FLAG_DF;
+            while(cnt--){ elf_write8(proc,cpu.edi,cpu.eax&0xFF); cpu.edi+=df?-1:1; }
+            if(pfx_rep) cpu.ecx=0; break;
+        }
+        case 0xAB: { // STOSD
+            uint32_t cnt=pfx_rep?cpu.ecx:1; bool df=cpu.eflags&FLAG_DF;
+            while(cnt--){ elf_write32(proc,cpu.edi,cpu.eax); cpu.edi+=df?-4:4; }
+            if(pfx_rep) cpu.ecx=0; break;
+        }
+        case 0xAC: { // LODSB
+            bool df=cpu.eflags&FLAG_DF;
+            cpu.eax=(cpu.eax&0xFFFFFF00u)|elf_read8(proc,cpu.esi);
+            cpu.esi+=df?-1:1; break;
+        }
+        case 0xAD: { // LODSD
+            bool df=cpu.eflags&FLAG_DF;
+            cpu.eax=elf_read32(proc,cpu.esi); cpu.esi+=df?-4:4; break;
+        }
+        case 0xAE: { // SCASB (REPE/REPNE)
+            uint32_t cnt=(pfx_rep||pfx_repn)?cpu.ecx:1; bool df=cpu.eflags&FLAG_DF;
+            while(cnt--){
+                uint8_t b=elf_read8(proc,cpu.edi); cpu.edi+=df?-1:1;
+                alu8(cpu,7,cpu.eax&0xFF,b);
+                if(pfx_rep  &&!(cpu.eflags&FLAG_ZF)) break;
+                if(pfx_repn && (cpu.eflags&FLAG_ZF)) break;
+            }
+            if(pfx_rep||pfx_repn) cpu.ecx=cnt; break;
+        }
+        case 0xAF: { // SCASD
+            uint32_t cnt=(pfx_rep||pfx_repn)?cpu.ecx:1; bool df=cpu.eflags&FLAG_DF;
+            while(cnt--){
+                uint32_t b=elf_read32(proc,cpu.edi); cpu.edi+=df?-4:4;
+                alu32(cpu,7,cpu.eax,b,false);
+                if(pfx_rep  &&!(cpu.eflags&FLAG_ZF)) break;
+                if(pfx_repn && (cpu.eflags&FLAG_ZF)) break;
+            }
+            if(pfx_rep||pfx_repn) cpu.ecx=cnt; break;
+        }
+
+        // ── 0xB0-0xB7: MOV r8, imm8 ──────────────────────────────────────
+        case 0xB0: case 0xB1: case 0xB2: case 0xB3:
+        case 0xB4: case 0xB5: case 0xB6: case 0xB7:
+            *REG8(cpu, op & 7) = elf_read8(proc, cpu.eip++); break;
+
+        // ── 0xB8-0xBF: MOV r32, imm32 ────────────────────────────────────
+        case 0xB8: case 0xB9: case 0xBA: case 0xBB:
+        case 0xBC: case 0xBD: case 0xBE: case 0xBF:
+            *REG32(cpu, op & 7) = elf_read32(proc, cpu.eip); cpu.eip += 4; break;
+
+        // ── 0xC0: Shift r/m8, imm8 ───────────────────────────────────────
+        case 0xC0: {
+            ModRM m=decode_modrm32(proc,cpu);
+            uint8_t cnt=elf_read8(proc,cpu.eip++);
+            modrm_write8(proc,cpu,m,shift8(cpu,m.reg,modrm_read8(proc,cpu,m),cnt));
+            break;
+        }
+
+        // ── 0xC1: Shift r/m32, imm8 ──────────────────────────────────────
+        case 0xC1: {
+            ModRM m=decode_modrm32(proc,cpu);
+            uint8_t cnt=elf_read8(proc,cpu.eip++);
+            modrm_write32(proc,cpu,m,shift32(cpu,m.reg,modrm_read32(proc,cpu,m),cnt));
+            break;
+        }
+
+        // ── 0xC2: RET imm16 ──────────────────────────────────────────────
+        case 0xC2: { uint16_t i=elf_read16(proc,cpu.eip); cpu.eip+=2; cpu.eip=pop32(proc,cpu); cpu.esp+=i; break; }
+
+        // ── 0xC3: RET ────────────────────────────────────────────────────
+        case 0xC3: cpu.eip = pop32(proc, cpu); break;
+
+        // ── 0xC4: LES r32, m (treat as MOV) ─────────────────────────────
+        case 0xC4: { ModRM m=decode_modrm32(proc,cpu); *REG32(cpu,m.reg)=modrm_read32(proc,cpu,m); break; }
+
+        // ── 0xC5: LDS r32, m (treat as MOV) ─────────────────────────────
+        case 0xC5: { ModRM m=decode_modrm32(proc,cpu); *REG32(cpu,m.reg)=modrm_read32(proc,cpu,m); break; }
+
+        // ── 0xC6: MOV r/m8, imm8 ─────────────────────────────────────────
+        case 0xC6: { ModRM m=decode_modrm32(proc,cpu); modrm_write8(proc,cpu,m,elf_read8(proc,cpu.eip++)); break; }
+
+        // ── 0xC7: MOV r/m32, imm32 ───────────────────────────────────────
+        case 0xC7: { ModRM m=decode_modrm32(proc,cpu); uint32_t i=elf_read32(proc,cpu.eip); cpu.eip+=4; modrm_write32(proc,cpu,m,i); break; }
+
+        // ── 0xC8: ENTER ──────────────────────────────────────────────────
+        case 0xC8: {
+            uint16_t alloc=elf_read16(proc,cpu.eip); cpu.eip+=2;
+            uint8_t  level=elf_read8(proc,cpu.eip++);
+            push32(proc,cpu,cpu.ebp);
+            cpu.ebp=cpu.esp;
+            cpu.esp-=alloc;
+            break;
+        }
+
+        // ── 0xC9: LEAVE ──────────────────────────────────────────────────
+        case 0xC9: cpu.esp=cpu.ebp; cpu.ebp=pop32(proc,cpu); break;
+
+        // ── 0xCA: RETF imm16 ─────────────────────────────────────────────
+        case 0xCA: { uint16_t i=elf_read16(proc,cpu.eip); cpu.eip+=2; cpu.eip=pop32(proc,cpu); pop32(proc,cpu); cpu.esp+=i; break; }
+
+        // ── 0xCB: RETF ───────────────────────────────────────────────────
+        case 0xCB: cpu.eip=pop32(proc,cpu); pop32(proc,cpu); break;
+
+        // ── 0xCC: INT3 ───────────────────────────────────────────────────
+        case 0xCC:
+            proc->push_output_str("[BREAKPOINT]\n");
+            break;
+
+        // ── 0xCD: INT imm8 ────────────────────────────────────────────────
+        case 0xCD: {
+            uint8_t i=elf_read8(proc,cpu.eip++);
+            if (i == 0x80) { if (!handle_linux_syscall(proc, cpu)) return false; }
+            break;
+        }
+
+        // ── 0xCE: INTO — ignore ───────────────────────────────────────────
+        case 0xCE: break;
+
+        // ── 0xCF: IRET ───────────────────────────────────────────────────
+        case 0xCF: cpu.eip=pop32(proc,cpu); pop32(proc,cpu); cpu.eflags=pop32(proc,cpu); break;
+
+        // ── 0xD0: Shift r/m8, 1 ──────────────────────────────────────────
+        case 0xD0: { ModRM m=decode_modrm32(proc,cpu); modrm_write8(proc,cpu,m,shift8(cpu,m.reg,modrm_read8(proc,cpu,m),1)); break; }
+
+        // ── 0xD1: Shift r/m32, 1 ─────────────────────────────────────────
+        case 0xD1: { ModRM m=decode_modrm32(proc,cpu); modrm_write32(proc,cpu,m,shift32(cpu,m.reg,modrm_read32(proc,cpu,m),1)); break; }
+
+        // ── 0xD2: Shift r/m8, CL ─────────────────────────────────────────
+        case 0xD2: { ModRM m=decode_modrm32(proc,cpu); modrm_write8(proc,cpu,m,shift8(cpu,m.reg,modrm_read8(proc,cpu,m),cpu.ecx&7)); break; }
+
+        // ── 0xD3: Shift r/m32, CL ────────────────────────────────────────
+        case 0xD3: { ModRM m=decode_modrm32(proc,cpu); modrm_write32(proc,cpu,m,shift32(cpu,m.reg,modrm_read32(proc,cpu,m),cpu.ecx&31)); break; }
+
+        // ── 0xD4: AAM ────────────────────────────────────────────────────
+        case 0xD4: { uint8_t b=elf_read8(proc,cpu.eip++); if(b){cpu.eax=((cpu.eax/b)<<8)|(cpu.eax%b);} break; }
+
+        // ── 0xD5: AAD ────────────────────────────────────────────────────
+        case 0xD5: { uint8_t b=elf_read8(proc,cpu.eip++); cpu.eax=((cpu.eax>>8)*b+(cpu.eax&0xFF))&0xFF; break; }
+
+        // ── 0xD6: SALC ───────────────────────────────────────────────────
+        case 0xD6: cpu.eax=(cpu.eax&~0xFFu)|((cpu.eflags&FLAG_CF)?0xFF:0); break;
+
+        // ── 0xD7: XLAT ───────────────────────────────────────────────────
+        case 0xD7: cpu.eax=(cpu.eax&~0xFFu)|elf_read8(proc,cpu.ebx+(cpu.eax&0xFF)); break;
+
+        // ── 0xD8-0xDF: FPU — skip ModRM ──────────────────────────────────
+        case 0xD8: case 0xD9: case 0xDA: case 0xDB:
+        case 0xDC: case 0xDD: case 0xDE: case 0xDF: {
+            uint8_t modrm=elf_read8(proc,cpu.eip++);
+            if((modrm>>6)!=3){
+                uint8_t rm=modrm&7, mod=(modrm>>6);
+                if(rm==4) cpu.eip++; // SIB
+                if(mod==1) cpu.eip++;
+                if(mod==2) cpu.eip+=4;
+                if(mod==0&&rm==5) cpu.eip+=4;
+            }
+            break;
+        }
+
+        // ── 0xE0-0xE2: LOOP ──────────────────────────────────────────────
+        case 0xE0: { int8_t r=(int8_t)elf_read8(proc,cpu.eip++); --cpu.ecx; if(cpu.ecx&&!(cpu.eflags&FLAG_ZF)) cpu.eip+=r; break; } // LOOPNE
+        case 0xE1: { int8_t r=(int8_t)elf_read8(proc,cpu.eip++); --cpu.ecx; if(cpu.ecx&& (cpu.eflags&FLAG_ZF)) cpu.eip+=r; break; } // LOOPE
+        case 0xE2: { int8_t r=(int8_t)elf_read8(proc,cpu.eip++); if(--cpu.ecx) cpu.eip+=r; break; }                                 // LOOP
+
+        // ── 0xE3: JECXZ ──────────────────────────────────────────────────
+        case 0xE3: { int8_t r=(int8_t)elf_read8(proc,cpu.eip++); if(!cpu.ecx) cpu.eip+=r; break; }
+
+        // ── 0xE4-0xE7: IN/OUT imm8 — no-op ──────────────────────────────
+        case 0xE4: case 0xE5: cpu.eax=0; cpu.eip++; break;
+        case 0xE6: case 0xE7: cpu.eip++; break;
+
+        // ── 0xE8: CALL rel32 ─────────────────────────────────────────────
+        case 0xE8: { int32_t r=(int32_t)elf_read32(proc,cpu.eip); cpu.eip+=4; push32(proc,cpu,cpu.eip); cpu.eip+=r; break; }
+
+        // ── 0xE9: JMP rel32 ──────────────────────────────────────────────
+        case 0xE9: { int32_t r=(int32_t)elf_read32(proc,cpu.eip); cpu.eip+=4; cpu.eip+=r; break; }
+
+        // ── 0xEA: JMP far — use offset as absolute ────────────────────────
+        case 0xEA: { uint32_t off=elf_read32(proc,cpu.eip); cpu.eip+=6; cpu.eip=off; break; }
+
+        // ── 0xEB: JMP rel8 ───────────────────────────────────────────────
+        case 0xEB: { int8_t r=(int8_t)elf_read8(proc,cpu.eip++); cpu.eip+=r; break; }
+
+        // ── 0xEC-0xEF: IN/OUT DX — no-op ─────────────────────────────────
+        case 0xEC: case 0xED: cpu.eax=0; break;
+        case 0xEE: case 0xEF: break;
+
+        // ── 0xF4: HLT ────────────────────────────────────────────────────
+        case 0xF4: proc->completed=proc->active=false; return false;
+
+        // ── 0xF5: CMC ────────────────────────────────────────────────────
+        case 0xF5: cpu.eflags ^= FLAG_CF; break;
+
+        // ── 0xF6: Unary r/m8 ─────────────────────────────────────────────
+        case 0xF6: {
+            ModRM m=decode_modrm32(proc,cpu);
+            uint8_t v=modrm_read8(proc,cpu,m);
+            switch(m.reg&7){
+                case 0: case 1: { uint8_t i=elf_read8(proc,cpu.eip++); set_flags_log8(cpu,v&i); break; } // TEST
+                case 2: modrm_write8(proc,cpu,m,~v); break; // NOT
+                case 3: { uint8_t r=(uint8_t)(0-v); set_flags_sub8(cpu,0,v,r); modrm_write8(proc,cpu,m,r); break; } // NEG
+                case 4: { uint16_t p=(cpu.eax&0xFF)*v; cpu.eax=(cpu.eax&0xFFFF0000u)|p; if(p>>8) cpu.eflags|=FLAG_CF|FLAG_OF; else cpu.eflags&=~(FLAG_CF|FLAG_OF); break; } // MUL
+                case 5: { int16_t p=(int8_t)(cpu.eax&0xFF)*(int8_t)v; cpu.eax=(cpu.eax&0xFFFF0000u)|(uint16_t)p; break; } // IMUL
+                case 6: if(v){cpu.eax=(cpu.eax&~0xFFFFu)|((cpu.eax&0xFF)/v)|((uint16_t)((cpu.eax&0xFF)%v)<<8);} break; // DIV
+                case 7: if(v){int16_t q=(int8_t)(cpu.eax&0xFF)/(int8_t)v; int16_t r=(int8_t)(cpu.eax&0xFF)%(int8_t)v; cpu.eax=(cpu.eax&~0xFFFFu)|(uint8_t)q|((uint8_t)r<<8);} break; // IDIV
+            }
+            break;
+        }
+
+        // ── 0xF7: Unary r/m32 ────────────────────────────────────────────
+        case 0xF7: {
+            ModRM m=decode_modrm32(proc,cpu);
+            uint32_t v=modrm_read32(proc,cpu,m);
+            switch(m.reg&7){
+                case 0: case 1: { uint32_t i=elf_read32(proc,cpu.eip); cpu.eip+=4; set_flags_log32(cpu,v&i); break; } // TEST
+                case 2: modrm_write32(proc,cpu,m,~v); break; // NOT
+                case 3: { uint32_t r=(uint32_t)(0u-v); set_flags_sub32(cpu,0,v,r); modrm_write32(proc,cpu,m,r); break; } // NEG
+                case 4: { uint64_t p=(uint64_t)cpu.eax*v; cpu.eax=(uint32_t)p; cpu.edx=(uint32_t)(p>>32); if(cpu.edx) cpu.eflags|=FLAG_CF|FLAG_OF; else cpu.eflags&=~(FLAG_CF|FLAG_OF); break; } // MUL
+                case 5: { int64_t p=(int64_t)(int32_t)cpu.eax*(int32_t)v; cpu.eax=(uint32_t)p; cpu.edx=(uint32_t)((uint64_t)p>>32); break; } // IMUL
+                case 6: if(v){uint64_t d=((uint64_t)cpu.edx<<32)|cpu.eax; cpu.eax=(uint32_t)(d/v); cpu.edx=(uint32_t)(d%v);} break; // DIV
+                case 7: if(v){int64_t d=((int64_t)(int32_t)cpu.edx<<32)|(uint32_t)cpu.eax; cpu.eax=(uint32_t)(d/(int32_t)v); cpu.edx=(uint32_t)(d%(int32_t)v);} break; // IDIV
+            }
+            break;
+        }
+
+        // ── 0xF8-0xFD: Flag ops ───────────────────────────────────────────
+        case 0xF8: cpu.eflags &= ~FLAG_CF; break; // CLC
+        case 0xF9: cpu.eflags |=  FLAG_CF; break; // STC
+        case 0xFA: break;                          // CLI (ignore)
+        case 0xFB: break;                          // STI (ignore)
+        case 0xFC: cpu.eflags &= ~FLAG_DF; break; // CLD
+        case 0xFD: cpu.eflags |=  FLAG_DF; break; // STD
+
+        // ── 0xFE: INC/DEC r/m8 ───────────────────────────────────────────
+        case 0xFE: {
+            ModRM m=decode_modrm32(proc,cpu);
+            uint8_t v=modrm_read8(proc,cpu,m);
+            uint32_t sc=cpu.eflags&FLAG_CF;
+            if((m.reg&7)==0){ uint8_t r=v+1; set_flags_add8(cpu,v,1,r); modrm_write8(proc,cpu,m,r); }
+            else             { uint8_t r=v-1; set_flags_sub8(cpu,v,1,r); modrm_write8(proc,cpu,m,r); }
+            cpu.eflags=(cpu.eflags&~FLAG_CF)|sc;
+            break;
+        }
+
+        // ── 0xFF: INC/DEC/CALL/JMP/PUSH r/m32 ────────────────────────────
+        case 0xFF: {
+            ModRM m=decode_modrm32(proc,cpu);
+            uint32_t v=modrm_read32(proc,cpu,m);
+            uint32_t sc=cpu.eflags&FLAG_CF;
+            switch(m.reg&7){
+                case 0: { uint32_t r=v+1; set_flags_add32(cpu,v,1,r); modrm_write32(proc,cpu,m,r); cpu.eflags=(cpu.eflags&~FLAG_CF)|sc; break; } // INC
+                case 1: { uint32_t r=v-1; set_flags_sub32(cpu,v,1,r); modrm_write32(proc,cpu,m,r); cpu.eflags=(cpu.eflags&~FLAG_CF)|sc; break; } // DEC
+                case 2: push32(proc,cpu,cpu.eip); cpu.eip=v; break;  // CALL r/m32
+                case 3: push32(proc,cpu,cpu.eip); push32(proc,cpu,0); cpu.eip=v; break; // CALL far
+                case 4: cpu.eip=v; break;                            // JMP r/m32
+                case 5: cpu.eip=v; break;                            // JMP far
+                case 6: push32(proc,cpu,v); break;                   // PUSH r/m32
+            }
+            break;
+        }
+
+        // ── Two-byte opcodes (0x0F ...) ───────────────────────────────────
+        two_byte: {
+            uint8_t op2 = elf_read8(proc, cpu.eip++);
+            switch (op2) {
+
+            // 0x0F 0x00-0x01: system — ignore
+            case 0x00: case 0x01: decode_modrm32(proc,cpu); break;
+
+            // 0x0F 0x06: CLTS — ignore
+            case 0x06: break;
+
+            // 0x0F 0x08: INVD, 0x09: WBINVD — ignore
+            case 0x08: case 0x09: break;
+
+            // 0x0F 0x0B: UD2 — treat as halt
+            case 0x0B: proc->completed=proc->active=false; return false;
+
+            // 0x0F 0x10-0x17: SSE movups/movss etc — skip ModRM
+            case 0x10: case 0x11: case 0x12: case 0x13:
+            case 0x14: case 0x15: case 0x16: case 0x17: {
+                ModRM m=decode_modrm32(proc,cpu);
+                // Some have imm8 operand
                 break;
             }
 
-            // --- MOV r8, imm8 ---
-            case 0xB0: case 0xB1: case 0xB2: case 0xB3:
-            case 0xB4: case 0xB5: case 0xB6: case 0xB7: {
-                uint8_t* regs8[8] = {
-                    (uint8_t*)&cpu.eax,(uint8_t*)&cpu.ecx,
-                    (uint8_t*)&cpu.edx,(uint8_t*)&cpu.ebx,
-                    (uint8_t*)&cpu.eax+1,(uint8_t*)&cpu.ecx+1,
-                    (uint8_t*)&cpu.edx+1,(uint8_t*)&cpu.ebx+1
-                };
-                *regs8[opcode - 0xB0] = elf_read8(proc, cpu.eip++);
-                break;
-            }
+            // 0x0F 0x1F: HINT NOP (multi-byte)
+            case 0x1F: { decode_modrm32(proc,cpu); break; }
 
-            // --- MOV r/m32, r32 (89) ---
-            case 0x89: {
-                uint8_t modrm = elf_read8(proc, cpu.eip++);
-                uint32_t reg_idx; uint32_t* reg_ptr;
-                uint32_t ea = decode_modrm(proc, cpu, modrm, &reg_idx, &reg_ptr);
-                uint32_t* regs[8] = {
-                    &cpu.eax,&cpu.ecx,&cpu.edx,&cpu.ebx,
-                    &cpu.esp,&cpu.ebp,&cpu.esi,&cpu.edi
-                };
-                if ((modrm >> 6) == 3) {
-                    *regs[ea] = *reg_ptr; // reg to reg (ea is actually rm reg index here)
-                    // Recalculate: ea returned *value* of rm reg; we need rm index
-                    uint8_t rm = modrm & 7;
-                    *regs[rm] = *reg_ptr;
-                } else {
-                    elf_write32(proc, ea, *reg_ptr);
-                }
-                break;
-            }
+            // 0x0F 0x20-0x23: MOV to/from control/debug regs — ignore
+            case 0x20: case 0x21: case 0x22: case 0x23: cpu.eip++; break;
 
-            // --- MOV r32, r/m32 (8B) ---
-            case 0x8B: {
-                uint8_t modrm = elf_read8(proc, cpu.eip++);
-                uint8_t mod = (modrm >> 6) & 3;
-                uint8_t reg = (modrm >> 3) & 7;
-                uint8_t rm  = modrm & 7;
-                uint32_t* regs[8] = {
-                    &cpu.eax,&cpu.ecx,&cpu.edx,&cpu.ebx,
-                    &cpu.esp,&cpu.ebp,&cpu.esi,&cpu.edi
-                };
-                if (mod == 3) {
-                    *regs[reg] = *regs[rm];
-                } else {
-                    uint32_t reg_idx; uint32_t* rp;
-                    uint32_t ea = decode_modrm(proc, cpu, modrm, &reg_idx, &rp);
-                    *regs[reg] = elf_read32(proc, ea);
-                }
-                break;
-            }
+            // 0x0F 0x28-0x2F: SSE — skip ModRM
+            case 0x28: case 0x29: case 0x2A: case 0x2B:
+            case 0x2C: case 0x2D: case 0x2E: case 0x2F:
+                decode_modrm32(proc,cpu); break;
 
-            // --- MOV [r/m32], imm32 (C7 /0) ---
-            case 0xC7: {
-                uint8_t modrm = elf_read8(proc, cpu.eip++);
-                uint32_t reg_idx; uint32_t* rp;
-                uint32_t ea = decode_modrm(proc, cpu, modrm, &reg_idx, &rp);
-                uint32_t imm = elf_read32(proc, cpu.eip); cpu.eip += 4;
-                if ((modrm >> 6) == 3) {
-                    uint32_t* regs[8] = {
-                        &cpu.eax,&cpu.ecx,&cpu.edx,&cpu.ebx,
-                        &cpu.esp,&cpu.ebp,&cpu.esi,&cpu.edi
-                    };
-                    *regs[modrm & 7] = imm;
-                } else {
-                    elf_write32(proc, ea, imm);
-                }
-                break;
-            }
+            // 0x0F 0x31: RDTSC
+            case 0x31: cpu.eax=g_timer_ticks*1000; cpu.edx=0; break;
 
-            // --- PUSH r32 ---
-            case 0x50: case 0x51: case 0x52: case 0x53:
-            case 0x54: case 0x55: case 0x56: case 0x57: {
-                uint32_t* regs[8] = {
-                    &cpu.eax,&cpu.ecx,&cpu.edx,&cpu.ebx,
-                    &cpu.esp,&cpu.ebp,&cpu.esi,&cpu.edi
-                };
-                x86_push(proc, cpu, *regs[opcode - 0x50]);
-                break;
-            }
-
-            // --- POP r32 ---
-            case 0x58: case 0x59: case 0x5A: case 0x5B:
-            case 0x5C: case 0x5D: case 0x5E: case 0x5F: {
-                uint32_t* regs[8] = {
-                    &cpu.eax,&cpu.ecx,&cpu.edx,&cpu.ebx,
-                    &cpu.esp,&cpu.ebp,&cpu.esi,&cpu.edi
-                };
-                *regs[opcode - 0x58] = x86_pop(proc, cpu);
-                break;
-            }
-
-            // --- PUSH imm32 ---
-            case 0x68: {
-                uint32_t imm = elf_read32(proc, cpu.eip); cpu.eip += 4;
-                x86_push(proc, cpu, imm);
-                break;
-            }
-
-            // --- PUSH imm8 (sign extended) ---
-            case 0x6A: {
-                int8_t imm = (int8_t)elf_read8(proc, cpu.eip++);
-                x86_push(proc, cpu, (int32_t)imm);
-                break;
-            }
-
-            // --- ADD r/m32, imm8 (sign extended) / imm32 (83 /0, 81 /0) ---
-            case 0x83: {
-                uint8_t modrm = elf_read8(proc, cpu.eip++);
-                uint8_t op = (modrm >> 3) & 7;
-                uint8_t rm = modrm & 7;
-                uint32_t* regs[8] = {
-                    &cpu.eax,&cpu.ecx,&cpu.edx,&cpu.ebx,
-                    &cpu.esp,&cpu.ebp,&cpu.esi,&cpu.edi
-                };
-                int32_t imm = (int8_t)elf_read8(proc, cpu.eip++);
-
-                uint32_t reg_idx; uint32_t* rp;
-                uint32_t ea = 0;
-                uint32_t* target = nullptr;
-                uint32_t mem_val = 0;
-
-                if ((modrm >> 6) == 3) {
-                    target = regs[rm];
-                } else {
-                    ea = decode_modrm(proc, cpu, modrm, &reg_idx, &rp);
-                    mem_val = elf_read32(proc, ea);
-                    target = &mem_val;
-                }
-
-                uint32_t a = *target;
-                uint32_t result;
-                switch (op) {
-                    case 0: result = a + (uint32_t)imm; set_flags_add(cpu, a, (uint32_t)imm, result); *target = result; break; // ADD
-                    case 1: result = a | (uint32_t)imm; set_flags_logic(cpu, result); *target = result; break; // OR
-                    case 4: result = a & (uint32_t)imm; set_flags_logic(cpu, result); *target = result; break; // AND
-                    case 5: result = a - (uint32_t)imm; set_flags_sub(cpu, a, (uint32_t)imm, result); *target = result; break; // SUB
-                    case 6: result = a ^ (uint32_t)imm; set_flags_logic(cpu, result); *target = result; break; // XOR
-                    case 7: result = a - (uint32_t)imm; set_flags_sub(cpu, a, (uint32_t)imm, result); break; // CMP (no store)
-                    default: break;
-                }
-                if ((modrm >> 6) != 3 && op != 7) elf_write32(proc, ea, *target);
-                break;
-            }
-
-            // --- ADD eax, imm32 ---
-            case 0x05: {
-                uint32_t imm = elf_read32(proc, cpu.eip); cpu.eip += 4;
-                uint32_t result = cpu.eax + imm;
-                set_flags_add(cpu, cpu.eax, imm, result);
-                cpu.eax = result;
-                break;
-            }
-
-            // --- ADD r/m32, r32 ---
-            case 0x01: {
-                uint8_t modrm = elf_read8(proc, cpu.eip++);
-                uint8_t reg = (modrm >> 3) & 7;
-                uint8_t mod = (modrm >> 6) & 3;
-                uint8_t rm  = modrm & 7;
-                uint32_t* regs[8] = {
-                    &cpu.eax,&cpu.ecx,&cpu.edx,&cpu.ebx,
-                    &cpu.esp,&cpu.ebp,&cpu.esi,&cpu.edi
-                };
-                if (mod == 3) {
-                    uint32_t result = *regs[rm] + *regs[reg];
-                    set_flags_add(cpu, *regs[rm], *regs[reg], result);
-                    *regs[rm] = result;
-                } else {
-                    uint32_t ridx; uint32_t* rp;
-                    uint32_t ea = decode_modrm(proc, cpu, modrm, &ridx, &rp);
-                    uint32_t val = elf_read32(proc, ea);
-                    uint32_t result = val + *regs[reg];
-                    set_flags_add(cpu, val, *regs[reg], result);
-                    elf_write32(proc, ea, result);
-                }
-                break;
-            }
-
-            // --- SUB r/m32, r32 (29) ---
-            case 0x29: {
-                uint8_t modrm = elf_read8(proc, cpu.eip++);
-                uint8_t reg = (modrm >> 3) & 7;
-                uint8_t mod = (modrm >> 6) & 3;
-                uint8_t rm  = modrm & 7;
-                uint32_t* regs[8] = {
-                    &cpu.eax,&cpu.ecx,&cpu.edx,&cpu.ebx,
-                    &cpu.esp,&cpu.ebp,&cpu.esi,&cpu.edi
-                };
-                if (mod == 3) {
-                    uint32_t result = *regs[rm] - *regs[reg];
-                    set_flags_sub(cpu, *regs[rm], *regs[reg], result);
-                    *regs[rm] = result;
-                }
-                break;
-            }
-
-            // --- SUB eax, imm32 ---
-            case 0x2D: {
-                uint32_t imm = elf_read32(proc, cpu.eip); cpu.eip += 4;
-                uint32_t result = cpu.eax - imm;
-                set_flags_sub(cpu, cpu.eax, imm, result);
-                cpu.eax = result;
-                break;
-            }
-
-            // --- XOR r/m32, r32 (31) ---
-            case 0x31: {
-                uint8_t modrm = elf_read8(proc, cpu.eip++);
-                uint8_t reg = (modrm >> 3) & 7;
-                uint8_t rm  = modrm & 7;
-                uint32_t* regs[8] = {
-                    &cpu.eax,&cpu.ecx,&cpu.edx,&cpu.ebx,
-                    &cpu.esp,&cpu.ebp,&cpu.esi,&cpu.edi
-                };
-                if ((modrm >> 6) == 3) {
-                    *regs[rm] ^= *regs[reg];
-                    set_flags_logic(cpu, *regs[rm]);
-                }
-                break;
-            }
-
-            // --- XOR r32, r/m32 (33) ---
-            case 0x33: {
-                uint8_t modrm = elf_read8(proc, cpu.eip++);
-                uint8_t reg = (modrm >> 3) & 7;
-                uint8_t rm  = modrm & 7;
-                uint32_t* regs[8] = {
-                    &cpu.eax,&cpu.ecx,&cpu.edx,&cpu.ebx,
-                    &cpu.esp,&cpu.ebp,&cpu.esi,&cpu.edi
-                };
-                if ((modrm >> 6) == 3) {
-                    *regs[reg] ^= *regs[rm];
-                    set_flags_logic(cpu, *regs[reg]);
-                }
-                break;
-            }
-
-            // --- AND r/m32, r32 (21) ---
-            case 0x21: {
-                uint8_t modrm = elf_read8(proc, cpu.eip++);
-                uint8_t reg = (modrm >> 3) & 7;
-                uint8_t rm  = modrm & 7;
-                uint32_t* regs[8] = {
-                    &cpu.eax,&cpu.ecx,&cpu.edx,&cpu.ebx,
-                    &cpu.esp,&cpu.ebp,&cpu.esi,&cpu.edi
-                };
-                if ((modrm >> 6) == 3) {
-                    *regs[rm] &= *regs[reg];
-                    set_flags_logic(cpu, *regs[rm]);
-                }
-                break;
-            }
-
-            // --- CMP r/m32, r32 (39) ---
-            case 0x39: {
-                uint8_t modrm = elf_read8(proc, cpu.eip++);
-                uint8_t reg = (modrm >> 3) & 7;
-                uint8_t rm  = modrm & 7;
-                uint32_t* regs[8] = {
-                    &cpu.eax,&cpu.ecx,&cpu.edx,&cpu.ebx,
-                    &cpu.esp,&cpu.ebp,&cpu.esi,&cpu.edi
-                };
-                if ((modrm >> 6) == 3) {
-                    uint32_t result = *regs[rm] - *regs[reg];
-                    set_flags_sub(cpu, *regs[rm], *regs[reg], result);
-                }
-                break;
-            }
-
-            // --- CMP r32, r/m32 (3B) ---
-            case 0x3B: {
-                uint8_t modrm = elf_read8(proc, cpu.eip++);
-                uint8_t reg = (modrm >> 3) & 7;
-                uint8_t rm  = modrm & 7;
-                uint32_t* regs[8] = {
-                    &cpu.eax,&cpu.ecx,&cpu.edx,&cpu.ebx,
-                    &cpu.esp,&cpu.ebp,&cpu.esi,&cpu.edi
-                };
-                if ((modrm >> 6) == 3) {
-                    uint32_t result = *regs[reg] - *regs[rm];
-                    set_flags_sub(cpu, *regs[reg], *regs[rm], result);
-                }
-                break;
-            }
-
-            // --- CMP eax, imm32 (3D) ---
-            case 0x3D: {
-                uint32_t imm = elf_read32(proc, cpu.eip); cpu.eip += 4;
-                uint32_t result = cpu.eax - imm;
-                set_flags_sub(cpu, cpu.eax, imm, result);
-                break;
-            }
-
-            // --- TEST r/m32, r32 (85) ---
-            case 0x85: {
-                uint8_t modrm = elf_read8(proc, cpu.eip++);
-                uint8_t reg = (modrm >> 3) & 7;
-                uint8_t rm  = modrm & 7;
-                uint32_t* regs[8] = {
-                    &cpu.eax,&cpu.ecx,&cpu.edx,&cpu.ebx,
-                    &cpu.esp,&cpu.ebp,&cpu.esi,&cpu.edi
-                };
-                if ((modrm >> 6) == 3) {
-                    set_flags_logic(cpu, *regs[rm] & *regs[reg]);
-                }
-                break;
-            }
-
-            // --- INC r32 (40-47) ---
+            // 0x0F 0x40-0x4F: CMOVcc
             case 0x40: case 0x41: case 0x42: case 0x43:
-            case 0x44: case 0x45: case 0x46: case 0x47: {
-                uint32_t* regs[8] = {
-                    &cpu.eax,&cpu.ecx,&cpu.edx,&cpu.ebx,
-                    &cpu.esp,&cpu.ebp,&cpu.esi,&cpu.edi
-                };
-                uint32_t* r = regs[opcode - 0x40];
-                uint32_t old = *r;
-                (*r)++;
-                // INC doesn't affect CF
-                uint32_t saved_cf = cpu.eflags & FLAG_CF;
-                set_flags_add(cpu, old, 1, *r);
-                cpu.eflags = (cpu.eflags & ~FLAG_CF) | saved_cf;
-                break;
-            }
-
-            // --- DEC r32 (48-4F) ---
+            case 0x44: case 0x45: case 0x46: case 0x47:
             case 0x48: case 0x49: case 0x4A: case 0x4B:
             case 0x4C: case 0x4D: case 0x4E: case 0x4F: {
-                uint32_t* regs[8] = {
-                    &cpu.eax,&cpu.ecx,&cpu.edx,&cpu.ebx,
-                    &cpu.esp,&cpu.ebp,&cpu.esi,&cpu.edi
-                };
-                uint32_t* r = regs[opcode - 0x48];
-                uint32_t old = *r;
-                (*r)--;
-                uint32_t saved_cf = cpu.eflags & FLAG_CF;
-                set_flags_sub(cpu, old, 1, *r);
-                cpu.eflags = (cpu.eflags & ~FLAG_CF) | saved_cf;
+                ModRM m=decode_modrm32(proc,cpu);
+                if(eval_cc(cpu,op2&0xF)) *REG32(cpu,m.reg)=modrm_read32(proc,cpu,m);
                 break;
             }
 
-            // --- JMP rel8 (EB) ---
-            case 0xEB: {
-                int8_t rel = (int8_t)elf_read8(proc, cpu.eip++);
-                cpu.eip += rel;
+            // 0x0F 0x50-0x5F: SSE — skip ModRM
+            case 0x50: case 0x51: case 0x52: case 0x53:
+            case 0x54: case 0x55: case 0x56: case 0x57:
+            case 0x58: case 0x59: case 0x5A: case 0x5B:
+            case 0x5C: case 0x5D: case 0x5E: case 0x5F:
+                decode_modrm32(proc,cpu); break;
+
+            // 0x0F 0x60-0x6F: MMX — skip ModRM
+            case 0x60: case 0x61: case 0x62: case 0x63:
+            case 0x64: case 0x65: case 0x66: case 0x67:
+            case 0x68: case 0x69: case 0x6A: case 0x6B:
+            case 0x6C: case 0x6D: case 0x6E: case 0x6F:
+                decode_modrm32(proc,cpu); break;
+
+            // 0x0F 0x70-0x76: SSE shuffle/compare — skip ModRM + imm8
+            case 0x70: decode_modrm32(proc,cpu); cpu.eip++; break;
+            case 0x71: case 0x72: case 0x73: decode_modrm32(proc,cpu); cpu.eip++; break;
+            case 0x74: case 0x75: case 0x76: decode_modrm32(proc,cpu); break;
+
+            // 0x0F 0x77: EMMS — no-op
+            case 0x77: break;
+
+            // 0x0F 0x7E-0x7F: MOVD/MOVQ — skip ModRM
+            case 0x7E: case 0x7F: decode_modrm32(proc,cpu); break;
+
+            // 0x0F 0x80-0x8F: Jcc rel32
+            case 0x80: case 0x81: case 0x82: case 0x83:
+            case 0x84: case 0x85: case 0x86: case 0x87:
+            case 0x88: case 0x89: case 0x8A: case 0x8B:
+            case 0x8C: case 0x8D: case 0x8E: case 0x8F: {
+                int32_t r=(int32_t)elf_read32(proc,cpu.eip); cpu.eip+=4;
+                if(eval_cc(cpu,op2&0xF)) cpu.eip+=r;
                 break;
             }
 
-            // --- JMP rel32 (E9) ---
-            case 0xE9: {
-                int32_t rel = (int32_t)elf_read32(proc, cpu.eip); cpu.eip += 4;
-                cpu.eip += rel;
+            // 0x0F 0x90-0x9F: SETcc r/m8
+            case 0x90: case 0x91: case 0x92: case 0x93:
+            case 0x94: case 0x95: case 0x96: case 0x97:
+            case 0x98: case 0x99: case 0x9A: case 0x9B:
+            case 0x9C: case 0x9D: case 0x9E: case 0x9F: {
+                ModRM m=decode_modrm32(proc,cpu);
+                modrm_write8(proc,cpu,m,eval_cc(cpu,op2&0xF)?1:0);
                 break;
             }
 
-            // --- JE/JZ rel8 (74) ---
-            case 0x74: {
-                int8_t rel = (int8_t)elf_read8(proc, cpu.eip++);
-                if (cpu.eflags & FLAG_ZF) cpu.eip += rel;
+            // 0x0F 0xA0-0xA1: PUSH/POP FS — no-op
+            case 0xA0: push32(proc,cpu,0); break;
+            case 0xA1: pop32(proc,cpu); break;
+
+            // 0x0F 0xA2: CPUID
+            case 0xA2:
+                cpu.eax=cpu.ebx=cpu.ecx=cpu.edx=0; break;
+
+            // 0x0F 0xA3: BT r/m32, r32
+            case 0xA3: {
+                ModRM m=decode_modrm32(proc,cpu);
+                uint8_t bit=*REG32(cpu,m.reg)&31;
+                uint32_t v=modrm_read32(proc,cpu,m);
+                if(v&(1u<<bit)) cpu.eflags|=FLAG_CF; else cpu.eflags&=~FLAG_CF;
                 break;
             }
 
-            // --- JNE/JNZ rel8 (75) ---
-            case 0x75: {
-                int8_t rel = (int8_t)elf_read8(proc, cpu.eip++);
-                if (!(cpu.eflags & FLAG_ZF)) cpu.eip += rel;
+            // 0x0F 0xA4: SHLD r/m32, r32, imm8
+            case 0xA4: {
+                ModRM m=decode_modrm32(proc,cpu);
+                uint8_t cnt=elf_read8(proc,cpu.eip++);
+                uint32_t dst=modrm_read32(proc,cpu,m), src=*REG32(cpu,m.reg);
+                if(cnt){uint32_t r=(dst<<cnt)|(src>>(32-cnt)); set_flags_log32(cpu,r); modrm_write32(proc,cpu,m,r);}
                 break;
             }
 
-            // --- JL rel8 (7C) ---
-            case 0x7C: {
-                int8_t rel = (int8_t)elf_read8(proc, cpu.eip++);
-                bool sf = (cpu.eflags & FLAG_SF) != 0;
-                bool of = (cpu.eflags & FLAG_OF) != 0;
-                if (sf != of) cpu.eip += rel;
+            // 0x0F 0xA5: SHLD r/m32, r32, CL
+            case 0xA5: {
+                ModRM m=decode_modrm32(proc,cpu);
+                uint8_t cnt=cpu.ecx&31;
+                uint32_t dst=modrm_read32(proc,cpu,m), src=*REG32(cpu,m.reg);
+                if(cnt){uint32_t r=(dst<<cnt)|(src>>(32-cnt)); set_flags_log32(cpu,r); modrm_write32(proc,cpu,m,r);}
                 break;
             }
 
-            // --- JLE rel8 (7E) ---
-            case 0x7E: {
-                int8_t rel = (int8_t)elf_read8(proc, cpu.eip++);
-                bool zf = (cpu.eflags & FLAG_ZF) != 0;
-                bool sf = (cpu.eflags & FLAG_SF) != 0;
-                bool of = (cpu.eflags & FLAG_OF) != 0;
-                if (zf || (sf != of)) cpu.eip += rel;
+            // 0x0F 0xA8-0xA9: PUSH/POP GS — no-op
+            case 0xA8: push32(proc,cpu,0); break;
+            case 0xA9: pop32(proc,cpu); break;
+
+            // 0x0F 0xAB: BTS r/m32, r32
+            case 0xAB: {
+                ModRM m=decode_modrm32(proc,cpu);
+                uint8_t bit=*REG32(cpu,m.reg)&31;
+                uint32_t v=modrm_read32(proc,cpu,m);
+                if(v&(1u<<bit)) cpu.eflags|=FLAG_CF; else cpu.eflags&=~FLAG_CF;
+                modrm_write32(proc,cpu,m,v|(1u<<bit));
                 break;
             }
 
-            // --- JG rel8 (7F) ---
-            case 0x7F: {
-                int8_t rel = (int8_t)elf_read8(proc, cpu.eip++);
-                bool zf = (cpu.eflags & FLAG_ZF) != 0;
-                bool sf = (cpu.eflags & FLAG_SF) != 0;
-                bool of = (cpu.eflags & FLAG_OF) != 0;
-                if (!zf && (sf == of)) cpu.eip += rel;
+            // 0x0F 0xAC: SHRD r/m32, r32, imm8
+            case 0xAC: {
+                ModRM m=decode_modrm32(proc,cpu);
+                uint8_t cnt=elf_read8(proc,cpu.eip++);
+                uint32_t dst=modrm_read32(proc,cpu,m), src=*REG32(cpu,m.reg);
+                if(cnt){uint32_t r=(dst>>cnt)|(src<<(32-cnt)); set_flags_log32(cpu,r); modrm_write32(proc,cpu,m,r);}
                 break;
             }
 
-            // --- JGE rel8 (7D) ---
-            case 0x7D: {
-                int8_t rel = (int8_t)elf_read8(proc, cpu.eip++);
-                bool sf = (cpu.eflags & FLAG_SF) != 0;
-                bool of = (cpu.eflags & FLAG_OF) != 0;
-                if (sf == of) cpu.eip += rel;
+            // 0x0F 0xAD: SHRD r/m32, r32, CL
+            case 0xAD: {
+                ModRM m=decode_modrm32(proc,cpu);
+                uint8_t cnt=cpu.ecx&31;
+                uint32_t dst=modrm_read32(proc,cpu,m), src=*REG32(cpu,m.reg);
+                if(cnt){uint32_t r=(dst>>cnt)|(src<<(32-cnt)); set_flags_log32(cpu,r); modrm_write32(proc,cpu,m,r);}
                 break;
             }
 
-            // --- JA rel8 (77) - Jump if above (CF=0 and ZF=0) ---
-            case 0x77: {
-                int8_t rel = (int8_t)elf_read8(proc, cpu.eip++);
-                if (!(cpu.eflags & FLAG_CF) && !(cpu.eflags & FLAG_ZF)) cpu.eip += rel;
+            // 0x0F 0xAF: IMUL r32, r/m32
+            case 0xAF: {
+                ModRM m=decode_modrm32(proc,cpu);
+                int64_t r=(int64_t)(int32_t)*REG32(cpu,m.reg)*(int32_t)modrm_read32(proc,cpu,m);
+                *REG32(cpu,m.reg)=(uint32_t)r;
+                if(r!=(int64_t)(int32_t)*REG32(cpu,m.reg)) cpu.eflags|=FLAG_CF|FLAG_OF;
+                else cpu.eflags&=~(FLAG_CF|FLAG_OF);
                 break;
             }
 
-            // --- JB rel8 (72) - Jump if below (CF=1) ---
-            case 0x72: {
-                int8_t rel = (int8_t)elf_read8(proc, cpu.eip++);
-                if (cpu.eflags & FLAG_CF) cpu.eip += rel;
+            // 0x0F 0xB0: CMPXCHG r/m8, r8
+            case 0xB0: {
+                ModRM m=decode_modrm32(proc,cpu);
+                uint8_t dst=modrm_read8(proc,cpu,m), al=cpu.eax&0xFF;
+                alu8(cpu,7,al,dst);
+                if(cpu.eflags&FLAG_ZF) modrm_write8(proc,cpu,m,*REG8(cpu,m.reg));
+                else cpu.eax=(cpu.eax&~0xFFu)|dst;
                 break;
             }
 
-            // --- 0F prefix (two-byte opcodes) ---
-            case 0x0F: {
-                uint8_t op2 = elf_read8(proc, cpu.eip++);
-                switch (op2) {
-                    // JE/JZ rel32
-                    case 0x84: { int32_t rel = (int32_t)elf_read32(proc,cpu.eip); cpu.eip+=4; if(cpu.eflags&FLAG_ZF) cpu.eip+=rel; break; }
-                    // JNE/JNZ rel32
-                    case 0x85: { int32_t rel = (int32_t)elf_read32(proc,cpu.eip); cpu.eip+=4; if(!(cpu.eflags&FLAG_ZF)) cpu.eip+=rel; break; }
-                    // JL rel32
-                    case 0x8C: { int32_t rel=(int32_t)elf_read32(proc,cpu.eip); cpu.eip+=4; bool sf=(cpu.eflags&FLAG_SF)!=0,of=(cpu.eflags&FLAG_OF)!=0; if(sf!=of) cpu.eip+=rel; break; }
-                    // JGE rel32
-                    case 0x8D: { int32_t rel=(int32_t)elf_read32(proc,cpu.eip); cpu.eip+=4; bool sf=(cpu.eflags&FLAG_SF)!=0,of=(cpu.eflags&FLAG_OF)!=0; if(sf==of) cpu.eip+=rel; break; }
-                    // JLE rel32
-                    case 0x8E: { int32_t rel=(int32_t)elf_read32(proc,cpu.eip); cpu.eip+=4; bool zf=(cpu.eflags&FLAG_ZF)!=0,sf=(cpu.eflags&FLAG_SF)!=0,of=(cpu.eflags&FLAG_OF)!=0; if(zf||(sf!=of)) cpu.eip+=rel; break; }
-                    // JG rel32
-                    case 0x8F: { int32_t rel=(int32_t)elf_read32(proc,cpu.eip); cpu.eip+=4; bool zf=(cpu.eflags&FLAG_ZF)!=0,sf=(cpu.eflags&FLAG_SF)!=0,of=(cpu.eflags&FLAG_OF)!=0; if(!zf&&(sf==of)) cpu.eip+=rel; break; }
-                    // MOVZX r32, r/m8
-                    case 0xB6: {
-                        uint8_t modrm = elf_read8(proc, cpu.eip++);
-                        uint8_t reg = (modrm >> 3) & 7;
-                        uint8_t rm  = modrm & 7;
-                        uint32_t* regs[8] = {
-                            &cpu.eax,&cpu.ecx,&cpu.edx,&cpu.ebx,
-                            &cpu.esp,&cpu.ebp,&cpu.esi,&cpu.edi
-                        };
-                        if ((modrm >> 6) == 3) {
-                            *regs[reg] = (uint8_t)(*regs[rm] & 0xFF);
-                        } else {
-                            uint32_t ridx; uint32_t* rp;
-                            uint32_t ea = decode_modrm(proc, cpu, modrm, &ridx, &rp);
-                            *regs[reg] = elf_read8(proc, ea);
-                        }
-                        break;
+            // 0x0F 0xB1: CMPXCHG r/m32, r32
+            case 0xB1: {
+                ModRM m=decode_modrm32(proc,cpu);
+                uint32_t dst=modrm_read32(proc,cpu,m);
+                alu32(cpu,7,cpu.eax,dst,false);
+                if(cpu.eflags&FLAG_ZF) modrm_write32(proc,cpu,m,*REG32(cpu,m.reg));
+                else cpu.eax=dst;
+                break;
+            }
+
+            // 0x0F 0xB2: LSS — load SS:r32 from mem (treat as MOV)
+            case 0xB2: { ModRM m=decode_modrm32(proc,cpu); *REG32(cpu,m.reg)=modrm_read32(proc,cpu,m); break; }
+
+            // 0x0F 0xB3: BTR r/m32, r32
+            case 0xB3: {
+                ModRM m=decode_modrm32(proc,cpu);
+                uint8_t bit=*REG32(cpu,m.reg)&31;
+                uint32_t v=modrm_read32(proc,cpu,m);
+                if(v&(1u<<bit)) cpu.eflags|=FLAG_CF; else cpu.eflags&=~FLAG_CF;
+                modrm_write32(proc,cpu,m,v&~(1u<<bit));
+                break;
+            }
+
+            // 0x0F 0xB4-0xB5: LFS/LGS — treat as MOV
+            case 0xB4: case 0xB5: { ModRM m=decode_modrm32(proc,cpu); *REG32(cpu,m.reg)=modrm_read32(proc,cpu,m); break; }
+
+            // 0x0F 0xB6: MOVZX r32, r/m8
+            case 0xB6: { ModRM m=decode_modrm32(proc,cpu); *REG32(cpu,m.reg)=(uint32_t)modrm_read8(proc,cpu,m); break; }
+
+            // 0x0F 0xB7: MOVZX r32, r/m16
+            case 0xB7: { ModRM m=decode_modrm32(proc,cpu); *REG32(cpu,m.reg)=(uint32_t)(m.is_mem?elf_read16(proc,m.ea):(uint16_t)*REG32(cpu,m.rm)); break; }
+
+            // 0x0F 0xBA: BT/BTS/BTR/BTC r/m32, imm8
+            case 0xBA: {
+                ModRM m=decode_modrm32(proc,cpu);
+                uint8_t bit=elf_read8(proc,cpu.eip++)&31;
+                uint32_t v=modrm_read32(proc,cpu,m), mask=1u<<bit;
+                if(v&mask) cpu.eflags|=FLAG_CF; else cpu.eflags&=~FLAG_CF;
+                switch(m.reg&7){
+                    case 5: modrm_write32(proc,cpu,m,v|mask); break;  // BTS
+                    case 6: modrm_write32(proc,cpu,m,v&~mask); break; // BTR
+                    case 7: modrm_write32(proc,cpu,m,v^mask); break;  // BTC
+                }
+                break;
+            }
+
+            // 0x0F 0xBB: BTC r/m32, r32
+            case 0xBB: {
+                ModRM m=decode_modrm32(proc,cpu);
+                uint8_t bit=*REG32(cpu,m.reg)&31;
+                uint32_t v=modrm_read32(proc,cpu,m), mask=1u<<bit;
+                if(v&mask) cpu.eflags|=FLAG_CF; else cpu.eflags&=~FLAG_CF;
+                modrm_write32(proc,cpu,m,v^mask);
+                break;
+            }
+
+            // 0x0F 0xBC: BSF r32, r/m32
+            case 0xBC: {
+                ModRM m=decode_modrm32(proc,cpu);
+                uint32_t v=modrm_read32(proc,cpu,m);
+                if(!v){ cpu.eflags|=FLAG_ZF; }
+                else{ cpu.eflags&=~FLAG_ZF; uint32_t i=0; while(!(v&(1u<<i))) i++; *REG32(cpu,m.reg)=i; }
+                break;
+            }
+
+            // 0x0F 0xBD: BSR r32, r/m32
+            case 0xBD: {
+                ModRM m=decode_modrm32(proc,cpu);
+                uint32_t v=modrm_read32(proc,cpu,m);
+                if(!v){ cpu.eflags|=FLAG_ZF; }
+                else{ cpu.eflags&=~FLAG_ZF; uint32_t i=31; while(!(v&(1u<<i))) i--; *REG32(cpu,m.reg)=i; }
+                break;
+            }
+
+            // 0x0F 0xBE: MOVSX r32, r/m8
+            case 0xBE: { ModRM m=decode_modrm32(proc,cpu); *REG32(cpu,m.reg)=(uint32_t)(int32_t)(int8_t)modrm_read8(proc,cpu,m); break; }
+
+            // 0x0F 0xBF: MOVSX r32, r/m16
+            case 0xBF: { ModRM m=decode_modrm32(proc,cpu); *REG32(cpu,m.reg)=(uint32_t)(int32_t)(int16_t)(m.is_mem?elf_read16(proc,m.ea):(uint16_t)*REG32(cpu,m.rm)); break; }
+
+            // 0x0F 0xC0-0xC1: XADD
+            case 0xC0: { ModRM m=decode_modrm32(proc,cpu); uint8_t s=*REG8(cpu,m.reg),d=modrm_read8(proc,cpu,m); *REG8(cpu,m.reg)=d; modrm_write8(proc,cpu,m,alu8(cpu,0,d,s)); break; }
+            case 0xC1: { ModRM m=decode_modrm32(proc,cpu); uint32_t s=*REG32(cpu,m.reg),d=modrm_read32(proc,cpu,m); *REG32(cpu,m.reg)=d; modrm_write32(proc,cpu,m,alu32(cpu,0,d,s,true)); break; }
+
+            // 0x0F 0xC2: CMPSS/CMPPS — skip ModRM + imm8
+            case 0xC2: decode_modrm32(proc,cpu); cpu.eip++; break;
+
+            // 0x0F 0xC3: MOVNTI — treat as store
+            case 0xC3: { ModRM m=decode_modrm32(proc,cpu); modrm_write32(proc,cpu,m,*REG32(cpu,m.reg)); break; }
+
+            // 0x0F 0xC4-0xC6: SSE — skip ModRM + imm8
+            case 0xC4: case 0xC5: case 0xC6: decode_modrm32(proc,cpu); cpu.eip++; break;
+
+            // 0x0F 0xC7: CMPXCHG8B m64
+            case 0xC7: {
+                ModRM m=decode_modrm32(proc,cpu);
+                if(m.is_mem){
+                    uint32_t lo=elf_read32(proc,m.ea), hi=elf_read32(proc,m.ea+4);
+                    if(lo==cpu.eax && hi==cpu.edx){
+                        cpu.eflags|=FLAG_ZF;
+                        elf_write32(proc,m.ea,cpu.ebx); elf_write32(proc,m.ea+4,cpu.ecx);
+                    } else {
+                        cpu.eflags&=~FLAG_ZF;
+                        cpu.eax=lo; cpu.edx=hi;
                     }
-                    // IMUL r32, r/m32, imm8
-                    case 0xAF: {
-                        uint8_t modrm = elf_read8(proc, cpu.eip++);
-                        uint8_t reg = (modrm >> 3) & 7;
-                        uint8_t rm  = modrm & 7;
-                        uint32_t* regs[8] = {
-                            &cpu.eax,&cpu.ecx,&cpu.edx,&cpu.ebx,
-                            &cpu.esp,&cpu.ebp,&cpu.esi,&cpu.edi
-                        };
-                        if ((modrm >> 6) == 3) {
-                            *regs[reg] = (int32_t)*regs[reg] * (int32_t)*regs[rm];
-                        }
-                        break;
-                    }
-                    default:
-                        // Unknown two-byte opcode - skip
-                        break;
                 }
                 break;
             }
 
-            // --- CALL rel32 (E8) ---
-            case 0xE8: {
-                int32_t rel = (int32_t)elf_read32(proc, cpu.eip); cpu.eip += 4;
-                x86_push(proc, cpu, cpu.eip);
-                cpu.eip += rel;
+            // 0x0F 0xC8-0xCF: BSWAP r32
+            case 0xC8: case 0xC9: case 0xCA: case 0xCB:
+            case 0xCC: case 0xCD: case 0xCE: case 0xCF: {
+                uint32_t* r=REG32(cpu,op2&7);
+                uint32_t v=*r;
+                *r=((v&0xFF)<<24)|((v&0xFF00)<<8)|((v>>8)&0xFF00)|((v>>24)&0xFF);
                 break;
             }
 
-            // --- RET (C3) ---
-            case 0xC3: {
-                cpu.eip = x86_pop(proc, cpu);
-                break;
-            }
-
-            // --- RET imm16 (C2) ---
-            case 0xC2: {
-                uint16_t imm = elf_read16(proc, cpu.eip); cpu.eip += 2;
-                cpu.eip = x86_pop(proc, cpu);
-                cpu.esp += imm;
-                break;
-            }
-
-            // --- LEAVE (C9) ---
-            case 0xC9: {
-                cpu.esp = cpu.ebp;
-                cpu.ebp = x86_pop(proc, cpu);
-                break;
-            }
-
-            // --- NOP (90) ---
-            case 0x90:
-                break;
-
-            // --- INT (CD) ---
-            case 0xCD: {
-                uint8_t int_num = elf_read8(proc, cpu.eip++);
-                if (int_num == 0x80) {
-                    if (!handle_syscall(proc, cpu)) return false;
-                }
-                break;
-            }
-
-            // --- LEA r32, m (8D) ---
-            case 0x8D: {
-                uint8_t modrm = elf_read8(proc, cpu.eip++);
-                uint8_t reg = (modrm >> 3) & 7;
-                uint32_t* regs[8] = {
-                    &cpu.eax,&cpu.ecx,&cpu.edx,&cpu.ebx,
-                    &cpu.esp,&cpu.ebp,&cpu.esi,&cpu.edi
-                };
-                uint32_t ridx; uint32_t* rp;
-                uint32_t ea = decode_modrm(proc, cpu, modrm, &ridx, &rp);
-                *regs[reg] = ea;
-                break;
-            }
-
-            // --- MOV r/m8, imm8 (C6) ---
-            case 0xC6: {
-                uint8_t modrm = elf_read8(proc, cpu.eip++);
-                uint8_t imm = elf_read8(proc, cpu.eip++);
-                if ((modrm >> 6) == 3) {
-                    // Register - write low byte
-                    uint32_t* regs[8] = {
-                        &cpu.eax,&cpu.ecx,&cpu.edx,&cpu.ebx,
-                        &cpu.esp,&cpu.ebp,&cpu.esi,&cpu.edi
-                    };
-                    *((uint8_t*)regs[modrm & 7]) = imm;
-                } else {
-                    uint32_t ridx; uint32_t* rp;
-                    uint32_t ea = decode_modrm(proc, cpu, modrm, &ridx, &rp);
-                    elf_write8(proc, ea, imm);
-                }
-                break;
-            }
-
-            // --- MOV r/m8, r8 (88) ---
-            case 0x88: {
-                uint8_t modrm = elf_read8(proc, cpu.eip++);
-                uint8_t reg = (modrm >> 3) & 7;
-                uint32_t* regs[8] = {
-                    &cpu.eax,&cpu.ecx,&cpu.edx,&cpu.ebx,
-                    &cpu.esp,&cpu.ebp,&cpu.esi,&cpu.edi
-                };
-                uint8_t val = (uint8_t)(*regs[reg] & 0xFF);
-                if ((modrm >> 6) == 3) {
-                    *((uint8_t*)regs[modrm & 7]) = val;
-                } else {
-                    uint32_t ridx; uint32_t* rp;
-                    uint32_t ea = decode_modrm(proc, cpu, modrm, &ridx, &rp);
-                    elf_write8(proc, ea, val);
-                }
-                break;
-            }
-
-            // --- MOV r8, r/m8 (8A) ---
-            case 0x8A: {
-                uint8_t modrm = elf_read8(proc, cpu.eip++);
-                uint8_t reg = (modrm >> 3) & 7;
-                uint32_t* regs[8] = {
-                    &cpu.eax,&cpu.ecx,&cpu.edx,&cpu.ebx,
-                    &cpu.esp,&cpu.ebp,&cpu.esi,&cpu.edi
-                };
-                if ((modrm >> 6) == 3) {
-                    *regs[reg] = (*regs[reg] & 0xFFFFFF00) |
-                                 (*regs[modrm & 7] & 0xFF);
-                } else {
-                    uint32_t ridx; uint32_t* rp;
-                    uint32_t ea = decode_modrm(proc, cpu, modrm, &ridx, &rp);
-                    *regs[reg] = (*regs[reg] & 0xFFFFFF00) | elf_read8(proc, ea);
-                }
-                break;
-            }
-
-            // --- IMUL r32, r/m32, imm8 (6B) ---
-            case 0x6B: {
-                uint8_t modrm = elf_read8(proc, cpu.eip++);
-                uint8_t reg = (modrm >> 3) & 7;
-                uint8_t rm  = modrm & 7;
-                uint32_t* regs[8] = {
-                    &cpu.eax,&cpu.ecx,&cpu.edx,&cpu.ebx,
-                    &cpu.esp,&cpu.ebp,&cpu.esi,&cpu.edi
-                };
-                int8_t imm = (int8_t)elf_read8(proc, cpu.eip++);
-                if ((modrm >> 6) == 3) {
-                    *regs[reg] = (int32_t)*regs[rm] * (int32_t)imm;
-                }
-                break;
-            }
-
-            // --- SHL / SHR / SAR r/m32, imm8 (C1) ---
-            case 0xC1: {
-                uint8_t modrm = elf_read8(proc, cpu.eip++);
-                uint8_t op = (modrm >> 3) & 7;
-                uint8_t rm = modrm & 7;
-                uint8_t count = elf_read8(proc, cpu.eip++) & 31;
-                uint32_t* regs[8] = {
-                    &cpu.eax,&cpu.ecx,&cpu.edx,&cpu.ebx,
-                    &cpu.esp,&cpu.ebp,&cpu.esi,&cpu.edi
-                };
-                if ((modrm >> 6) == 3) {
-                    switch (op) {
-                        case 4: *regs[rm] <<= count; break; // SHL
-                        case 5: *regs[rm] >>= count; break; // SHR
-                        case 7: *regs[rm] = (uint32_t)((int32_t)*regs[rm] >> count); break; // SAR
-                    }
-                    set_flags_logic(cpu, *regs[rm]);
-                }
-                break;
-            }
-            // --- XCHG eax, r32 (91-97) ---
-            case 0x91: case 0x92: case 0x93: case 0x94:
-            case 0x95: case 0x96: case 0x97: {
-                uint32_t* regs[8] = {
-                    &cpu.eax,&cpu.ecx,&cpu.edx,&cpu.ebx,
-                    &cpu.esp,&cpu.ebp,&cpu.esi,&cpu.edi
-                };
-                uint32_t tmp = cpu.eax;
-                cpu.eax = *regs[opcode - 0x90];
-                *regs[opcode - 0x90] = tmp;
-                break;
-            }
-
-            // --- PUSHA (60) ---
-            case 0x60: {
-                uint32_t old_esp = cpu.esp;
-                x86_push(proc, cpu, cpu.eax);
-                x86_push(proc, cpu, cpu.ecx);
-                x86_push(proc, cpu, cpu.edx);
-                x86_push(proc, cpu, cpu.ebx);
-                x86_push(proc, cpu, old_esp);
-                x86_push(proc, cpu, cpu.ebp);
-                x86_push(proc, cpu, cpu.esi);
-                x86_push(proc, cpu, cpu.edi);
-                break;
-            }
-
-            // --- POPA (61) ---
-            case 0x61: {
-                cpu.edi = x86_pop(proc, cpu);
-                cpu.esi = x86_pop(proc, cpu);
-                cpu.ebp = x86_pop(proc, cpu);
-                x86_pop(proc, cpu); // skip esp
-                cpu.ebx = x86_pop(proc, cpu);
-                cpu.edx = x86_pop(proc, cpu);
-                cpu.ecx = x86_pop(proc, cpu);
-                cpu.eax = x86_pop(proc, cpu);
-                break;
-            }
-
-            // --- CLD (FC) / STD (FD) --- ignore direction flag
-            case 0xFC: case 0xFD:
-                break;
-
-            // --- HLT (F4) ---
-            case 0xF4: {
-                proc->completed = true;
-                proc->active    = false;
-                return false;
-            }
-			case 0xF7: {
-				uint8_t modrm = elf_read8(proc, cpu.eip++);
-				uint8_t reg = (modrm >> 3) & 7;
-				uint8_t mod = (modrm >> 6) & 3;
-				uint8_t rm  = modrm & 7;
-
-				uint32_t* regs[8] = {
-					&cpu.eax,&cpu.ecx,&cpu.edx,&cpu.ebx,
-					&cpu.esp,&cpu.ebp,&cpu.esi,&cpu.edi
-				};
-
-				uint32_t val = 0;
-				if (mod == 3) {
-					val = *regs[rm];
-				} else {
-					// If you already have effective-address decode, use it here.
-					// Example:
-					// uint32_t ridx; uint32_t* rp;
-					// uint32_t ea = decode_modrm(proc, cpu, modrm, &ridx, &rp);
-					// val = elf_read32(proc, ea);
-					// For now, if memory operands aren't implemented yet, trap clearly.
-					elf_trap("F7 memory operand not implemented");
-				}
-
-				switch (reg) {
-					case 0: { // TEST r/m32, imm32
-						uint32_t imm = elf_read32(proc, cpu.eip); cpu.eip += 4;
-						set_flags_logic(cpu, val & imm);
-						break;
-					}
-					case 2: { // NOT r/m32
-						if (mod == 3) *regs[rm] = ~val;
-						else elf_trap("F7 /2 memory operand not implemented");
-						break;
-					}
-					case 3: { // NEG r/m32
-						if (mod == 3) {
-							uint32_t result = (uint32_t)(0u - val);
-							set_flags_sub(cpu, 0, val, result);
-							*regs[rm] = result;
-						} else {
-							elf_trap("F7 /3 memory operand not implemented");
-						}
-						break;
-					}
-					case 4: { // MUL r/m32 => EDX:EAX = EAX * r/m32
-						uint64_t prod = (uint64_t)cpu.eax * (uint64_t)val;
-						cpu.eax = (uint32_t)(prod & 0xFFFFFFFFu);
-						cpu.edx = (uint32_t)(prod >> 32);
-						if (cpu.edx) cpu.eflags |= FLAG_CF | FLAG_OF;
-						else cpu.eflags &= ~(FLAG_CF | FLAG_OF);
-						break;
-					}
-					case 5: { // IMUL r/m32 => EDX:EAX = EAX * signed(r/m32)
-						int64_t prod = (int64_t)(int32_t)cpu.eax * (int64_t)(int32_t)val;
-						cpu.eax = (uint32_t)(prod & 0xFFFFFFFFu);
-						cpu.edx = (uint32_t)((uint64_t)prod >> 32);
-						int64_t signext = (int64_t)(int32_t)cpu.eax;
-						if (prod != signext) cpu.eflags |= FLAG_CF | FLAG_OF;
-						else cpu.eflags &= ~(FLAG_CF | FLAG_OF);
-						break;
-					}
-					case 6: { // DIV r/m32 => EDX:EAX / r/m32
-						if (val == 0) elf_trap("divide by zero");
-						uint64_t dividend = ((uint64_t)cpu.edx << 32) | cpu.eax;
-						cpu.eax = (uint32_t)(dividend / val);
-						cpu.edx = (uint32_t)(dividend % val);
-						break;
-					}
-					case 7: { // IDIV r/m32 => signed EDX:EAX / r/m32
-						if (val == 0) elf_trap("divide by zero");
-						int64_t dividend = ((int64_t)(int32_t)cpu.edx << 32) | (uint32_t)cpu.eax;
-						int32_t divisor = (int32_t)val;
-						cpu.eax = (uint32_t)(dividend / divisor);
-						cpu.edx = (uint32_t)(dividend % divisor);
-						break;
-					}
-					default:
-						elf_trap("unsupported F7 subopcode");
-				}
-				break;
-			}
-			case 0x81: {
-				uint8_t modrm = elf_read8(proc, cpu.eip++);
-				uint8_t sub = (modrm >> 3) & 7;
-				uint8_t mod = (modrm >> 6) & 3;
-				uint8_t rm  = modrm & 7;
-
-				uint32_t* regs[8] = {
-					&cpu.eax,&cpu.ecx,&cpu.edx,&cpu.ebx,
-					&cpu.esp,&cpu.ebp,&cpu.esi,&cpu.edi
-				};
-
-				uint32_t imm = elf_read32(proc, cpu.eip);
-				cpu.eip += 4;
-
-				uint32_t oldv, result;
-
-				if (mod != 3) {
-					elf_trap("0x81 memory operand not implemented");
-					break;
-				}
-
-				oldv = *regs[rm];
-
-				switch (sub) {
-					case 0: // ADD r/m32, imm32
-						result = oldv + imm;
-						set_flags_add(cpu, oldv, imm, result);
-						*regs[rm] = result;
-						break;
-
-					case 1: // OR r/m32, imm32
-						result = oldv | imm;
-						*regs[rm] = result;
-						set_flags_logic(cpu, result);
-						break;
-
-					case 2: // ADC r/m32, imm32
-					{
-						uint32_t cf = (cpu.eflags & FLAG_CF) ? 1 : 0;
-						result = oldv + imm + cf;
-						set_flags_add(cpu, oldv, imm + cf, result);
-						*regs[rm] = result;
-						break;
-					}
-
-					case 3: // SBB r/m32, imm32
-					{
-						uint32_t cf = (cpu.eflags & FLAG_CF) ? 1 : 0;
-						result = oldv - (imm + cf);
-						set_flags_sub(cpu, oldv, imm + cf, result);
-						*regs[rm] = result;
-						break;
-					}
-
-					case 4: // AND r/m32, imm32
-						result = oldv & imm;
-						*regs[rm] = result;
-						set_flags_logic(cpu, result);
-						break;
-
-					case 5: // SUB r/m32, imm32
-						result = oldv - imm;
-						set_flags_sub(cpu, oldv, imm, result);
-						*regs[rm] = result;
-						break;
-
-					case 6: // XOR r/m32, imm32
-						result = oldv ^ imm;
-						*regs[rm] = result;
-						set_flags_logic(cpu, result);
-						break;
-
-					case 7: // CMP r/m32, imm32
-						result = oldv - imm;
-						set_flags_sub(cpu, oldv, imm, result);
-						break;
-
-					default:
-						elf_trap("invalid 0x81 subopcode");
-						break;
-				}
-				break;
-			}
+            // 0x0F 0xD0-0xFE: SSE2/MMX — skip ModRM (best effort)
             default: {
-                // Unknown opcode - log and halt process
-                char msg[64];
-				char buf[16];
-				uint32_to_hex_string(opcode, buf);
-                wm.print_to_focused("[ELF] unknown opcode: ");
-				wm.print_to_focused(buf);
-				wm.print_to_focused(" at eip=");
-				char buf2[16];
-				uint32_to_hex_string(opcode, buf2);
-				wm.print_to_focused(buf2);
-				wm.print_to_focused("\n");
-                proc->push_output_str(msg);
-                proc->completed = true;
-                proc->active    = false;
-                return false;
+                // If in range D0-FF, most have a ModRM
+                if (op2 >= 0xD0) decode_modrm32(proc, cpu);
+                // Some also have imm8 — conservative: don't skip extra byte
+                break;
             }
+
+            } // end two-byte switch
+            break;
+        } // end two_byte block
+
+        // ── Catch-all for genuinely unknown primary opcodes ───────────────
+        default: {
+            char tmp[48];
+            const char* hex = "0123456789ABCDEF";
+            tmp[0]='['; tmp[1]='E'; tmp[2]='L'; tmp[3]='F'; tmp[4]=']';
+            tmp[5]=' '; tmp[6]='?'; tmp[7]='0'; tmp[8]='p';
+            tmp[9]=' '; tmp[10]='0'; tmp[11]='x';
+            tmp[12]=hex[(op>>4)&0xF]; tmp[13]=hex[op&0xF];
+            tmp[14]=' '; tmp[15]='@'; tmp[16]=' ';
+            uint32_t eip=cpu.eip-1;
+            for(int i=0;i<8;i++) tmp[17+i]=hex[(eip>>(28-i*4))&0xF];
+            tmp[25]='\n'; tmp[26]=0;
+            proc->push_output_str(tmp);
+            proc->completed=proc->active=false;
+            return false;
         }
-    }
+
+        } // end primary switch
+    } // end step loop
 
     return !proc->completed;
 }
