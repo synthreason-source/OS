@@ -6847,6 +6847,8 @@ static void elf_write32(ElfProcess* p, uint32_t a, uint32_t v) { elf_mem_write(p
 
 static inline void elf_trap(const char* msg) {
     (void)msg;
+	wm.print_to_focused(msg);
+
     asm volatile("cli; hlt");
 }
 
@@ -7791,7 +7793,89 @@ static bool x86_tick(int slot, int steps) {
 				}
 				break;
 			}
-			
+			case 0x81: {
+				uint8_t modrm = elf_read8(proc, cpu.eip++);
+				uint8_t sub = (modrm >> 3) & 7;
+				uint8_t mod = (modrm >> 6) & 3;
+				uint8_t rm  = modrm & 7;
+
+				uint32_t* regs[8] = {
+					&cpu.eax,&cpu.ecx,&cpu.edx,&cpu.ebx,
+					&cpu.esp,&cpu.ebp,&cpu.esi,&cpu.edi
+				};
+
+				uint32_t imm = elf_read32(proc, cpu.eip);
+				cpu.eip += 4;
+
+				uint32_t oldv, result;
+
+				if (mod != 3) {
+					elf_trap("0x81 memory operand not implemented");
+					break;
+				}
+
+				oldv = *regs[rm];
+
+				switch (sub) {
+					case 0: // ADD r/m32, imm32
+						result = oldv + imm;
+						set_flags_add(cpu, oldv, imm, result);
+						*regs[rm] = result;
+						break;
+
+					case 1: // OR r/m32, imm32
+						result = oldv | imm;
+						*regs[rm] = result;
+						set_flags_logic(cpu, result);
+						break;
+
+					case 2: // ADC r/m32, imm32
+					{
+						uint32_t cf = (cpu.eflags & FLAG_CF) ? 1 : 0;
+						result = oldv + imm + cf;
+						set_flags_add(cpu, oldv, imm + cf, result);
+						*regs[rm] = result;
+						break;
+					}
+
+					case 3: // SBB r/m32, imm32
+					{
+						uint32_t cf = (cpu.eflags & FLAG_CF) ? 1 : 0;
+						result = oldv - (imm + cf);
+						set_flags_sub(cpu, oldv, imm + cf, result);
+						*regs[rm] = result;
+						break;
+					}
+
+					case 4: // AND r/m32, imm32
+						result = oldv & imm;
+						*regs[rm] = result;
+						set_flags_logic(cpu, result);
+						break;
+
+					case 5: // SUB r/m32, imm32
+						result = oldv - imm;
+						set_flags_sub(cpu, oldv, imm, result);
+						*regs[rm] = result;
+						break;
+
+					case 6: // XOR r/m32, imm32
+						result = oldv ^ imm;
+						*regs[rm] = result;
+						set_flags_logic(cpu, result);
+						break;
+
+					case 7: // CMP r/m32, imm32
+						result = oldv - imm;
+						set_flags_sub(cpu, oldv, imm, result);
+						break;
+
+					default:
+						elf_trap("invalid 0x81 subopcode");
+						break;
+				}
+				break;
+			}
             default: {
                 // Unknown opcode - log and halt process
                 char msg[64];
