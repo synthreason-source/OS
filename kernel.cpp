@@ -7791,11 +7791,19 @@ static bool x86_tick(int slot, int steps) {
 				}
 				break;
 			}
+			
             default: {
                 // Unknown opcode - log and halt process
                 char msg[64];
-                snprintf(msg, 64, "[ELF] unknown opcode 0x%02x at eip=0x%x\n",
-                         opcode, cpu.eip - 1);
+				char buf[16];
+				uint32_to_hex_string(opcode, buf);
+                wm.print_to_focused("[ELF] unknown opcode: ");
+				wm.print_to_focused(buf);
+				wm.print_to_focused(" at eip=");
+				char buf2[16];
+				uint32_to_hex_string(opcode, buf2);
+				wm.print_to_focused(buf2);
+				wm.print_to_focused("\n");
                 proc->push_output_str(msg);
                 proc->completed = true;
                 proc->active    = false;
