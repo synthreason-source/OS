@@ -62,6 +62,58 @@ extern "C" {
         return dest;
     }
 }
+
+extern "C" unsigned long long __udivmoddi4(unsigned long long num,
+                                           unsigned long long den,
+                                           unsigned long long *rem)
+{
+    if (den == 0) {
+        if (rem) *rem = 0;
+        return 0;
+    }
+
+    unsigned long long q = 0;
+    unsigned long long r = 0;
+
+    for (int i = 63; i >= 0; --i) {
+        r <<= 1;
+        r |= (num >> i) & 1ULL;
+        if (r >= den) {
+            r -= den;
+            q |= (1ULL << i);
+        }
+    }
+
+    if (rem) *rem = r;
+    return q;
+}
+
+extern "C" long long __divmoddi4(long long num,
+                                 long long den,
+                                 long long *rem)
+{
+    if (den == 0) {
+        if (rem) *rem = 0;
+        return 0;
+    }
+
+    bool neg_q = (num < 0) ^ (den < 0);
+    bool neg_r = (num < 0);
+
+    unsigned long long unum = (num < 0) ? (unsigned long long)(-num) : (unsigned long long)num;
+    unsigned long long uden = (den < 0) ? (unsigned long long)(-den) : (unsigned long long)den;
+
+    unsigned long long ur = 0;
+    unsigned long long uq = __udivmoddi4(unum, uden, &ur);
+
+    long long q = neg_q ? -(long long)uq : (long long)uq;
+    long long r = neg_r ? -(long long)ur : (long long)ur;
+
+    if (rem) *rem = r;
+    return q;
+}
+
+
 // --- Forward Declarations ---
 class Window;
 class TerminalWindow;
