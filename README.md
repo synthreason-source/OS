@@ -1,5 +1,6 @@
 a simple GUI interface OS with terminal windows.
 
+TODO, fix elf_trap traces.
 
 CTRL-Q saves and exits editor...
 
