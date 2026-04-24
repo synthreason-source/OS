@@ -9,7 +9,7 @@ BOCHS_VERSION := 2.7
 BOCHS_DIR := bochs-$(BOCHS_VERSION)
 BOCHS_GH_ARCHIVE := $(BOCHS_DIR).tar.gz
 BOCHS_GH_URL := https://downloads.sourceforge.net/project/bochs/bochs/$(BOCHS_VERSION)/$(BOCHS_GH_ARCHIVE)
-BOCHS_CPU_LIB := $(BOCHS_DIR)/cpu/.libs/libcpu.a
+BOCHS_CPU_LIB := $(BOCHS_DIR)/cpu/libcpu.a
 
 $(BOCHS_GH_ARCHIVE):
 	wget -O $@ $(BOCHS_GH_URL) || curl -L -o $@ $(BOCHS_GH_URL)
