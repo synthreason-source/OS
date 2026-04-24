@@ -4,10 +4,6 @@ MAIN := main.iso
 CXXFLAGS := -ffreestanding -O2 -Wall -Wextra -std=c++17 -fno-exceptions -fno-rtti -m32 -include fixes.h 
 CPPFLAGS += -include instrument_stub.h
 
-# BusyBox
-BUSYBOX_URL := https://busybox.net/downloads/binaries/1.35.0-i686-linux-musl/busybox
-BUSYBOX_BIN := busybox
-
 # Bochs
 BOCHS_VERSION := 2.7
 BOCHS_DIR := bochs-$(BOCHS_VERSION)
@@ -47,7 +43,6 @@ $(BOCHS_CPU_LIB):
 	# Point Bochs at the stub instrument header
 	sed -i 's|instrument/stubs/instrument.h|../instrument/stubs/instrument.h|g' $(BOCHS_DIR)/cpu/*.cc $(BOCHS_DIR)/cpu/*.h || true
 	cd $(BOCHS_DIR)/cpu && make
-	test -f $(BOCHS_CPU_LIB)
 
 bochs_glue.cpp: $(BOCHS_CPU_LIB)
 	echo '#include "$(BOCHS_DIR)/bochs.h"' >> bochs_glue.cpp
@@ -59,12 +54,6 @@ bochs_glue.cpp: $(BOCHS_CPU_LIB)
 
 bochs_glue.o: bochs_glue.cpp $(BOCHS_CPU_LIB)
 	g++ -m32 -O2 -I$(BOCHS_DIR) -I$(BOCHS_DIR)/cpu $(CXXFLAGS) -c bochs_glue.cpp -o $@
-
-$(BUSYBOX_BIN):
-	wget busybox
-
-ramdisk.o: $(BUSYBOX_BIN)
-	objcopy -I binary -O elf32-i386 --rename-section .data=.rodata --redefine-sym _binary_busybox_start=ramdisk_start --redefine-sym _binary_busybox_end=ramdisk_end $(BUSYBOX_BIN) ramdisk.o
 
 boot.o: boot.S
 	as --32 boot.S -o boot.o
@@ -86,6 +75,6 @@ run: $(MAIN)
 	qemu-system-i386 -cdrom main.iso -m 128M
 
 clean:
-	rm -rf *.o busybox iso main.iso bochs-2.7 $(BOCHS_CPU_LIB)
+	rm -rf *.o iso main.iso bochs-2.7 $(BOCHS_CPU_LIB)
 
 .PHONY: all run clean
