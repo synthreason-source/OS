@@ -200,55 +200,93 @@ typedef unsigned char uint8_t;
 typedef unsigned short uint16_t;
 typedef unsigned int uint32_t;
 typedef unsigned long long uint64_t;
-// ... (keep all your existing types)
+// =============================================================================
+// CORRECT ORDER - paste these blocks in this sequence
+// =============================================================================
 
-// ===== ELF EXEC SYSTEM ===== (complete, fixed)
+// --- STEP 1: Constants - move these to the TOP, before any class ---
+#define INBUFSIZE   512
+#define OUTBUFSIZE  4096
+#define SB          0x80000000u
 #define MAXelf_processes 4
-#define ELFSTACKSIZE (64*1024)
-#define ELFHEAPSIZE (256*1024)
-#define INBUFSIZE 512
-#define OUTBUFSIZE 4096
-#define SB 0x80000000u
+#define ELFSTACKSIZE     (64  * 1024)
+#define ELFHEAPSIZE      (256 * 1024)
 
-// FIXED: Extend YOUR existing ElfProcess (add these fields)
+// --- STEP 2: ElfProcess struct - move before TerminalWindow ---
 struct ElfProcess {
-    // YOUR EXISTING FIELDS HERE (keep all)...
-	int input_pos = 0;  // ADD THIS LINE (line ~5993 needs it)
+    int input_pos = 0;
 
-    bool active = false;
+    bool active          = false;
+    bool cpu_initialized = false;
     uint32_t entry_point = 0;
     uint8_t* memory_base = nullptr;
     uint32_t memory_size = 0;
-    uint8_t* stack = nullptr;
+    uint8_t* stack       = nullptr;
     uint32_t esp = 0, eip = 0;
-    TerminalWindow* terminal = nullptr;  // YOUR field
+    TerminalWindow* terminal = nullptr;
     char cmdline[256] = {0};
     bool waiting_for_input = false;
     bool completed = false;
-    int exit_code = 0;
-    
-    // NEW RING BUFFERS (FIXED naming)
-    char inbuf[INBUFSIZE]; int in_head=0, in_tail=0;
+    int exit_code  = 0;
+
+    char inbuf[INBUFSIZE];   int in_head=0,  in_tail=0;
     char outbuf[OUTBUFSIZE]; int out_head=0, out_tail=0;
 };
+
+// --- STEP 3: Global array - move before TerminalWindow ---
 static ElfProcess elf_processes[MAXelf_processes];
 
-// ===== FIXED RING BUFFERS (match your naming) =====
-bool in_empty(int slot) { 
-    return elf_processes[slot].in_head == elf_processes[slot].in_tail; 
+// --- STEP 4: Ring buffer helpers - move before TerminalWindow ---
+bool in_empty(int slot) {
+    return elf_processes[slot].in_head == elf_processes[slot].in_tail;
 }
-bool out_empty(int slot) { 
-    return elf_processes[slot].out_head == elf_processes[slot].out_tail; 
+bool out_empty(int slot) {
+    return elf_processes[slot].out_head == elf_processes[slot].out_tail;
 }
-
 void push_input(int slot, char c) {
     ElfProcess& p = elf_processes[slot];
-    int next = p.in_head + 1; if (next == INBUFSIZE) next = 0;
+    int next = p.in_head + 1;
+    if (next == INBUFSIZE) next = 0;
     if (next != p.in_tail) {
-        p.inbuf[p.in_head] = c; 
+        p.inbuf[p.in_head] = c;
         p.in_head = next;
     }
 }
+char pop_input(int slot) {
+    ElfProcess& p = elf_processes[slot];
+    if (in_empty(slot)) return 0;
+    char c = p.inbuf[p.in_tail];
+    p.in_tail = (p.in_tail + 1) % INBUFSIZE;
+    return c;
+}
+void push_output(int slot, char c) {
+    ElfProcess& p = elf_processes[slot];
+    int next = p.out_head + 1;
+    if (next == OUTBUFSIZE) next = 0;
+    if (next != p.out_tail) {
+        p.outbuf[p.out_head] = c;
+        p.out_head = next;
+    }
+}
+char pop_output(int slot) {
+    ElfProcess& p = elf_processes[slot];
+    if (out_empty(slot)) return 0;
+    char c = p.outbuf[p.out_tail];
+    p.out_tail = (p.out_tail + 1) % OUTBUFSIZE;
+    return c;
+}
+
+// --- STEP 5: Bochs externs - move before TerminalWindow ---
+extern "C" void bochs_set_process_memory(
+    uint8_t* base, uint32_t size, uint8_t* stack);
+extern "C" void bochs_cpu_init();
+extern "C" void bochs_cpu_set_eip(uint32_t eip);
+extern "C" void bochs_cpu_set_esp(uint32_t esp);
+extern "C" int  bochs_cpu_tick(int steps);
+extern "C" uint32_t bochs_cpu_get_eax();
+extern "C" uint32_t bochs_cpu_get_eip();
+
+// --- STEP 6: NOW TerminalWindow and everything else follows ---
 // Moved here to be visible to all classes and functions
 static bool    g_fs_encryption_enabled = false;
 static uint8_t g_fs_xor_key[64]        = {0};  // 64-byte keystream
@@ -5482,9 +5520,10 @@ void kill_elf_process(int slot) {
         if (elf_processes[slot].stack) {
             delete[] elf_processes[slot].stack;
         }
-        elf_processes[slot].active = false;
-        elf_processes[slot].memory_base = nullptr;
-        elf_processes[slot].stack = nullptr;
+        elf_processes[slot].active          = false;
+        elf_processes[slot].cpu_initialized = false;  // <-- ADD THIS
+        elf_processes[slot].memory_base     = nullptr;
+        elf_processes[slot].stack           = nullptr;
     }
 }
 
@@ -6635,329 +6674,86 @@ static void init_screen_timer(uint16_t hz) {
 
 
 
-
-
-// ===== FIXED MEMORY (direct funcs, no lambdas) =====
-bool elf_mem_read(ElfProcess* p, uint32_t addr, void* out, uint32_t size) {
-    if (addr + size <= p->memory_size) {
-        memcpy(out, p->memory_base + addr, size); return true;
-    }
-    uint32_t stackoff = addr - SB;
-    if (addr >= SB && stackoff + size <= ELFSTACKSIZE) {
-        memcpy(out, p->stack + stackoff, size); return true;
-    }
-    memset(out, 0, size); return true;
-}
-
-bool elf_mem_write(ElfProcess* p, uint32_t addr, const void* in, uint32_t size) {
-    if (addr + size <= p->memory_size) {
-        memcpy(p->memory_base + addr, in, size); return true;
-    }
-    uint32_t stackoff = addr - SB;
-    if (addr >= SB && stackoff + size <= ELFSTACKSIZE) {
-        memcpy(p->stack + stackoff, in, size); return true;
-    }
-    return true;
-}
-
-uint8_t elf_read8(ElfProcess* p, uint32_t a) { uint8_t v=0; elf_mem_read(p,a,&v,1); return v; }
-uint16_t elf_read16(ElfProcess* p, uint32_t a) { uint16_t v=0; elf_mem_read(p,a,&v,2); return v; }
-uint32_t elf_read32(ElfProcess* p, uint32_t a) { uint32_t v=0; elf_mem_read(p,a,&v,4); return v; }
-void elf_write8(ElfProcess* p, uint32_t a, uint8_t v) { elf_mem_write(p,a,&v,1); }
-void elf_write16(ElfProcess* p, uint32_t a, uint16_t v) { elf_mem_write(p,a,&v,2); }
-void elf_write32(ElfProcess* p, uint32_t a, uint32_t v) { elf_mem_write(p,a,&v,4); }
-
-// ===== X86 CPU (your existing + fixed) =====
-struct X86State {
-    uint32_t eax,ebx,ecx,edx,esi,edi,esp,ebp,eip,eflags;
-    bool initialized = false;
+struct BochsCPURegs {
+    uint32_t eax, ebx, ecx, edx, esi, edi, esp, ebp;
 };
-static X86State elf_cpu[MAXelf_processes];  // FIXED naming
 
-void x86_push(ElfProcess* p, X86State* cpu, uint32_t v) { cpu->esp -= 4; elf_write32(p, cpu->esp, v); }
-uint32_t x86_pop(ElfProcess* p, X86State* cpu) { uint32_t v = elf_read32(p, cpu->esp); cpu->esp += 4; return v; }
-
-
-char pop_input(int slot) {
-    ElfProcess& p = elf_processes[slot];
-    if (in_empty(slot)) return 0;
-    char c = p.inbuf[p.in_tail];
-    p.in_tail = (p.in_tail + 1) % INBUFSIZE;
-    return c;
-}
-
-void push_output(int slot, char c) {
-    ElfProcess& p = elf_processes[slot];
-    int next = p.out_head + 1; if (next == OUTBUFSIZE) next = 0;
-    if (next != p.out_tail) {
-        p.outbuf[p.out_head] = c; 
-        p.out_head = next;
+// Replace init_elf_system() call in kernel_main with:
+void init_elf_system() {
+    for (auto& p : elf_processes) {
+        p.active          = false;
+        p.cpu_initialized = false;  // <-- ADD THIS
+        p.in_head  = p.in_tail  = 0;
+        p.out_head = p.out_tail = 0;
     }
+    bochs_cpu_init();
 }
-
-char pop_output(int slot) {
-    ElfProcess& p = elf_processes[slot];
-    if (out_empty(slot)) return 0;
-    char c = p.outbuf[p.out_tail];
-    p.out_tail = (p.out_tail + 1) % OUTBUFSIZE;
-    return c;
-}
-// ── Linux syscall handler ─────────────────────────────────────────────────
-// Returns false if process should stop executing.
-// COMPLETE LINUX SYSCALL TABLE FOR BUSYBOX
-// Add this to your kernel.cpp (~line 6683, replace handle_linux_syscall)
-// Supports ALL BusyBox needs: sh, ls, cat, echo, etc.
-
-static bool handle_linux_syscall(ElfProcess* proc, X86State& cpu) {
-    int slot = proc - elf_processes;
-    
-    switch (cpu.eax) {
-        case 0:  // readlink
-            cpu.eax = -95; break;  // ENOSYS stub
-        
-        case 1:  // exit
-            proc->exit_code = cpu.ebx;
-            proc->completed = proc->active = true;
-            return false;
-        
-        case 2:  // fork - stub (single-process)
-            cpu.eax = 0; break;
-        
-        case 3:  // read(fd, buf, count)
-            if (cpu.ebx == 0) {  // stdin
-                proc->waiting_for_input = true;
-                cpu.eax = 0;
-                return true;
-            }
-            cpu.eax = -9; break;  // EBADF
-        
-        case 4:  // write(fd, buf, count)
-            if (cpu.ebx == 1 || cpu.ebx == 2) {  // stdout/stderr
-                uint32_t count = cpu.edx > 4096 ? 4096 : cpu.edx;
-                uint32_t wrote = 0;
-                for (uint32_t i = 0; i < count; ++i) {
-                    uint8_t cv = elf_read8(proc, cpu.ecx + i);
-                    if (!cv) break;
-                    push_output(slot, (char)cv);
-                    wrote++;
-                }
-                cpu.eax = wrote;
-                return true;
-            }
-            cpu.eax = -9; break;
-        
-        case 5:  // open(filename, flags, mode)
-            // Stub: return stdin=0 if "stdin", stdout=1, etc.
-            cpu.eax = -95; break;
-        
-        case 6:  // close(fd)
-            cpu.eax = 0; break;
-        
-        case 7:  // waitpid - stub
-            cpu.eax = 0; break;
-        
-        case 8:  // creat - stub
-            cpu.eax = -95; break;
-        
-        case 9:  // link - stub
-            cpu.eax = -95; break;
-        
-        case 10: // unlink(filename)
-            cpu.eax = 0; break;  // Success stub
-        
-        case 11: // execve(filename, argv, envp) - restart process
-            cpu.eax = -95; break;
-        
-        case 12: // chdir
-            cpu.eax = 0; break;
-        
-        case 13: // time
-            cpu.eax = g_timer_ticks; break;
-        
-        case 14: // mknod - stub
-            cpu.eax = -95; break;
-        
-        case 15: // chmod
-            cpu.eax = 0; break;
-        
-        case 16: // lchown - stub
-            cpu.eax = 0; break;
-        
-        case 19: // lseek(fd, offset, whence)
-            cpu.eax = 0; break;  // Always 0
-        
-        case 20: // getpid
-            cpu.eax = slot + 1; break;
-        
-        case 21: // mount - stub
-            cpu.eax = 0; break;
-        
-        case 27: // alarm - stub
-            cpu.eax = 0; break;
-        
-        case 33: // access(filename, mode)
-            cpu.eax = 0; break;  // Always accessible
-        
-        case 34: // nice - stub
-            cpu.eax = 0; break;
-        
-        case 37: // sync - stub
-            cpu.eax = 0; break;
-        
-        case 39: // mkdir(path, mode)
-            cpu.eax = 0; break;
-        
-        case 40: // rmdir(path)
-            cpu.eax = 0; break;
-        
-        case 41: // dup(fd)
-            cpu.eax = cpu.ebx; break;
-        
-        case 42: // pipe - stub
-            cpu.eax = -95; break;
-        
-        case 45: // brk(ptr)
-            static uint32_t brk_base[MAXelf_processes] = {};
-            if (!brk_base[slot]) brk_base[slot] = proc->memory_size;
-            if (!cpu.ebx) cpu.eax = brk_base[slot];
-            else { brk_base[slot] = cpu.ebx; cpu.eax = brk_base[slot]; }
-            break;
-        
-        case 46: // setuid - stub
-            cpu.eax = 0; break;
-        
-        case 48: // getgid
-            cpu.eax = 0; break;
-        
-        case 49: // signal - stub
-            cpu.eax = 0; break;
-        
-        case 54: // ioctl - stub
-            cpu.eax = 0; break;
-        
-        case 57: // getppid
-            cpu.eax = 1; break;
-        
-        case 60: // umask - stub
-            cpu.eax = 0; break;
-        
-        case 63: // gettimeofday - stub
-            cpu.eax = 0; break;
-        
-        case 66: // getuid
-            cpu.eax = 0; break;
-        
-        case 72: // setuid
-            cpu.eax = 0; break;
-        
-        case 78: // geteuid
-            cpu.eax = 0; break;
-        
-        case 90: // mmap - stub (return heap)
-            cpu.eax = proc->memory_size; break;
-        
-        case 91: // munmap - stub
-            cpu.eax = 0; break;
-        
-        case 122: // uname - stub
-            cpu.eax = 0; break;
-        
-        case 183: // getcwd(buf, size)
-            strcpy((char*)cpu.ebx, "/");  // Root dir
-            cpu.eax = cpu.ebx;
-            break;
-        
-        case 192: // stat(filename, statbuf)
-            cpu.eax = 0; memset((void*)cpu.ecx, 0, 100); break;
-        
-        case 195: // lstat - same as stat
-            cpu.eax = 0; memset((void*)cpu.ecx, 0, 100); break;
-        
-        default:
-            cpu.eax = -38;  // ENOSYS
-            break;
-    }
-    return true;
-}
-
-     
-// ===== MAIN TICK (200 instr/frame) =====
 bool x86_tick(int slot, int steps = 200) {
     ElfProcess& proc = elf_processes[slot];
-    X86State& cpu = elf_cpu[slot];
-    
+
     if (!proc.active || proc.completed) return false;
-    if (proc.waiting_for_input) return true;
-    
-    // First-time init
-    if (!cpu.initialized) {
-        cpu.eflags = 0x202;  // IF=1
-        cpu.esp = SB + ELFSTACKSIZE - 16;
-        cpu.eip = proc.entry_point;
-        cpu.initialized = true;
-        x86_push(&proc, &cpu, 0); x86_push(&proc, &cpu, 0);  // argv, envp
+    if (proc.waiting_for_input)        return true;
+
+    // Point Bochs memory at this process
+    bochs_set_process_memory(
+        proc.memory_base,
+        proc.memory_size,
+        proc.stack
+    );
+
+    // First run: set entry point and stack
+    if (!proc.cpu_initialized) {
+        bochs_cpu_set_eip(proc.entry_point);
+        bochs_cpu_set_esp(SB + ELF_STACK_SIZE - 16);
+        proc.cpu_initialized = true;
     }
-    
-    for (int s = 0; s < steps; ++s) {
-        if (proc.waiting_for_input || proc.completed) return false;
-        
-        uint8_t op = elf_read8(&proc, cpu.eip++);
-        if (op == 0xCD && elf_read8(&proc, cpu.eip) == 0x80) {
-            cpu.eip++;  // int 0x80
-			if (!handle_linux_syscall(&proc, cpu)) return false;  // Remove &
-            continue;
-        }
-        
-        // YOUR EXISTING OPCODE DISPATCH HERE (from paste.txt)
-        // ... (MOV, RET, etc. - keep your full switch)
-        switch (op) {
-            case 0xC3: cpu.eip = x86_pop(&proc, &cpu); break;  // RET
-            // Add your full cases...
-            default: break;
-        }
+
+    // Run steps instructions
+    bochs_cpu_tick(steps);
+
+    // Check if process ended via bad EIP
+    uint32_t eip = bochs_cpu_get_eip();
+    if (eip == 0 || eip >= proc.memory_size) {
+        proc.completed = true;
+        proc.active    = false;
+        return false;
     }
+
     return true;
 }
-
-void tick_elf_processes(int steps=200) {
+// And definition without default:
+void tick_elf_processes(int steps) {
     for (int i = 0; i < MAXelf_processes; ++i) {
         if (!elf_processes[i].active || elf_processes[i].completed) continue;
+
         if (elf_processes[i].waiting_for_input) {
-            // Drain output
-            ElfProcess& p = elf_processes[i];
-            if (p.terminal && !out_empty(i)) {
-                char tmp[256]; int n=0;
-                while (!out_empty(i) && n<255) tmp[n++] = pop_output(i);
-                tmp[n]=0; if (n) p.terminal->console_print(tmp);
+            // Drain output while waiting
+            if (elf_processes[i].terminal && !out_empty(i)) {
+                char tmp[256]; int n = 0;
+                while (!out_empty(i) && n < 255) tmp[n++] = pop_output(i);
+                tmp[n] = 0;
+                if (n) elf_processes[i].terminal->console_print(tmp);
             }
             continue;
         }
+
         bool running = x86_tick(i, steps);
-        // Drain output
+
+        // Drain output after tick
         if (elf_processes[i].terminal && !out_empty(i)) {
-            char tmp[256]; int n=0;
-            while (!out_empty(i) && n<255) tmp[n++] = pop_output(i);
-            tmp[n]=0; if (n) elf_processes[i].terminal->console_print(tmp);
+            char tmp[256]; int n = 0;
+            while (!out_empty(i) && n < 255) tmp[n++] = pop_output(i);
+            tmp[n] = 0;
+            if (n) elf_processes[i].terminal->console_print(tmp);
         }
+
         if (!running) {
             elf_processes[i].active = false;
-            if (elf_processes[i].terminal) 
+            if (elf_processes[i].terminal)
                 elf_processes[i].terminal->captured_elf_slot = -1;
         }
     }
 }
-
-
-
-// ===== INIT (add to kernel_main) =====
-void init_elf_system() {
-    for (auto& p : elf_processes) {
-        p.active = false;
-        p.in_head = p.in_tail = p.out_head = p.out_tail = 0;
-    }
-}
-
-
 extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
     // --- INITIALIZATION --- (unchanged)
     static uint8_t kernelheap[1024 * 1024 * 8];
@@ -6977,7 +6773,7 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
     
     g_gfx.init(false);
     launch_new_terminal();
-
+	init_elf_system();
     enable_usb_legacy_support();
 
     for (int i = 0; i < 100000; i++) io_wait_short();
@@ -7024,15 +6820,15 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
     // MAIN LOOP - PERFECT: KEYBOARD + MOUSE CLICKS BOTH WORK
     // =============================================================================
     for (;;) {
+		tick_elf_processes(100);
         // **CRITICAL MOUSE FIX #1**: Save mouse state BEFORE polling
         bool prev_left = mouse_left_down;
         bool prev_right = mouse_right_down;
-
+		
         // 1. Poll input (updates mouse_left_down, mouse_right_down, last_key_press)
         poll_input_universal();
 
 		// ===== MAIN LOOP (add to main loop) =====
-		tick_elf_processes(200);
         // **CRITICAL MOUSE FIX #2**: Detect clicks using PREVIOUS frame state
         bool leftClickedThisFrame = (mouse_left_down && !prev_left);
         bool rightClickedThisFrame = (mouse_right_down && !prev_right);
