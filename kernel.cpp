@@ -5688,13 +5688,8 @@ void handle_command() {
         } else {
             console_print("Usage: killelf <slot>\n");
         }
-    } else if (strcmp(command, "run") == 0) {
-        cmd_run(ahci_base, selected_port, get_arg(args, 0));
     }
-    else if (strcmp(command, "exec") == 0) {
-        cmd_exec(get_arg(args, 0));
-    }
-    else if (strcmp(command, "ps") == 0) {
+	else if (strcmp(command, "ps") == 0) {
         list_run_processes();
         list_exec_processes();
     }
