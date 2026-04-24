@@ -91,7 +91,7 @@ BOCHS_DEFINES := \
     -DBX_USE_CPU_SMF=0 \
     -DBX_DEBUGGER=0 \
     -DBX_GDBSTUB=0 \
-    -DBX_INSTRUMENTATION=0 \
+    -DBX_INSTRUMENTATION=1 \
     -DBX_SMP_PROCESSORS=1 \
     -DPACKAGE_VERSION=\"$(BOCHS_VERSION)\"
 
@@ -265,6 +265,19 @@ bochs_glue.o: bochs_glue.cpp $(BOCHS_CPU_LIB)
 bochs-build: bochs-patch $(BOCHS_CPU_OBJS)
 
 $(BOCHS_BUILD)/%.o: $(BOCHS_DIR)/cpu/%.cc $(BOCHS_DIR)/.patched
+	
+	
+	@echo "Patching Bochs for standalone CPU use..."
+	# Fix instrument.h include
+	sed -i '364s/#include "instrument.h"/#ifdef BX_SUPPORT_INSTRUMENTATION\n#include "instrument.h"\n#endif/' $(BOCHS_DIR)/bochs.h
+	# Alternative stub include if stubs dir missing
+	echo '#ifndef BX_SUPPORT_INSTRUMENTATION' > $(BOCHS_DIR)/instrument.h
+	echo '#define BX_INSTR_ENABLED(x)  ((void)0)' >> $(BOCHS_DIR)/instrument.h
+	echo '#define BX_INSTR_FPU_ENABLED  ((void)0)' >> $(BOCHS_DIR)/instrument.h
+	echo '#endif' >> $(BOCHS_DIR)/instrument.h
+	ln -sf $(BOCHS_DIR)/instrument.h $(BOCHS_DIR)/instrument/stubs/instrument.h 2>/dev/null || true
+	# Comment out other GUI/optional includes if needed
+	sed -i 's/#include "param_names.h"/\/\/#include "param_names.h"/' $(BOCHS_DIR)/bochs.h
 	@mkdir -p $(dir $@)
 	@echo "[BOCHS] $<"
 	gcc -c $< $(BOCHS_CXXFLAGS) -o $@
