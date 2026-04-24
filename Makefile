@@ -34,8 +34,9 @@ $(BOCHS_CPU_LIB):
 		--enable-cpu-level=6 --enable-fpu \
 		--disable-mmx --disable-sse --disable-avx \
 		--disable-x86-64 --disable-debugger \
+		--with-nogui --disable-gui \
 		CXXFLAGS="-O2 -m32" CFLAGS="-O2 -m32"
-	cd $(BOCHS_DIR)/cpu && make
+	cd $(BOCHS_DIR) && make
 
 bochs_glue.cpp: $(BOCHS_CPU_LIB)
 	printf '%s\n' \
