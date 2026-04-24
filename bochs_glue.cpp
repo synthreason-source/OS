@@ -285,12 +285,11 @@ void bx_shadow_filedata_c::set_sr_handlers(void*,
 // APIC / misc Bochs globals
 // ═════════════════════════════════════════════════════════════════════════
 
-bx_bool  simulate_xapic = 0;
+//bx_bool  simulate_xapic = 0;
 Bit32u   apic_id_mask   = 0;
 bx_debug_t bx_dbg;
 
 // FPU_tagof – used by sse_move / xsave
-extern "C" int FPU_tagof(const floatx80 &) { return 3; } // empty tag
 
 // ═════════════════════════════════════════════════════════════════════════
 // C stdlib symbols that Bochs references but we are -nostdlib
@@ -310,12 +309,10 @@ extern "C" {
     size_t strlen(const char *s) {
         size_t n = 0; while (*s++) n++; return n;
     }
-    char  *strstr(const char *h, const char *n) { return nullptr; }
 
     // stdio-ish (only called from print_state_FPU / load_MSRs,
     //            which we never invoke)
     int    sprintf(char *buf, const char *fmt, ...) { return 0; }
-    int    fprintf(void*, const char*, ...) { return 0; }
 
     // math (used by print_state_FPU)
     double pow(double, double) { return 0.0; }
@@ -333,7 +330,6 @@ extern "C" {
     // setjmp / longjmp (used by cpu_loop / exception)
     // provided by libgcc/-fno-stack-protector path
     // but declare them weak just in case
-    __attribute__((weak)) int  _setjmp(void*) { return 0; }
     __attribute__((weak)) void __longjmp_chk(void*, int) { while(1); }
 
     // __assert_fail
@@ -345,17 +341,9 @@ extern "C" {
     void  __cxa_guard_abort(void*) {}
 
     // file I/O (called from misc_mem / msr, never in our path)
-    void *fopen64(const char*, const char*) { return nullptr; }
-    int   fclose(void*) { return 0; }
-    int   feof(void*) { return 1; }
-    char *fgets(char*, int, void*) { return nullptr; }
-    size_t fread(void*, size_t, size_t, void*) { return 0; }
-    size_t fwrite(const void*, size_t, size_t, void*) { return 0; }
-    int   fseeko64(void*, long long, int) { return -1; }
     int   open64(const char*, int, ...) { return -1; }
     int   close(int) { return 0; }
     int   read(int, void*, size_t) { return -1; }
-    int   fstat64(int, void*) { return -1; }
     void *tmpfile64() { return nullptr; }
     int   __isoc23_sscanf(const char*, const char*, ...) { return 0; }
     long  __isoc23_strtol(const char*, char**, int) { return 0; }
@@ -363,7 +351,6 @@ extern "C" {
     // fortify wrappers
     int  __sprintf_chk(char *buf, int, size_t, const char *fmt, ...) { return 0; }
     int  __vsprintf_chk(char*, int, size_t, const char*, va_list) { return 0; }
-    int  __fprintf_chk(void*, int, const char*, ...) { return 0; }
 
     // division helper (usually in libgcc but may be missing for -m32)
     __attribute__((weak))
