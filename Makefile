@@ -31,19 +31,21 @@ BOCHS_CPU_LIB := $(BOCHS_DIR)/cpu/.libs/libcpu.a
 
 all: $(MAIN)
 
-$(BOCHS_CPU_LIB): 
+$(BOCHS_CPU_LIB):
 	rm -rf $(BOCHS_DIR)
 	wget -O temp.tar.gz https://downloads.sourceforge.net/project/bochs/bochs/2.7/$(BOCHS_DIR).tar.gz
 	tar -xzf temp.tar.gz
-	mv $(BOCHS_DIR) temp-bochs
-	mv temp-bochs $(BOCHS_DIR)
+	mv $(BOCHS_DIR) temp-bochs && mv temp-bochs $(BOCHS_DIR)
 	rm temp.tar.gz
-	cd $(BOCHS_DIR) && ./configure --enable-cpu-level=6 --enable-fpu --disable-mmx --disable-sse --disable-avx --disable-x86-64 --disable-debugger CXXFLAGS="-O2 -m32" CFLAGS="-O2 -m32"
-	sed -i '364s/#include/#ifdef BX_SUPPORT_INSTRUMENTATION\n#include/' $(BOCHS_DIR)/bochs.h
-	
-	echo "#endif" >> $(BOCHS_DIR)/bochs.h
-
-	echo "#define BX_SUPPORT_INSTRUMENTATION 0" >> $(BOCHS_DIR)/bochs.h
+	cd $(BOCHS_DIR) && ./configure \
+		--enable-cpu-level=6 --enable-fpu \
+		--disable-mmx --disable-sse --disable-avx \
+		--disable-x86-64 --disable-debugger \
+		CXXFLAGS="-O2 -m32" CFLAGS="-O2 -m32"
+	# Inject the define BEFORE bochs.h is processed, at the very top
+	sed -i '1s/^/#define BX_SUPPORT_INSTRUMENTATION 1\n/' $(BOCHS_DIR)/bochs.h
+	# Point Bochs at the stub instrument header
+	sed -i 's|instrument/stubs/instrument.h|../instrument/stubs/instrument.h|g' $(BOCHS_DIR)/cpu/*.cc $(BOCHS_DIR)/cpu/*.h || true
 	cd $(BOCHS_DIR)/cpu && make
 	test -f $(BOCHS_CPU_LIB)
 
