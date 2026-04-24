@@ -8,6 +8,12 @@ sudo make clean
 
 sudo make run
 
+cd bochs-2.7/
+
+./configure --enable-instrumentation="instrument/stubs"
+
+sudo make run
+
 use VMware (other-64bit) with SATA drive, port 0
 
 
