@@ -23,7 +23,7 @@ ISODIR := iso
 MAIN := main.iso
 CXXFLAGS := -ffreestanding -O2 -Wall -Wextra -std=c++17 -fno-exceptions -fno-rtti -m32
 BOCHS_DIR := bochs-2.7
-BOCHS_CPU_LIB := $(BOCHS_DIR)/cpu/.libs/libcpu.a
+BOCHS_CPU_LIB := $(BOCHS_DIR)/cpu/libcpu.a
 
 all: $(MAIN)
 $(BOCHS_CPU_LIB):
