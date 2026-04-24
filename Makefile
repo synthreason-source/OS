@@ -94,10 +94,10 @@ boot.o: boot.S
 
 kernel.o: kernel.cpp $(BOCHS_CPU_LIB)
 	g++ -m32 -O2 -I$(BOCHS_DIR) -I$(BOCHS_DIR)/cpu $(CXXFLAGS) -c kernel.cpp -o kernel.o
-
+	
 $(MULTIBOOT): boot.o kernel.o bochs_glue.o $(BOCHS_CPU_LIB)
 	mkdir -p iso/boot
-	ld -m elf_i386 -T linker.ld -o iso/boot/main.elf boot.o kernel.o bochs_glue.o \
+	g++ -m32 -T linker.ld -nostdlib -o iso/boot/main.elf boot.o kernel.o bochs_glue.o \
 		$(BOCHS_DIR)/cpu/libcpu.a \
 		$(BOCHS_DIR)/cpu/fpu/libfpu.a \
 		$(BOCHS_DIR)/cpu/cpudb/libcpudb.a \
