@@ -30,12 +30,13 @@ $(BOCHS_CPU_LIB):
 	wget -O temp.tar.gz https://downloads.sourceforge.net/project/bochs/bochs/2.7/$(BOCHS_DIR).tar.gz
 	tar -xzf temp.tar.gz
 	rm temp.tar.gz
-	cd $(BOCHS_DIR) && ./configure \
+		cd $(BOCHS_DIR) && ./configure \
 		--enable-cpu-level=6 --enable-fpu \
 		--disable-mmx --disable-sse --disable-avx \
 		--disable-x86-64 --disable-debugger \
 		--with-nogui --disable-gui \
-		CXXFLAGS="-O2 -m32" CFLAGS="-O2 -m32"
+		CXXFLAGS="-O2 -m32 -fno-stack-protector" \
+		CFLAGS="-O2 -m32 -fno-stack-protector"
 	cd $(BOCHS_DIR) && make
 
 bochs_glue.cpp: $(BOCHS_CPU_LIB)
