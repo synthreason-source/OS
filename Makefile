@@ -97,7 +97,12 @@ kernel.o: kernel.cpp $(BOCHS_CPU_LIB)
 
 $(MULTIBOOT): boot.o kernel.o bochs_glue.o $(BOCHS_CPU_LIB)
 	mkdir -p iso/boot
-	ld -m elf_i386 -T linker.ld -o iso/boot/main.elf boot.o kernel.o bochs_glue.o $(BOCHS_CPU_LIB)
+	ld -m elf_i386 -T linker.ld -o iso/boot/main.elf boot.o kernel.o bochs_glue.o \
+		$(BOCHS_DIR)/cpu/libcpu.a \
+		$(BOCHS_DIR)/cpu/fpu/libfpu.a \
+		$(BOCHS_DIR)/cpu/cpudb/libcpudb.a \
+		$(BOCHS_DIR)/memory/libmemory.a \
+		-lgcc
 
 $(MAIN): $(MULTIBOOT)
 	mkdir -p iso/boot/grub
