@@ -39,7 +39,7 @@ $(BOCHS_CPU_LIB): $(BOCHS_DIR)/.extracted
 	cd $(BOCHS_DIR) && ./configure \
 	    --enable-cpu-level=6 \
 	    --disable-x86-64 \
-	    --disable-fpu \
+	    --enable-fpu \
 	    --disable-mmx \
 	    --disable-sse \
 	    --disable-vmx \
@@ -61,6 +61,15 @@ $(BOCHS_CPU_LIB): $(BOCHS_DIR)/.extracted
 	    --without-rfb \
 	    --without-vnc \
 	    --without-svga \
+		--enable-cpu-level=6 \
+		--enable-fpu \
+		--enable-instrumentation="instrument/stubs" \
+		--disable-mmx --disable-sse --disable-avx --disable-evex \
+		--disable-x86-64 --disable-vmx --disable-svm \
+		--disable-debugger --disable-disasm --disable-gdb-stub \
+		--disable-docbook --disable-plugins \
+		--without-x --without-x11 --without-wx --without-sdl --without-sdl2 \
+		--without-nogui --without-term --without-rfb --without-vnc --without-svga \
 	    CXXFLAGS="-O2 -m32 -fno-exceptions -fno-rtti" \
 	    CFLAGS="-O2 -m32"
 	@echo "Building Bochs CPU library..."
@@ -74,6 +83,7 @@ BOCHS_DEFINES := \
     -DBX_SUPPORT_FPU=0 \
     -DBX_SUPPORT_SSE=0 \
     -DBX_SUPPORT_VMX=0 \
+	-DBX_SUPPORT_MMX=0 \
     -DBX_SUPPORT_SVM=0 \
     -DBX_SUPPORT_MONITOR_MWAIT=0 \
     -DBX_SUPPORT_APIC=0 \
