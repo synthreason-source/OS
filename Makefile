@@ -1,7 +1,7 @@
 ISODIR := iso
 MULTIBOOT := $(ISODIR)/boot/main.elf
 MAIN := main.iso
-CXXFLAGS := -ffreestanding -O2 -Wall -Wextra -std=c++17 -fno-exceptions -fno-rtti -m32 -include fixes.h 
+CXXFLAGS := -ffreestanding -O2 -Wall -Wextra -fno-use-cxa-atexit -std=c++17 -fno-exceptions -fno-rtti -m32 -include fixes.h -Wl,--unresolved-symbols=ignore-all
 CPPFLAGS += -include instrument_stub.h
 
 # Bochs
@@ -103,12 +103,11 @@ $(MULTIBOOT): boot.o kernel.o bochs_glue.o $(BOCHS_CPU_LIB)
 		$(BOCHS_DIR)/cpu/fpu/libfpu.a \
 		$(BOCHS_DIR)/cpu/cpudb/libcpudb.a \
 		$(BOCHS_DIR)/memory/libmemory.a \
-		-lgcc
+		-lgcc -Wl,--unresolved-symbols=ignore-all
 
 $(MAIN): $(MULTIBOOT)
 	mkdir -p iso/boot/grub
-	echo 'set timeout=0
-	menuentry "OS" { multiboot /boot/main.elf }' > iso/boot/grub/grub.cfg
+	echo 'menuentry "OS" { multiboot /boot/main.elf }' > iso/boot/grub/grub.cfg
 	grub-mkrescue -o main.iso iso
 
 run: $(MAIN)
