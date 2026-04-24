@@ -5870,6 +5870,33 @@ void handle_command() {
         
         delete[] args_copy;
     }
+	
+// ===== BUSYBOX COMMAND (add to handle_command) =====
+if (strcmp(command, "busybox") == 0) {
+    char* elfdata = fat32_read_file_as_string("busybox");
+    if (!elfdata) { console_print("BusyBox not found\n"); return; }
+    
+    int slot = -1;
+    for (int i=0; i<MAX_ELF_PROCESSES; i++) 
+        if (!elf_processes[i].active) { slot=i; break; }
+    if (slot < 0) { console_print("No slots\n"); delete[] elfdata; return; }
+    
+    ElfProcess& proc = elf_processes[slot];
+    Elf32_Ehdr* ehdr = (Elf32_Ehdr*)elfdata;
+    proc.entry_point = ehdr->e_entry;
+    proc.memory_size = 1<<20;  // 1MB
+    proc.memory_base = new uint8_t[proc.memory_size];
+    memcpy(proc.memory_base, elfdata, proc.memory_size);
+    proc.stack = new uint8_t[ELFSTACKSIZE];
+    proc.terminal = this;
+    strncpy(proc.cmdline, "busybox", 255);
+    proc.active = true;
+    
+    captured_elf_slot = slot;
+    console_print("BusyBox: terminal captured!\n");
+    delete[] elfdata;
+}
+
     else if (strcmp(command, "time") == 0) { 
         RTC_Time t = read_rtc(); 
         char buf[64]; 
