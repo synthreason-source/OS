@@ -344,7 +344,6 @@ extern "C" {
     int   open64(const char*, int, ...) { return -1; }
     int   close(int) { return 0; }
     int   read(int, void*, size_t) { return -1; }
-    void *tmpfile64() { return nullptr; }
     int   __isoc23_sscanf(const char*, const char*, ...) { return 0; }
     long  __isoc23_strtol(const char*, char**, int) { return 0; }
 
