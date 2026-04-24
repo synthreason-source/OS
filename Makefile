@@ -84,6 +84,52 @@ $(BOCHS_CPU_LIB):
 	cd $(BOCHS_DIR)/cpu && make
 
 bochs_glue.cpp: $(BOCHS_CPU_LIB)
+	printf '%s\n' \
+		'#ifndef BX_INSTRUMENT_H' \
+		'#define BX_INSTRUMENT_H' \
+		'#define BX_INSTR_PHY_ACCESS(cpu_id, paddr, size, memtype, rw)' \
+		'#define BX_INSTR_CACHE_CNTRL(cpu_id, what)' \
+		'#define BX_INSTR_CLFLUSH(cpu_id, laddr, paddr)' \
+		'#define BX_INSTR_TLB_CNTRL(cpu_id, what, new_cr3)' \
+		'#define BX_INSTR_WRMSR(cpu_id, addr, val64)' \
+		'#define BX_INSTR_OPCODE(cpu_id, i, opcode, len, is32, is64)' \
+		'#define BX_INSTR_UCNEAR_BRANCH(cpu_id, what, orig_rip, new_rip)' \
+		'#define BX_INSTR_CNEAR_BRANCH_TAKEN(cpu_id, orig_rip, new_rip)' \
+		'#define BX_INSTR_CNEAR_BRANCH_NOT_TAKEN(cpu_id, orig_rip)' \
+		'#define BX_INSTR_FAR_BRANCH(cpu_id, what, prev_cs, prev_rip, new_cs, new_rip)' \
+		'#define BX_INSTR_FAR_BRANCH_ORIGIN()' \
+		'#define BX_INSTR_IS_INT(cpu_id)       (0)' \
+		'#define BX_INSTR_INIT_ENV()' \
+		'#define BX_INSTR_EXIT_ENV()' \
+		'#define BX_INSTR_INITIALIZE(cpu_id)' \
+		'#define BX_INSTR_EXIT(cpu_id)' \
+		'#define BX_INSTR_RESET(cpu_id, source)' \
+		'#define BX_INSTR_HLT(cpu_id)' \
+		'#define BX_INSTR_MWAIT(cpu_id, addr, len, flags)' \
+		'#define BX_INSTR_CNT(cpu_id)' \
+		'#define BX_INSTR_BEFORE_EXECUTION(cpu_id, i)' \
+		'#define BX_INSTR_AFTER_EXECUTION(cpu_id, i)' \
+		'#define BX_INSTR_REPEAT_ITERATION(cpu_id, i)' \
+		'#define BX_INSTR_INP(addr, len)' \
+		'#define BX_INSTR_INP2(addr, len, val)' \
+		'#define BX_INSTR_OUTP(addr, len, val)' \
+		'#define BX_INSTR_MEM_PHY_READ(cpu_id, addr, len)' \
+		'#define BX_INSTR_MEM_PHY_WRITE(cpu_id, addr, len)' \
+		'#define BX_INSTR_MEM_PHY_ACCESS(cpu_id, addr, rw, len)' \
+		'#define BX_INSTR_LIN_ACCESS(cpu_id, lin, phy, len, memtype, rw)' \
+		'#define BX_INSTR_MEM_DATA(cpu_id, seg, off, len, rw)' \
+		'#define BX_INSTR_INTERRUPT(cpu_id, vector)' \
+		'#define BX_INSTR_EXCEPTION(cpu_id, vector, error_code)' \
+		'#define BX_INSTR_HWINTERRUPT(cpu_id, vector, cs, eip)' \
+		'#define BX_INSTR_WRMSR(cpu_id, addr, val64)' \
+		'#define BX_INSTR_IS_INT(cpu_id)       (0)' \
+		'#define BX_INSTR_IS_RET(cpu_id)       (0)' \
+		'#define BX_INSTR_IS_CALL(cpu_id)      (0)' \
+		'#define BX_INSTR_IS_IRET(cpu_id)      (0)' \
+		'#define BX_INSTR_IS_CALL_NEAR(cpu_id) (0)' \
+		'#define BX_INSTR_IS_CALL_FAR(cpu_id)  (0)' \
+		'#endif' \
+	> $(BOCHS_DIR)/instrument/stubs/instrument.h
 	echo '#include "$(BOCHS_DIR)/bochs.h"' >> bochs_glue.cpp
 	echo '#include "$(BOCHS_DIR)/cpu/cpu.h"' >> bochs_glue.cpp
 	echo 'static BX_CPU_C bx_cpu;' >> bochs_glue.cpp
