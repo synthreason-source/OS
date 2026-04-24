@@ -1,0 +1,6 @@
+#include "bochs-2.7/bochs.h"
+#include "bochs-2.7/cpu/cpu.h"
+static BX_CPU_C bx_cpu;
+extern "C" void bochs_cpu_init(){bx_cpu.initialize(); bx_cpu.reset(BX_RESET_HARDWARE);}
+extern "C" int bochs_cpu_tick(int n){for(int i=0;i<n;i++)bx_cpu.cpu_loop();return 0;}
+extern "C" unsigned int bochs_cpu_get_eip(){return bx_cpu.get_instruction_pointer();}
