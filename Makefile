@@ -61,9 +61,9 @@ boot.o: boot.S
 kernel.o: kernel.cpp $(BOCHS_CPU_LIB)
 	g++ -m32 -O2 -I$(BOCHS_DIR) -I$(BOCHS_DIR)/cpu $(CXXFLAGS) -c kernel.cpp -o kernel.o
 
-$(MULTIBOOT): boot.o kernel.o ramdisk.o bochs_glue.o $(BOCHS_CPU_LIB)
+$(MULTIBOOT): boot.o kernel.o bochs_glue.o $(BOCHS_CPU_LIB)
 	mkdir -p iso/boot
-	ld -m elf_i386 -T linker.ld -o iso/boot/main.elf boot.o kernel.o ramdisk.o bochs_glue.o $(BOCHS_CPU_LIB)
+	ld -m elf_i386 -T linker.ld -o iso/boot/main.elf boot.o kernel.o bochs_glue.o $(BOCHS_CPU_LIB)
 
 $(MAIN): $(MULTIBOOT)
 	mkdir -p iso/boot/grub
