@@ -1,6 +1,12 @@
 #include "bochs-2.7/bochs.h"
 #include "bochs-2.7/cpu/cpu.h"
+extern "C" void *__dso_handle = nullptr;
 
+extern "C" int __cxa_atexit(void (*)(void*), void*, void*) {
+  return 0;
+}
+
+extern "C" void __cxa_finalize(void*) {}
 extern "C" void bochs_cpu_init() {
   bx_cpu.initialize();
   bx_cpu.reset(BX_RESET_HARDWARE);

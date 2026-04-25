@@ -6773,7 +6773,7 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
     
     g_gfx.init(false);
     launch_new_terminal();
-	init_elf_system();
+	//init_elf_system();
     enable_usb_legacy_support();
 
     for (int i = 0; i < 100000; i++) io_wait_short();
@@ -6805,7 +6805,6 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
 	} else {
 		wm.print_to_focused("FAT32 init failed.\n");
 	}
-    extract_busybox_to_filesystem();
     init_screen_timer(30);
 
     uint32_t last_paint_tick = 0;
@@ -6820,7 +6819,7 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
     // MAIN LOOP - PERFECT: KEYBOARD + MOUSE CLICKS BOTH WORK
     // =============================================================================
     for (;;) {
-		tick_elf_processes(100);
+		//tick_elf_processes(100);
         // **CRITICAL MOUSE FIX #1**: Save mouse state BEFORE polling
         bool prev_left = mouse_left_down;
         bool prev_right = mouse_right_down;

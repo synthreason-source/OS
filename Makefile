@@ -107,7 +107,11 @@ $(MULTIBOOT): boot.o kernel.o bochs_glue.o $(BOCHS_CPU_LIB)
 
 $(MAIN): $(MULTIBOOT)
 	mkdir -p iso/boot/grub
-	echo 'menuentry "OS" { multiboot /boot/main.elf }' > iso/boot/grub/grub.cfg
+	printf '%s\n' \
+	'set timeout=0' \
+	'menuentry "OS" {' \
+	'    multiboot /boot/main.elf' \
+	'}' > iso/boot/grub/grub.cfg
 	grub-mkrescue -o main.iso iso
 
 run: $(MAIN)
