@@ -6813,7 +6813,7 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
     int prev_mouse_y = mouse_y;
     
     g_gfx.clear_screen(ColorPalette::DESKTOP_BLUE);
-	init_elf_system();
+	//init_elf_system();
 
     // =============================================================================
     // MAIN LOOP - PERFECT: KEYBOARD + MOUSE CLICKS BOTH WORK

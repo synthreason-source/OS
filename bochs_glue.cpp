@@ -1,65 +1,116 @@
+// bochs_glue.cpp
+// Verified against actual Bochs 2.7 source (memory-bochs.h, cpu/cpu.h,
+// cpu/decoder/decoder.h, bx_debug/debug.h).
+
 #include "bochs-2.7/bochs.h"
 #include "bochs-2.7/cpu/cpu.h"
+#include "bochs-2.7/memory/memory-bochs.h"   // defines BX_MEM_C + extern bx_mem
 
-extern "C" void *__dso_handle = nullptr;
-
-extern "C" int __cxa_atexit(void (*)(void*), void*, void*) { return 0; }
+// ── ABI stubs ─────────────────────────────────────────────────────────────────
+extern "C" void* __dso_handle = nullptr;
+extern "C" int  __cxa_atexit(void (*)(void*), void*, void*) { return 0; }
 extern "C" void __cxa_finalize(void*) {}
 
-// ── Memory backing ────────────────────────────────────────────────────────────
-// Bochs reads/writes guest physical memory through BX_MEM().  We redirect
-// those calls to whichever process slab is currently active.
-static uint8_t* g_mem_base  = nullptr;
-static uint32_t g_mem_size  = 0;
-static uint8_t* g_stack_base = nullptr;
+// ── Process memory slab ───────────────────────────────────────────────────────
+static Bit8u*   g_mem_base = nullptr;
+static Bit32u   g_mem_size = 0;
 
-extern "C" void bochs_set_process_memory(uint8_t* base,
-                                          uint32_t size,
-                                          uint8_t* stack)
+// Memory-handler callbacks registered with registerMemoryHandlers().
+// Bochs calls these for every physical read/write that falls in the
+// registered address range [0, g_mem_size).
+// Signature: bool handler(bx_phy_address addr, unsigned len, void* data, void* param)
+
+static bool mem_read_handler(bx_phy_address addr, unsigned len, void* data, void* /*param*/)
 {
-    g_mem_base   = base;
-    g_mem_size   = size;
-    g_stack_base = stack;
-    // Tell the Bochs memory model where RAM lives.
-    // BX_MEM(0) is the singleton; direct_ptr is the simplest hook.
-    BX_MEM(0)->set_memory_type(BX_MEMTYPE_WB);   // may be a no-op stub
-    // If libmemory exposes a base pointer, set it here.  The common pattern:
-    BX_MEM(0)->mem_base = base;     // <-- adjust to actual field name in 2.7
-    BX_MEM(0)->megabytes_needed = (size + 0xFFFFF) >> 20;
+    Bit32u offset = (Bit32u)addr;
+    if (g_mem_base && offset + len <= g_mem_size) {
+        __builtin_memcpy(data, g_mem_base + offset, len);
+    } else {
+        __builtin_memset(data, 0, len);
+    }
+    return true;   // true = handled, Bochs won't touch its own RAM
+}
+
+static bool mem_write_handler(bx_phy_address addr, unsigned len, void* data, void* /*param*/)
+{
+    Bit32u offset = (Bit32u)addr;
+    if (g_mem_base && offset + len <= g_mem_size) {
+        __builtin_memcpy(g_mem_base + offset, data, len);
+    }
+    return true;
+}
+
+extern "C" void bochs_set_process_memory(Bit8u* base, Bit32u size, Bit8u* /*stack*/)
+{
+    // Unregister old range if any
+    if (g_mem_base && g_mem_size) {
+        BX_MEM(0)->unregisterMemoryHandlers(nullptr, 0, (bx_phy_address)(g_mem_size - 1));
+    }
+
+    g_mem_base = base;
+    g_mem_size = size;
+
+    if (base && size) {
+        BX_MEM(0)->registerMemoryHandlers(
+            nullptr,
+            mem_read_handler,
+            mem_write_handler,
+            (bx_phy_address)0,
+            (bx_phy_address)(size - 1)
+        );
+    }
 }
 
 // ── CPU lifecycle ─────────────────────────────────────────────────────────────
-extern "C" void bochs_cpu_init() {
-    bx_cpu.initialize();
-    bx_cpu.reset(BX_RESET_HARDWARE);
+extern "C" void bochs_cpu_init()
+{
+    // With BX_USE_CPU_SMF=1 all BX_CPU_C methods are static; call via BX_CPU(0)->
+    BX_CPU(0)->initialize();//fixme
+    BX_CPU(0)->reset(BX_RESET_HARDWARE);;//fixme
 }
 
-extern "C" int bochs_cpu_tick(int n) {
+// cpu_loop() is an instance/static method -- call via BX_CPU(0)-> either way.
+extern "C" int bochs_cpu_tick(int n)
+{
     for (int i = 0; i < n; ++i)
-        BX_CPU_C::cpu_loop();
+        BX_CPU(0)->cpu_loop();
     return 0;
 }
 
 // ── Register accessors ────────────────────────────────────────────────────────
-extern "C" void bochs_cpu_set_eip(uint32_t eip) {
-    bx_cpu.sregs[BX_SEG_REG_CS].cache.u.segment.base = 0;
-    bx_cpu.prev_rip = eip;
-    bx_cpu.RIP      = eip;          // sets the internal EIP field
+// dbg_set_eip() is guarded by #if BX_DEBUGGER, so we set EIP directly.
+// With --disable-x86-64 (our build), BX_GENERAL_REGISTERS=8, so:
+//   BX_32BIT_REG_EIP = 8  (BX_GENERAL_REGISTERS)
+// The EIP macro expands to: BX_CPU_THIS_PTR gen_reg[BX_32BIT_REG_EIP].dword.erx
+// With BX_USE_CPU_SMF=1, BX_CPU_THIS_PTR = BX_CPU(0)->
+
+extern "C" void bochs_cpu_set_eip(Bit32u eip)
+{
+    // Set both EIP and prev_rip so the prefetch queue is coherent.
+    BX_CPU(0)->gen_reg[BX_32BIT_REG_EIP].dword.erx = eip;
+    BX_CPU(0)->prev_rip = eip;
+    BX_CPU(0)->invalidate_prefetch_q();
 }
 
-extern "C" void bochs_cpu_set_esp(uint32_t esp_val) {
-    bx_cpu.gen_reg[BX_32BIT_REG_ESP].dword.erx = esp_val;
+extern "C" void bochs_cpu_set_esp(Bit32u esp_val)
+{
+    // BX_32BIT_REG_ESP = 4 (index in BxRegs32 enum)
+    BX_CPU(0)->gen_reg[BX_32BIT_REG_ESP].dword.erx = esp_val;
 }
 
-extern "C" uint32_t bochs_cpu_get_eip() {      // matches kernel.cpp declaration
-    return (uint32_t)bx_cpu.get_instruction_pointer();
+extern "C" Bit32u bochs_cpu_get_eip()
+{
+    return BX_CPU(0)->get_eip();   // inline in cpu.h, no BX_DEBUGGER guard
 }
 
-// kept for any legacy call sites that use the old name
-extern "C" unsigned int bochs_cpu_geteip() {
-    return (unsigned int)bx_cpu.get_instruction_pointer();
+// Legacy name kept for compatibility
+extern "C" unsigned int bochs_cpu_geteip()
+{
+    return (unsigned int)BX_CPU(0)->get_eip();
 }
 
-extern "C" uint32_t bochs_cpu_get_eax() {
-    return bx_cpu.gen_reg[BX_32BIT_REG_EAX].dword.erx;
+extern "C" Bit32u bochs_cpu_get_eax()
+{
+    // BX_32BIT_REG_EAX = 0
+    return BX_CPU(0)->gen_reg[BX_32BIT_REG_EAX].dword.erx;
 }
