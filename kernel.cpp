@@ -6773,7 +6773,6 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
     
     g_gfx.init(false);
     launch_new_terminal();
-	//init_elf_system();
     enable_usb_legacy_support();
 
     for (int i = 0; i < 100000; i++) io_wait_short();
@@ -6814,6 +6813,7 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
     int prev_mouse_y = mouse_y;
     
     g_gfx.clear_screen(ColorPalette::DESKTOP_BLUE);
+	init_elf_system();
 
     // =============================================================================
     // MAIN LOOP - PERFECT: KEYBOARD + MOUSE CLICKS BOTH WORK

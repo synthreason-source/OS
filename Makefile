@@ -39,7 +39,7 @@ $(BOCHS_CPU_LIB):
 		CFLAGS="-O2 -m32 -fno-stack-protector"
 	cd $(BOCHS_DIR) && make
 
-bochs_glue.cpp: $(BOCHS_CPU_LIB)
+$(BOCHS_DIR)/instrument.h: $(BOCHS_CPU_LIB)
 	printf '%s\n' \
 		'#ifndef BX_INSTRUMENT_H' \
 		'#define BX_INSTRUMENT_H' \
@@ -87,9 +87,9 @@ bochs_glue.cpp: $(BOCHS_CPU_LIB)
 		'#endif' \
 	> $(BOCHS_DIR)/instrument.h
 
-bochs_glue.o: bochs_glue.cpp $(BOCHS_CPU_LIB)
+bochs_glue.o: bochs_glue.cpp $(BOCHS_DIR)/instrument.h $(BOCHS_CPU_LIB)
 	g++ -m32 -O2 -I$(BOCHS_DIR) -I$(BOCHS_DIR)/cpu $(CXXFLAGS) -c bochs_glue.cpp -o $@
-
+	
 boot.o: boot.S
 	as --32 boot.S -o boot.o
 
