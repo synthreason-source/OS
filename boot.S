@@ -1,36 +1,48 @@
 .section .multiboot
 .align 4
-
-/* Multiboot magic */
 .long 0x1BADB002
-/* FLAGS: bit0=align, bit1=meminfo, bit2=request video mode */
-.long 0x00000007
-/* CHECKSUM */
-.long -(0x1BADB002 + 0x00000007)
-/* Address fields (unused when bit16=0, but space required by spec for video) */
-.long 0, 0, 0, 0, 0
-/* Video mode: type=0 (linear graphics), width=1024, height=768, depth=32 */
-.long 0        /* mode_type: 0=linear framebuffer */
-.long 1024     /* width */
-.long 768      /* height */
-.long 32       /* depth */
+.long 0x00010000  /* FLAGS: meminfo+align */
+.long -(0x1BADB002 + 0x00010000)  /* CHECKSUM */
 
+.section .text
+.global start
+.code32
+start:
+    mov $stack_top, %esp
+    push %ebx
+    push %eax
+    call kernel_main  /* Matches kernel.cpp */
+hang: hlt; jmp hang
+
+.bss
+stack_bottom: .skip 16384
+stack_top:
+
+
+# The kernel's entry point.
 .section .text
 .global _start
 .type _start, @function
 _start:
-    cli
-    movl $stack_top, %esp
-    pushl %ebx            /* multiboot_info pointer */
-    pushl %eax            /* multiboot magic */
-    call kernel_main
+	# Disable interrupts initially.
+	cli
+
+	# Set up the stack pointer.
+	movl $stack_top, %esp
+
+	# The bootloader places the magic number in EAX and a pointer to the 
+	# Multiboot info structure in EBX. We pass them as arguments to kernel_main.
+	# Arguments are pushed in reverse order (right to left).
+	pushl %ebx # Push multiboot_addr
+	pushl %eax # Push magic
+
+	# Call the C++ part of our kernel.
+	call kernel_main
+
+	# If kernel_main returns, halt the system.
 .Lhang:
-    hlt
-    jmp .Lhang
+	hlt
+	jmp .Lhang
+
 .size _start, . - _start
 
-.section .bss
-.align 16
-stack_bottom:
-    .skip 16384
-stack_top:

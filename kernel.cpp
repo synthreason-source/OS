@@ -5913,79 +5913,28 @@ void handle_command() {
 	
 // ===== BUSYBOX COMMAND (add to handle_command) =====
 if (strcmp(command, "busybox") == 0) {
-    // Use embedded ramdisk binary directly (no disk needed)
-    uint8_t* elf_src = &ramdisk_start;
-    uint32_t elf_sz  = (uint32_t)(&ramdisk_end - &ramdisk_start);
-
-    if (elf_sz < sizeof(Elf32_Ehdr)) {
-        console_print("BusyBox: embedded binary missing\n");
-        return;
-    }
-
-    Elf32_Ehdr* ehdr = (Elf32_Ehdr*)elf_src;
-    if (ehdr->e_ident[EI_MAG0] != ELFMAG0 ||
-        ehdr->e_ident[EI_MAG1] != ELFMAG1 ||
-        ehdr->e_ident[EI_MAG2] != ELFMAG2 ||
-        ehdr->e_ident[EI_MAG3] != ELFMAG3 ||
-        ehdr->e_ident[EI_CLASS] != ELFCLASS32 ||
-        ehdr->e_machine != EM_386) {
-        console_print("BusyBox: invalid ELF\n");
-        return;
-    }
-
+    char* elfdata = fat32_read_file_as_string("busybox");
+    if (!elfdata) { console_print("BusyBox not found\n"); return; }
+    
     int slot = -1;
-    for (int i = 0; i < MAXelf_processes; i++)
-        if (!elf_processes[i].active) { slot = i; break; }
-    if (slot < 0) { console_print("No free process slots\n"); return; }
-
-    // Walk PT_LOAD segments to find vaddr range
-    Elf32_Phdr* phdr = (Elf32_Phdr*)(elf_src + ehdr->e_phoff);
-    uint32_t min_vaddr = 0xFFFFFFFF, max_vaddr = 0;
-    for (int i = 0; i < ehdr->e_phnum; i++) {
-        if (phdr[i].p_type == PT_LOAD) {
-            if (phdr[i].p_vaddr < min_vaddr) min_vaddr = phdr[i].p_vaddr;
-            uint32_t end = phdr[i].p_vaddr + phdr[i].p_memsz;
-            if (end > max_vaddr) max_vaddr = end;
-        }
-    }
-
-    uint32_t mem_sz = max_vaddr - min_vaddr + ELF_HEAP_SIZE;
+    for (int i=0; i<MAX_ELF_PROCESSES; i++) 
+        if (!elf_processes[i].active) { slot=i; break; }
+    if (slot < 0) { console_print("No slots\n"); delete[] elfdata; return; }
+    
     ElfProcess& proc = elf_processes[slot];
-    proc.memory_base = new uint8_t[mem_sz];
-    if (!proc.memory_base) { console_print("Out of memory\n"); return; }
-    memset(proc.memory_base, 0, mem_sz);
-    proc.memory_size = mem_sz;
-
-    // Load segments
-    for (int i = 0; i < ehdr->e_phnum; i++) {
-        if (phdr[i].p_type == PT_LOAD) {
-            uint32_t off = phdr[i].p_vaddr - min_vaddr;
-            memcpy(proc.memory_base + off, elf_src + phdr[i].p_offset, phdr[i].p_filesz);
-            if (phdr[i].p_memsz > phdr[i].p_filesz)
-                memset(proc.memory_base + off + phdr[i].p_filesz, 0,
-                       phdr[i].p_memsz - phdr[i].p_filesz);
-        }
-    }
-
-    proc.stack = new uint8_t[ELF_STACK_SIZE];
-    if (!proc.stack) { delete[] proc.memory_base; proc.memory_base = nullptr; console_print("Out of memory\n"); return; }
-    memset(proc.stack, 0, ELF_STACK_SIZE);
-
-    proc.entry_point    = ehdr->e_entry - min_vaddr;
-    proc.eip            = proc.entry_point;
-    proc.esp            = ELF_STACK_SIZE - 16;
-    proc.active         = true;
-    proc.cpu_initialized= false;
-    proc.completed      = false;
-    proc.waiting_for_input = false;
-    proc.terminal       = this;
+    Elf32_Ehdr* ehdr = (Elf32_Ehdr*)elfdata;
+    proc.entry_point = ehdr->e_entry;
+    proc.memory_size = 1<<20;  // 1MB
+    proc.memory_base = new uint8_t[proc.memory_size];
+    memcpy(proc.memory_base, elfdata, proc.memory_size);
+    proc.stack = new uint8_t[ELFSTACKSIZE];
+    proc.terminal = this;
     strncpy(proc.cmdline, "busybox", 255);
-
+    proc.active = true;
+    
     captured_elf_slot = slot;
-    console_print("BusyBox loaded from embedded image (slot ");
-    char snum[8]; snprintf(snum, 8, "%d", slot);
-    console_print(snum);
-    console_print(")\n");
+    console_print("BusyBox: terminal captured!\n");
+    delete[] elfdata;
 }
 
     else if (strcmp(command, "time") == 0) { 
@@ -6689,32 +6638,17 @@ void launch_terminal_with_command(const char* command) {
 }
 
 void swap_buffers() {
-    if (!fb_info.ptr || !backbuffer) return;
-    uint32_t pitch_pixels = fb_info.pitch / 4;  // pitch is in bytes, convert to pixels
-    if (pitch_pixels == fb_info.width) {
-        // Fast path: pitch matches width, single blit
+    if (fb_info.ptr && backbuffer) {
         uint32_t* dest = fb_info.ptr;
         uint32_t* src = backbuffer;
         size_t count = fb_info.width * fb_info.height;
+
         asm volatile (
             "rep movsl"
             : "=S"(src), "=D"(dest), "=c"(count)
             : "S"(src), "D"(dest), "c"(count)
             : "memory"
         );
-    } else {
-        // Pitch != width: copy row by row respecting stride
-        for (uint32_t y = 0; y < fb_info.height; y++) {
-            uint32_t* dest = (uint32_t*)((uint8_t*)fb_info.ptr + y * fb_info.pitch);
-            uint32_t* src  = backbuffer + y * fb_info.width;
-            uint32_t  count = fb_info.width;
-            asm volatile (
-                "rep movsl"
-                : "=S"(src), "=D"(dest), "=c"(count)
-                : "S"(src), "D"(dest), "c"(count)
-                : "memory"
-            );
-        }
     }
 }
 
@@ -6823,21 +6757,18 @@ void tick_elf_processes(int steps) {
 }
 extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
     // --- INITIALIZATION --- (unchanged)
-    static uint8_t kernelheap[4 * 1024 * 1024];
+    static uint8_t kernelheap[1024 * 1024 * 1800];
     g_allocator.init(kernelheap, sizeof(kernelheap));
     
     multiboot_info* mbi = (multiboot_info*)multiboot_addr;
-    if (mbi->flags & (1 << 12)) {
-        fb_info = {
-            (uint32_t*)(uintptr_t)mbi->framebuffer_addr,
-            mbi->framebuffer_width,
-            mbi->framebuffer_height,
-            mbi->framebuffer_pitch
-        };
-    } else {
-        // Fallback: QEMU standard VGA linear framebuffer
-        fb_info = { (uint32_t*)0xE0000000, 1024, 768, 1024 * 4 };
-    }
+    if (!(mbi->flags & (1 << 12))) return;
+
+    fb_info = { 
+        (uint32_t*)(uint64_t)mbi->framebuffer_addr, 
+        mbi->framebuffer_width, 
+        mbi->framebuffer_height, 
+        mbi->framebuffer_pitch 
+    };
     
     backbuffer = new uint32_t[fb_info.width * fb_info.height];
     
@@ -6870,11 +6801,6 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
 	if (current_directory_cluster) {
 		
 		wm.load_desktop_items();
-		if (extract_busybox_to_filesystem()) {
-			wm.print_to_focused("BusyBox embedded: ready.\n");
-		} else {
-			wm.print_to_focused("BusyBox: no disk, stored in RAM only.\n");
-		}
 
 	} else {
 		wm.print_to_focused("FAT32 init failed.\n");
@@ -6888,13 +6814,13 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
     int prev_mouse_y = mouse_y;
     
     g_gfx.clear_screen(ColorPalette::DESKTOP_BLUE);
-	init_elf_system();
+	//init_elf_system();
 
     // =============================================================================
     // MAIN LOOP - PERFECT: KEYBOARD + MOUSE CLICKS BOTH WORK
     // =============================================================================
     for (;;) {
-		tick_elf_processes(100);
+		//tick_elf_processes(100);
         // **CRITICAL MOUSE FIX #1**: Save mouse state BEFORE polling
         bool prev_left = mouse_left_down;
         bool prev_right = mouse_right_down;
