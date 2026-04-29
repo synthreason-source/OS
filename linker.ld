@@ -8,7 +8,7 @@ SECTIONS
 {
 	/* Begin putting sections at 1 MiB, a conventional place for kernels to be
 	   loaded at by the bootloader. */
-	. = 1M;
+	. = 0x100000;
 
 	/* First put the multiboot header, as it is required to be put very early
 	   early in the image or the bootloader won't recognize the file format.
@@ -44,12 +44,7 @@ SECTIONS
 	}
 
 	/* Read-write data (uninitialized) and stack */
-	.bss BLOCK(4K) : ALIGN(4K)
-	{
-		*(COMMON)
-		*(.bss)
-		*(.bootstrap_stack)
-	}
+	.bss : SUBALIGN(4K) { *(.bss) } =0x00  /* ZERO-FILL, no disk read */
 
 	/* The compiler may produce other sections, by default it will put them in
 	   a segment with the same name. Simply add stuff here as needed. */

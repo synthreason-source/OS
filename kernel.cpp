@@ -2093,8 +2093,9 @@ found:
     current_directory_cluster = bpb.root_clus;
     return true;
 }
-uint64_t cluster_to_lba(uint32_t cluster) { return data_start_sector + (cluster - 2) * bpb.sec_per_clus; }
-void to_83_format(const char* filename, char* out) { memset(out, ' ', 11); int i = 0, j = 0; while (filename[i] && filename[i] != '.' && j < 8) { out[j++] = (filename[i] >= 'a' && filename[i] <= 'z') ? (filename[i]-32) : filename[i]; i++; } if(filename[i] == '.') i++; j=8; while(filename[i] && j<11) { out[j++] = (filename[i] >= 'a' && filename[i] <= 'z') ? (filename[i]-32) : filename[i]; i++; } }
+uint64_t cluster_to_lba(uint32_t cluster) {
+  return (uint64_t)(cluster - 2) * bpb.sec_per_clus + data_start_sector;
+}void to_83_format(const char* filename, char* out) { memset(out, ' ', 11); int i = 0, j = 0; while (filename[i] && filename[i] != '.' && j < 8) { out[j++] = (filename[i] >= 'a' && filename[i] <= 'z') ? (filename[i]-32) : filename[i]; i++; } if(filename[i] == '.') i++; j=8; while(filename[i] && j<11) { out[j++] = (filename[i] >= 'a' && filename[i] <= 'z') ? (filename[i]-32) : filename[i]; i++; } }
 
 void from_83_format(const char* fat_name, char* out) {
     int i, j = 0;
@@ -6756,7 +6757,7 @@ void tick_elf_processes(int steps) {
 }
 extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
     // --- INITIALIZATION --- (unchanged)
-    static uint8_t kernelheap[1024 * 1024 * 8];
+    static uint8_t kernelheap[1024 * 1024 * 1800];
     g_allocator.init(kernelheap, sizeof(kernelheap));
     
     multiboot_info* mbi = (multiboot_info*)multiboot_addr;

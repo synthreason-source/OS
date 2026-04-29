@@ -104,7 +104,12 @@ $(MULTIBOOT): boot.o kernel.o bochs_glue.o $(BOCHS_CPU_LIB)
 		$(BOCHS_DIR)/cpu/cpudb/libcpudb.a \
 		$(BOCHS_DIR)/memory/libmemory.a \
 		-lgcc -Wl,--unresolved-symbols=ignore-all
-
+	objcopy --strip-unneeded --remove-section=.note.gnu.build-id \
+	  --set-section-flags .bss=alloc,contents iso/boot/main.elf
+	strip --strip-unneeded --remove-section=.comment \
+	  --remove-section=.note.gnu.build-id iso/boot/main.elf -o main-stripped.elf
+	truncate -s 900M main-stripped.elf  # Pad to 900MB (GRUB ignores holes)
+	mv main-stripped.elf iso/boot/main.elf
 $(MAIN): $(MULTIBOOT)
 	mkdir -p iso/boot/grub
 	printf '%s\n' \
