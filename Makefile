@@ -17,7 +17,10 @@ $(BOCHS_GH_ARCHIVE):
 $(BOCHS_DIR)/.extracted: $(BOCHS_GH_ARCHIVE)
 	tar -xzf $(BOCHS_GH_ARCHIVE)
 	touch $(BOCHS_DIR)/.extracted
-	
+
+
+BUSYBOX_URL := https://busybox.net/downloads/binaries/1.35.0-i686-linux-musl/busybox
+BUSYBOX_BIN := busybox
 
 ISODIR := iso
 MAIN := main.iso
@@ -39,6 +42,24 @@ $(BOCHS_CPU_LIB):
 		CFLAGS="-O2 -m32 -fno-stack-protector"
 	cd $(BOCHS_DIR) && make
 
+# Download BusyBox 32-bit binary if not present
+$(BUSYBOX_BIN):
+	@echo "Downloading BusyBox 32-bit binary..."
+	wget -O $(BUSYBOX_BIN) $(BUSYBOX_URL) || curl -L -o $(BUSYBOX_BIN) $(BUSYBOX_URL)
+	@echo "BusyBox downloaded successfully"
+	
+# Embed BusyBox binary into the kernel as a ramdisk
+ramdisk.o: $(BUSYBOX_BIN)
+	@echo "Embedding BusyBox into ramdisk..."
+	chmod +x $(BUSYBOX_BIN)
+	objcopy -I binary -O elf32-i386 -B i386:x86-64 \
+		--rename-section .data=.rodata,alloc,load,readonly,data,contents \
+		--redefine-sym _binary_busybox_start=ramdisk_start \
+		--redefine-sym _binary_busybox_end=ramdisk_end \
+		--redefine-sym _binary_busybox_size=ramdisk_size \
+		$(BUSYBOX_BIN) ramdisk.o
+	@echo "Ramdisk created successfully"
+	
 $(BOCHS_DIR)/instrument.h: $(BOCHS_CPU_LIB)
 	printf '%s\n' \
 		'#ifndef BX_INSTRUMENT_H' \
@@ -54,7 +75,7 @@ $(BOCHS_DIR)/instrument.h: $(BOCHS_CPU_LIB)
 		'#define BX_INSTR_CNEAR_BRANCH_NOT_TAKEN(cpu_id, orig_rip)' \
 		'#define BX_INSTR_FAR_BRANCH(cpu_id, what, prev_cs, prev_rip, new_cs, new_rip)' \
 		'#define BX_INSTR_FAR_BRANCH_ORIGIN()' \
-		'#define BX_INSTR_IS_INT(cpu_id)       (0)' \
+		'#define BX_INSTR_IS_INT(cpu_id)	   (0)' \
 		'#define BX_INSTR_INIT_ENV()' \
 		'#define BX_INSTR_EXIT_ENV()' \
 		'#define BX_INSTR_INITIALIZE(cpu_id)' \
@@ -78,10 +99,10 @@ $(BOCHS_DIR)/instrument.h: $(BOCHS_CPU_LIB)
 		'#define BX_INSTR_EXCEPTION(cpu_id, vector, error_code)' \
 		'#define BX_INSTR_HWINTERRUPT(cpu_id, vector, cs, eip)' \
 		'#define BX_INSTR_WRMSR(cpu_id, addr, val64)' \
-		'#define BX_INSTR_IS_INT(cpu_id)       (0)' \
-		'#define BX_INSTR_IS_RET(cpu_id)       (0)' \
-		'#define BX_INSTR_IS_CALL(cpu_id)      (0)' \
-		'#define BX_INSTR_IS_IRET(cpu_id)      (0)' \
+		'#define BX_INSTR_IS_INT(cpu_id)	   (0)' \
+		'#define BX_INSTR_IS_RET(cpu_id)	   (0)' \
+		'#define BX_INSTR_IS_CALL(cpu_id)	  (0)' \
+		'#define BX_INSTR_IS_IRET(cpu_id)	  (0)' \
 		'#define BX_INSTR_IS_CALL_NEAR(cpu_id) (0)' \
 		'#define BX_INSTR_IS_CALL_FAR(cpu_id)  (0)' \
 		'#endif' \
@@ -96,7 +117,7 @@ boot.o: boot.S
 kernel.o: kernel.cpp $(BOCHS_CPU_LIB)
 	g++ -m32 -O2 -I$(BOCHS_DIR) -I$(BOCHS_DIR)/cpu $(CXXFLAGS) -c kernel.cpp -o kernel.o
 	
-$(MULTIBOOT): boot.o kernel.o bochs_glue.o $(BOCHS_CPU_LIB)
+$(MULTIBOOT): boot.o kernel.o ramdisk.o bochs_glue.o $(BOCHS_CPU_LIB)
 	mkdir -p iso/boot
 	g++ -m32 -T linker.ld -nostdlib -o iso/boot/main.elf boot.o kernel.o bochs_glue.o \
 		$(BOCHS_DIR)/cpu/libcpu.a \
@@ -104,18 +125,17 @@ $(MULTIBOOT): boot.o kernel.o bochs_glue.o $(BOCHS_CPU_LIB)
 		$(BOCHS_DIR)/cpu/cpudb/libcpudb.a \
 		$(BOCHS_DIR)/memory/libmemory.a \
 		-lgcc -Wl,--unresolved-symbols=ignore-all
-	objcopy --strip-unneeded --remove-section=.note.gnu.build-id \
-	  --set-section-flags .bss=alloc,contents iso/boot/main.elf
+	# Remove the objcopy --set-section-flags line
+	# Remove the truncate line entirely
 	strip --strip-unneeded --remove-section=.comment \
-	  --remove-section=.note.gnu.build-id iso/boot/main.elf -o main-stripped.elf
-	truncate -s 900M main-stripped.elf  # Pad to 900MB (GRUB ignores holes)
-	mv main-stripped.elf iso/boot/main.elf
+		--remove-section=.note.gnu.build-id iso/boot/main.elf \  # Also fix: strip to a temp then move
+		-o iso/boot/main.elf
 $(MAIN): $(MULTIBOOT)
 	mkdir -p iso/boot/grub
 	printf '%s\n' \
 	'set timeout=0' \
 	'menuentry "OS" {' \
-	'    multiboot /boot/main.elf' \
+	'	multiboot /boot/main.elf' \
 	'}' > iso/boot/grub/grub.cfg
 	grub-mkrescue -o main.iso iso
 
@@ -123,6 +143,6 @@ run: $(MAIN)
 	qemu-system-i386 -cdrom main.iso -m 128M
 
 clean:
-	rm -rf *.o iso main.iso bochs-2.7 $(BOCHS_CPU_LIB)
+	rm -rf *.o main.iso $(BOCHS_CPU_LIB)
 
 .PHONY: all run clean
