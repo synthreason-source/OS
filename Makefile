@@ -57,15 +57,12 @@ $(BOCHS_CPU_LIB): $(BOCHS_DIR)/.extracted
 	cd $(BOCHS_DIR) && ./configure          \
 	    --enable-cpu-level=6                \
 	    --enable-fpu                         \
-	    --disable-mmx                        \
-	    --disable-sse                        \
-	    --disable-avx                        \
 	    --disable-x86-64                     \
 	    --disable-debugger                   \
 	    --with-nogui                         \
-	    --disable-gui                        \
-	    CXXFLAGS="-O2 -m32 -fno-stack-protector" \
-	    CFLAGS="-O2 -m32 -fno-stack-protector"
+	    --host=i686-linux-gnu               \
+	    CXXFLAGS="-O2 -m32 -fno-stack-protector -fno-pie" \
+	    CFLAGS="-O2 -m32 -fno-stack-protector -fno-pie"
 	$(MAKE) -C $(BOCHS_DIR)/cpu
 	$(MAKE) -C $(BOCHS_DIR)/cpu/fpu
 	$(MAKE) -C $(BOCHS_DIR)/cpu/cpudb
@@ -100,27 +97,30 @@ ramdisk.o: $(BUSYBOX_BIN)
 	@echo ">>> ramdisk.o created."
 
 # ============================================================
-#  Bochs CPU emulation: off by default (set BOCHS=1 to enable)
-#  Without BOCHS=1, bochs_stub.cpp is used (all bochs functions
-#  are no-ops) and the Bochs libraries are not required.
+#  Bochs CPU emulation: ON by default (set BOCHS=0 to disable)
+#  bochs_infra.o provides all Bochs infrastructure globals
+#  (logfunctions, SIM, bx_cpu, bx_mem, bx_devices, etc.)
 # ============================================================
-BOCHS ?= 0
+BOCHS ?= 1
 
 ifeq ($(BOCHS),1)
-BOCHS_OBJ    := bochs_glue.o
+BOCHS_OBJ    := bochs_glue.o bochs_infra.o bochs_paramtree.o bochs_pc_system.o bochs_cstubs.o
 BOCHS_LIBS   := $(BOCHS_DIR)/cpu/libcpu.a \
                 $(BOCHS_DIR)/cpu/fpu/libfpu.a \
                 $(BOCHS_DIR)/cpu/cpudb/libcpudb.a \
                 $(BOCHS_DIR)/memory/libmemory.a
-BOCHS_IFLAGS := -I$(BOCHS_DIR) -I$(BOCHS_DIR)/cpu
+BOCHS_IFLAGS := -I$(BOCHS_DIR) -I$(BOCHS_DIR)/cpu \
+                -I$(BOCHS_DIR)/iodev -I$(BOCHS_DIR)/gui
 BOCHS_DEP    := $(BOCHS_CPU_LIB)
 BOCHS_CDEF   := -DBOCHS_ENABLED=1
+LIBGCC_EH    := /usr/lib/gcc/x86_64-linux-gnu/13/32/libgcc_eh.a
 else
 BOCHS_OBJ    := bochs_stub.o
 BOCHS_LIBS   :=
 BOCHS_IFLAGS :=
 BOCHS_DEP    :=
 BOCHS_CDEF   :=
+LIBGCC_EH    :=
 endif
 
 # ============================================================
@@ -138,6 +138,36 @@ bochs_stub.o: bochs_stub.cpp
 bochs_glue.o: bochs_glue.cpp $(BOCHS_DIR)/instrument.h $(BOCHS_CPU_LIB)
 	g++ -m32 -O2 $(BOCHS_IFLAGS) $(CXXFLAGS) -DBOCHS_GLUE -c bochs_glue.cpp -o bochs_glue.o
 
+# bochs_infra.cpp needs system headers (not freestanding) because bochs.h
+# pulls in <stdio.h> etc. for its own types. Compiled as a normal 32-bit object.
+bochs_infra.o: bochs_infra.cpp $(BOCHS_DIR)/instrument.h $(BOCHS_CPU_LIB)
+	g++ -m32 -O2 $(BOCHS_IFLAGS) \
+	    -fno-exceptions -fno-rtti -fno-pie -fno-pic \
+	    -std=c++17 \
+	    -include instrument_stub.h \
+	    -c bochs_infra.cpp -o bochs_infra.o
+
+# bochs_paramtree.o — provides bx_list_c, bx_shadow_num_c, bx_param_num_c etc.
+bochs_paramtree.o: $(BOCHS_DIR)/gui/paramtree.cc $(BOCHS_CPU_LIB)
+	g++ -m32 -O2 $(BOCHS_IFLAGS) \
+	    -fno-exceptions -fno-rtti -fno-pie -fno-pic \
+	    -std=c++17 \
+	    -include instrument_stub.h \
+	    -c $(BOCHS_DIR)/gui/paramtree.cc -o bochs_paramtree.o
+
+# bochs_pc_system.o — provides bx_pc_system_c constructor and timer methods
+bochs_pc_system.o: $(BOCHS_DIR)/pc_system.cc $(BOCHS_CPU_LIB)
+	g++ -m32 -O2 $(BOCHS_IFLAGS) \
+	    -fno-exceptions -fno-rtti -fno-pie -fno-pic \
+	    -std=c++17 \
+	    -include instrument_stub.h \
+	    -c $(BOCHS_DIR)/pc_system.cc -o bochs_pc_system.o
+
+# bochs_cstubs.o — freestanding C stdlib stubs (no system headers)
+bochs_cstubs.o: bochs_cstubs.c
+	gcc -m32 -O2 -ffreestanding -fno-pie -fno-pic \
+	    -c bochs_cstubs.c -o bochs_cstubs.o
+
 # ============================================================
 #  Link
 # ============================================================
@@ -147,7 +177,8 @@ $(MULTIBOOT): boot.o kernel.o ramdisk.o $(BOCHS_OBJ) $(BOCHS_DEP)
 	    -o $(MULTIBOOT)              \
 	    boot.o kernel.o ramdisk.o $(BOCHS_OBJ) \
 	    $(BOCHS_LIBS)                \
-	    -lgcc
+	    -lgcc $(LIBGCC_EH)           \
+	    -Wl,--allow-multiple-definition
 
 # ============================================================
 #  ISO image via GRUB

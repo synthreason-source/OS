@@ -466,7 +466,8 @@ int snprintf(char* buffer, size_t size, const char* fmt, ...) {
 }
 
 // --- Basic Memory Allocator ---
-static uint8_t kernel_heap[1024 * 1024 * 8];
+// Single 32MB global heap in BSS (not stack!) — enough for BusyBox + 4 ELF procs + FAT32 + backbuffer
+static uint8_t kernel_heap[32 * 1024 * 1024];
 static size_t heap_ptr = 0;
 void* operator new(size_t, void* p) { return p; }
 
@@ -565,8 +566,28 @@ public:
 
 static FreeListAllocator g_allocator;
 
+// Write OOM message directly to VGA text buffer (safe even before framebuffer init)
+static void oom_halt(size_t size) {
+    volatile char* vga = (volatile char*)0xB8000;
+    const char* msg = "OOM HALT";
+    for (int i = 0; msg[i]; i++) { vga[i*2] = msg[i]; vga[i*2+1] = 0x4F; }
+    // Print size in decimal after the message
+    char buf[16]; int n = 0, s = (int)size;
+    if (s == 0) buf[n++] = '0';
+    else { int tmp = s; int d = 1; while (tmp >= 10) { tmp /= 10; d++; }
+           for (int i = d-1; i >= 0; i--) { buf[i] = '0' + s%10; s/=10; n++; } }
+    buf[n] = 0;
+    int off = 8;
+    vga[off*2]=' '; vga[off*2+1]=0x4F; off++;
+    for (int i = 0; i < n; i++) { vga[(off+i)*2]=buf[i]; vga[(off+i)*2+1]=0x4F; }
+    asm volatile("cli");
+    for(;;) asm volatile("hlt");
+}
+
 void* operator new(size_t size) {
-    return g_allocator.allocate(size);
+    void* p = g_allocator.allocate(size);
+    if (!p) oom_halt(size);
+    return p;
 }
 
 void* operator new[](size_t size) {
@@ -3463,9 +3484,7 @@ static char file_buffer[65536]; // 64KB file buffer
 // Memory Management (new/delete operators)
 // ============================================================
 
-// Simple heap allocator
-static unsigned char heap[1048576]; // 1MB heap
-static int heap_offset = 0;
+// (heap managed by g_allocator via kernel_heap[] above)
 
 
 void simple_strcpy(char* dest, const char* src) {
@@ -7051,11 +7070,10 @@ void tick_elf_processes(int steps) {
     }
 }
 extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
-    // --- INITIALIZATION --- (unchanged)
-    // 12 MB heap: BusyBox ELF image (~2 MB) + process memory + stacks
-    // + FAT32 buffers + backbuffer + general use.
-    static uint8_t kernelheap[12 * 1024 * 1024];
-    g_allocator.init(kernelheap, sizeof(kernelheap));
+    // --- INITIALIZATION ---
+    // Use the 32MB global kernel_heap[] in BSS (NOT a local stack variable).
+    // A local 12MB array on the kernel stack would overflow the 64KB stack immediately.
+    g_allocator.init(kernel_heap, sizeof(kernel_heap));
     
     multiboot_info* mbi = (multiboot_info*)multiboot_addr;
     if (mbi->flags & (1 << 12)) {
