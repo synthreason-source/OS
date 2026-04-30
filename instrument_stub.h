@@ -1,5 +1,9 @@
 #pragma once
-// instrument_stub.h - no-op Bochs instrumentation macros
+// instrument_stub.h — no-op Bochs instrumentation macros.
+// When bochs_glue.cpp is compiled (BOCHS=1), it is compiled with
+// -DBOCHS_GLUE which prevents this file from stubbing out
+// BX_INSTR_INTERRUPT — allowing bochs_glue.cpp to provide the real
+// bx_instr_interrupt() function that intercepts guest int 0x80.
 #ifndef BX_INSTRUMENT_H
 #define BX_INSTRUMENT_H
 #define BX_INSTR_PHY_ACCESS(a,b,c,d,e)
@@ -38,7 +42,11 @@
 #define BX_INSTR_MEM_PHY_ACCESS(a,b,c,d)
 #define BX_INSTR_LIN_ACCESS(a,b,c,d,e,f)
 #define BX_INSTR_MEM_DATA(a,b,c,d,e)
+#ifndef BOCHS_GLUE
+// Only stub INTERRUPT when NOT building bochs_glue.cpp itself,
+// so bochs_glue.cpp can provide the real bx_instr_interrupt().
 #define BX_INSTR_INTERRUPT(a,b)
+#endif
 #define BX_INSTR_EXCEPTION(a,b,c)
 #define BX_INSTR_HWINTERRUPT(a,b,c,d)
 #endif

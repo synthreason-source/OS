@@ -146,9 +146,23 @@ extern "C" uint8_t ramdisk_end;
 bool extract_busybox_to_filesystem() {
     uint8_t* start = &ramdisk_start;
     uint8_t* end   = &ramdisk_end;
+    if (end <= start) return false;
     uint32_t size  = (uint32_t)(end - start);
-    if (size == 0 || size > 32 * 1024 * 1024) {
+    // Sanity: must be a plausible ELF (>= 52 bytes), not absurdly large.
+    if (size < 52 || size > 8 * 1024 * 1024) {
         return false;
+    }
+    // Check ELF magic before writing to avoid storing garbage on disk.
+    if (start[0] != 0x7f || start[1] != 'E' ||
+        start[2] != 'L'  || start[3] != 'F') {
+        return false;
+    }
+    // If a "busybox" file already exists with the right size, skip the write
+    // to save time on repeated boots.
+    fat_dir_entry_t existing;
+    uint32_t esec = 0, eoff = 0;
+    if (fat32_find_entry("busybox", &existing, &esec, &eoff) == 0) {
+        if (existing.file_size == size) return true;  // already current
     }
     int result = fat32_write_file("busybox", start, size);
     return (result == 0);
@@ -218,7 +232,9 @@ struct ElfProcess {
 
     bool active          = false;
     bool cpu_initialized = false;
-    uint32_t entry_point = 0;
+    uint32_t entry_point = 0;   // full virtual address (e_entry)
+    uint32_t vaddr_base  = 0;   // min PT_LOAD vaddr (== physical base in Bochs)
+    uint32_t vaddr_end   = 0;   // max PT_LOAD vaddr + memsz (exclusive)
     uint8_t* memory_base = nullptr;
     uint32_t memory_size = 0;
     uint8_t* stack       = nullptr;
@@ -278,13 +294,22 @@ char pop_output(int slot) {
 
 // --- STEP 5: Bochs externs - move before TerminalWindow ---
 extern "C" void bochs_set_process_memory(
-    uint8_t* base, uint32_t size, uint8_t* stack);
+    uint8_t* base, uint32_t size, uint32_t vaddr_base);
 extern "C" void bochs_cpu_init();
 extern "C" void bochs_cpu_set_eip(uint32_t eip);
 extern "C" void bochs_cpu_set_esp(uint32_t esp);
 extern "C" int  bochs_cpu_tick(int steps);
 extern "C" uint32_t bochs_cpu_get_eax();
 extern "C" uint32_t bochs_cpu_get_eip();
+// New: slot management, brk, I/O callbacks, and input-wait detection
+extern "C" void bochs_activate_slot(int slot);
+extern "C" void bochs_set_brk(int slot, uint32_t brk_addr);
+extern "C" void bochs_register_io_callbacks(
+    int slot,
+    int  (*read_cb )(int),
+    void (*write_cb)(int, char),
+    void (*exit_cb )(int, int));
+extern "C" bool bochs_process_wants_input(int slot);
 
 // --- STEP 6: NOW TerminalWindow and everything else follows ---
 // Moved here to be visible to all classes and functions
@@ -606,7 +631,10 @@ RTC_Time read_rtc() {
 // SECTION 3: GRAPHICS & WINDOWING SYSTEM WITH STATE MANAGEMENT
 // =============================================================================
 
-static uint32_t* backbuffer = nullptr;
+/* Back-buffer: 1024x768x4 = 3 MB.  Declared as a static array in BSS so it
+   doesn't consume heap space.  fb_info dimensions are checked before use. */
+static uint32_t backbuffer_storage[1024 * 768];
+static uint32_t* backbuffer = backbuffer_storage;
 struct FramebufferInfo { uint32_t* ptr; uint32_t width, height, pitch; } fb_info;
 
 // =============================================================================
@@ -1455,8 +1483,10 @@ struct USBLegacyInfo {
 static USBLegacyInfo usb_info = {false, false, false, 0, false, 0, 0, 0};
 
 static bool detect_usb_controllers() {
-    for (uint16_t bus = 0; bus < 256; bus++) {
+    for (uint16_t bus = 0; bus < 8; bus++) {  /* scan 8 buses: covers real HW and QEMU */
         for (uint8_t device = 0; device < 32; device++) {
+            uint32_t vid = pci_read_config_dword(bus, device, 0, 0) & 0xFFFF;
+            if (vid == 0xFFFF) continue;  /* slot empty */
             uint32_t class_code = pci_read_config_dword(bus, device, 0, 0x08);
             uint8_t base_class = (class_code >> 24) & 0xFF;
             uint8_t sub_class = (class_code >> 16) & 0xFF;
@@ -2031,8 +2061,8 @@ void start_cmd(HBA_PORT *port) {
     port->cmd |= 0x0001; // Set ST (Start)
 }
 void disk_init() {
-    // Find the AHCI controller's base address
-    for (uint16_t bus = 0; bus < 256; bus++) for (uint8_t dev = 0; dev < 32; dev++) if ((pci_read_config_dword(bus, dev, 0, 0) & 0xFFFF) != 0xFFFF && (pci_read_config_dword(bus, dev, 0, 0x08) >> 16) == 0x0106) { ahci_base = pci_read_config_dword(bus, dev, 0, 0x24) & 0xFFFFFFF0; goto found; }
+    // Find the AHCI controller's base address (scan 8 buses; skip empty slots)
+    for (uint16_t bus = 0; bus < 8; bus++) for (uint8_t dev = 0; dev < 32; dev++) if ((pci_read_config_dword(bus, dev, 0, 0) & 0xFFFF) != 0xFFFF && (pci_read_config_dword(bus, dev, 0, 0x08) >> 16) == 0x0106) { ahci_base = pci_read_config_dword(bus, dev, 0, 0x24) & 0xFFFFFFF0; goto found; }
 found:
     if (!ahci_base) return;
 
@@ -5911,82 +5941,123 @@ void handle_command() {
         delete[] args_copy;
     }
 	
-// ===== BUSYBOX COMMAND (add to handle_command) =====
-if (strcmp(command, "busybox") == 0) {
-    // Use embedded ramdisk binary directly (no disk needed)
-    uint8_t* elf_src = &ramdisk_start;
-    uint32_t elf_sz  = (uint32_t)(&ramdisk_end - &ramdisk_start);
+    else if (strcmp(command, "busybox") == 0 || strcmp(command, "bb") == 0) {
+        // Launch BusyBox from the embedded ramdisk (no disk I/O required).
+        uint8_t* elf_src = &ramdisk_start;
+        uint32_t elf_sz  = (uint32_t)(&ramdisk_end - &ramdisk_start);
 
-    if (elf_sz < sizeof(Elf32_Ehdr)) {
-        console_print("BusyBox: embedded binary missing\n");
-        return;
-    }
-
-    Elf32_Ehdr* ehdr = (Elf32_Ehdr*)elf_src;
-    if (ehdr->e_ident[EI_MAG0] != ELFMAG0 ||
-        ehdr->e_ident[EI_MAG1] != ELFMAG1 ||
-        ehdr->e_ident[EI_MAG2] != ELFMAG2 ||
-        ehdr->e_ident[EI_MAG3] != ELFMAG3 ||
-        ehdr->e_ident[EI_CLASS] != ELFCLASS32 ||
-        ehdr->e_machine != EM_386) {
-        console_print("BusyBox: invalid ELF\n");
-        return;
-    }
-
-    int slot = -1;
-    for (int i = 0; i < MAXelf_processes; i++)
-        if (!elf_processes[i].active) { slot = i; break; }
-    if (slot < 0) { console_print("No free process slots\n"); return; }
-
-    // Walk PT_LOAD segments to find vaddr range
-    Elf32_Phdr* phdr = (Elf32_Phdr*)(elf_src + ehdr->e_phoff);
-    uint32_t min_vaddr = 0xFFFFFFFF, max_vaddr = 0;
-    for (int i = 0; i < ehdr->e_phnum; i++) {
-        if (phdr[i].p_type == PT_LOAD) {
-            if (phdr[i].p_vaddr < min_vaddr) min_vaddr = phdr[i].p_vaddr;
-            uint32_t end = phdr[i].p_vaddr + phdr[i].p_memsz;
-            if (end > max_vaddr) max_vaddr = end;
+        if (elf_sz < sizeof(Elf32_Ehdr) || elf_sz > 8 * 1024 * 1024) {
+            console_print("BusyBox: ramdisk missing or corrupt\n");
+            return;
         }
-    }
 
-    uint32_t mem_sz = max_vaddr - min_vaddr + ELF_HEAP_SIZE;
-    ElfProcess& proc = elf_processes[slot];
-    proc.memory_base = new uint8_t[mem_sz];
-    if (!proc.memory_base) { console_print("Out of memory\n"); return; }
-    memset(proc.memory_base, 0, mem_sz);
-    proc.memory_size = mem_sz;
-
-    // Load segments
-    for (int i = 0; i < ehdr->e_phnum; i++) {
-        if (phdr[i].p_type == PT_LOAD) {
-            uint32_t off = phdr[i].p_vaddr - min_vaddr;
-            memcpy(proc.memory_base + off, elf_src + phdr[i].p_offset, phdr[i].p_filesz);
-            if (phdr[i].p_memsz > phdr[i].p_filesz)
-                memset(proc.memory_base + off + phdr[i].p_filesz, 0,
-                       phdr[i].p_memsz - phdr[i].p_filesz);
+        Elf32_Ehdr* ehdr = (Elf32_Ehdr*)elf_src;
+        if (ehdr->e_ident[EI_MAG0] != ELFMAG0 ||
+            ehdr->e_ident[EI_MAG1] != ELFMAG1 ||
+            ehdr->e_ident[EI_MAG2] != ELFMAG2 ||
+            ehdr->e_ident[EI_MAG3] != ELFMAG3 ||
+            ehdr->e_ident[EI_CLASS] != ELFCLASS32 ||
+            ehdr->e_machine != EM_386) {
+            console_print("BusyBox: invalid ELF header\n");
+            return;
         }
+
+        int slot = -1;
+        for (int i = 0; i < MAXelf_processes; i++)
+            if (!elf_processes[i].active) { slot = i; break; }
+        if (slot < 0) { console_print("No free process slots\n"); return; }
+
+        // Compute virtual address range from PT_LOAD segments.
+        if (ehdr->e_phoff == 0 || ehdr->e_phnum == 0) {
+            console_print("BusyBox: no program headers\n");
+            return;
+        }
+        Elf32_Phdr* phdr = (Elf32_Phdr*)(elf_src + ehdr->e_phoff);
+        uint32_t min_vaddr = 0xFFFFFFFFu, max_vaddr = 0;
+        for (int i = 0; i < ehdr->e_phnum; i++) {
+            if (phdr[i].p_type == PT_LOAD) {
+                if (phdr[i].p_vaddr < min_vaddr) min_vaddr = phdr[i].p_vaddr;
+                uint32_t seg_end = phdr[i].p_vaddr + phdr[i].p_memsz;
+                if (seg_end > max_vaddr) max_vaddr = seg_end;
+            }
+        }
+        if (min_vaddr == 0xFFFFFFFFu || max_vaddr <= min_vaddr) {
+            console_print("BusyBox: no PT_LOAD segments\n");
+            return;
+        }
+
+        // Guard: total process image must fit in available heap.
+        uint32_t img_sz  = max_vaddr - min_vaddr;
+        uint32_t mem_sz  = img_sz + ELF_HEAP_SIZE;  // image + heap
+        // Sanity cap: 6 MB max to leave room for other allocations.
+        if (mem_sz > 6 * 1024 * 1024) {
+            console_print("BusyBox: process image too large\n");
+            return;
+        }
+
+        ElfProcess& proc = elf_processes[slot];
+        proc.memory_base = new uint8_t[mem_sz];
+        if (!proc.memory_base) {
+            console_print("BusyBox: out of heap memory\n");
+            return;
+        }
+        memset(proc.memory_base, 0, mem_sz);
+        proc.memory_size = mem_sz;
+
+        // Copy PT_LOAD segments into process memory.
+        for (int i = 0; i < ehdr->e_phnum; i++) {
+            if (phdr[i].p_type == PT_LOAD) {
+                uint32_t dst_off = phdr[i].p_vaddr - min_vaddr;
+                // Bounds check each segment before copying.
+                if (dst_off + phdr[i].p_filesz > mem_sz ||
+                    phdr[i].p_offset + phdr[i].p_filesz > elf_sz) {
+                    delete[] proc.memory_base;
+                    proc.memory_base = nullptr;
+                    console_print("BusyBox: segment out of bounds\n");
+                    return;
+                }
+                memcpy(proc.memory_base + dst_off,
+                       elf_src + phdr[i].p_offset,
+                       phdr[i].p_filesz);
+                if (phdr[i].p_memsz > phdr[i].p_filesz)
+                    memset(proc.memory_base + dst_off + phdr[i].p_filesz,
+                           0, phdr[i].p_memsz - phdr[i].p_filesz);
+            }
+        }
+
+        proc.stack = new uint8_t[ELF_STACK_SIZE];
+        if (!proc.stack) {
+            delete[] proc.memory_base;
+            proc.memory_base = nullptr;
+            console_print("BusyBox: out of stack memory\n");
+            return;
+        }
+        memset(proc.stack, 0, ELF_STACK_SIZE);
+
+        proc.entry_point     = ehdr->e_entry;  // full VA, NOT offset
+        proc.vaddr_base      = min_vaddr;
+        proc.vaddr_end       = max_vaddr;
+        proc.eip             = proc.entry_point;
+        // Stack: place at top of memory slab (below the heap padding)
+        proc.esp             = min_vaddr + (max_vaddr - min_vaddr) + ELF_HEAP_SIZE - 64;
+        proc.active          = true;
+        proc.cpu_initialized = false;
+        proc.completed       = false;
+        proc.waiting_for_input = false;
+        proc.terminal        = this;
+        // cmdline = "busybox [subcommand]"; x86_tick parses subcommand for argv[0]
+        // Default subcommand "sh" gives an interactive shell.
+        if (args && *args)
+            strncpy(proc.cmdline, args, 255);
+        else
+            strncpy(proc.cmdline, "sh", 255);  // default: run as shell
+
+        captured_elf_slot = slot;
+        console_print("BusyBox started (slot ");
+        char snum[8]; snprintf(snum, 8, "%d", slot);
+        console_print(snum);
+        console_print(")\n");
     }
-
-    proc.stack = new uint8_t[ELF_STACK_SIZE];
-    if (!proc.stack) { delete[] proc.memory_base; proc.memory_base = nullptr; console_print("Out of memory\n"); return; }
-    memset(proc.stack, 0, ELF_STACK_SIZE);
-
-    proc.entry_point    = ehdr->e_entry - min_vaddr;
-    proc.eip            = proc.entry_point;
-    proc.esp            = ELF_STACK_SIZE - 16;
-    proc.active         = true;
-    proc.cpu_initialized= false;
-    proc.completed      = false;
-    proc.waiting_for_input = false;
-    proc.terminal       = this;
-    strncpy(proc.cmdline, "busybox", 255);
-
-    captured_elf_slot = slot;
-    console_print("BusyBox loaded from embedded image (slot ");
-    char snum[8]; snprintf(snum, 8, "%d", slot);
-    console_print(snum);
-    console_print(")\n");
-}
 
     else if (strcmp(command, "time") == 0) { 
         RTC_Time t = read_rtc(); 
@@ -5995,8 +6066,27 @@ if (strcmp(command, "busybox") == 0) {
         console_print(buf); 
     }
     else if (strcmp(command, "version") == 0) { console_print("RTOS++ v1.0 - Robust Parsing\n"); }
-    else if (strlen(command) > 0) { 
-        console_print("Unknown command.\n"); 
+    else if (strlen(command) > 0) {
+        // Try to execute the command as a filename stored on the FAT32
+        // filesystem (e.g. typing "busybox" directly, or any ELF binary
+        // that was written to the disk).
+        fat_dir_entry_t fentry;
+        uint32_t fsec = 0, foff = 0;
+        if (fat32_find_entry(command, &fentry, &fsec, &foff) == 0) {
+            // File exists on disk – load and run it as a 32-bit ELF.
+            int slot = load_and_execute_elf(command, args, this);
+            if (slot >= 0) {
+                captured_elf_slot = slot;
+            } else {
+                console_print("Exec failed: ");
+                console_print(command);
+                console_print("\n");
+            }
+        } else {
+            console_print("Unknown command: ");
+            console_print(command);
+            console_print("\n");
+        }
     }
     
     if(!in_editor) print_prompt();
@@ -6059,13 +6149,23 @@ int load_and_execute_elf(const char* filename, const char* args, TerminalWindow*
         }
     }
     
-    // Allocate memory for process
-    uint32_t memory_size = max_vaddr - min_vaddr + ELF_HEAP_SIZE;
+    // Allocate memory for process – guard against absurd sizes or overflow.
+    if (min_vaddr == 0xFFFFFFFFu || max_vaddr <= min_vaddr) {
+        if (terminal) terminal->console_print("ELF: no loadable segments\n");
+        delete[] elf_data;
+        return -1;
+    }
+    uint32_t img_size    = max_vaddr - min_vaddr;
+    uint32_t memory_size = img_size + ELF_HEAP_SIZE;
+    // Cap at 6 MB to prevent exhausting the 12 MB kernel heap.
+    if (memory_size > 6 * 1024 * 1024) {
+        if (terminal) terminal->console_print("ELF: image too large\n");
+        delete[] elf_data;
+        return -1;
+    }
     proc->memory_base = new uint8_t[memory_size];
     if (!proc->memory_base) {
-        if (terminal) {
-            terminal->console_print("Failed to allocate process memory\n");
-        }
+        if (terminal) terminal->console_print("ELF: out of memory\n");
         delete[] elf_data;
         return -1;
     }
@@ -6100,9 +6200,12 @@ int load_and_execute_elf(const char* filename, const char* args, TerminalWindow*
     
     // Initialize process state
     proc->active = true;
-    proc->entry_point = ehdr->e_entry - min_vaddr;
+    proc->entry_point = ehdr->e_entry;   // full VA
+    proc->vaddr_base  = min_vaddr;
+    proc->vaddr_end   = max_vaddr;
     proc->eip = proc->entry_point;
-    proc->esp = ELF_STACK_SIZE - 16;
+    // Initial stack at top of memory slab
+    proc->esp = min_vaddr + (max_vaddr - min_vaddr) + ELF_HEAP_SIZE - 64;
     proc->terminal = terminal;
     proc->waiting_for_input = false;
     proc->input_pos = 0;
@@ -6110,12 +6213,13 @@ int load_and_execute_elf(const char* filename, const char* args, TerminalWindow*
     proc->exit_code = 0;
     
     // Copy command line
-    if (args) {
+    if (args && *args) {
         strncpy(proc->cmdline, args, 255);
-        proc->cmdline[255] = '\0';
     } else {
-        proc->cmdline[0] = '\0';
+        // Default: run as shell if no subcommand given
+        strncpy(proc->cmdline, "sh", 255);
     }
+    proc->cmdline[255] = '\0';
     
     delete[] elf_data;
     
@@ -6755,35 +6859,147 @@ void init_elf_system() {
     }
     bochs_cpu_init();
 }
+// I/O callback adapters
+static int  elf_io_read (int slot) { return pop_input(slot); }
+static void elf_io_write(int slot, char c) { push_output(slot, c); }
+static void elf_io_exit (int slot, int /*code*/) {
+    if (slot >= 0 && slot < MAXelf_processes) {
+        elf_processes[slot].completed = true;
+        elf_processes[slot].active    = false;
+    }
+}
+
 bool x86_tick(int slot, int steps = 200) {
     ElfProcess& proc = elf_processes[slot];
-
     if (!proc.active || proc.completed) return false;
-    if (proc.waiting_for_input)        return true;
 
-    // Point Bochs memory at this process
-    bochs_set_process_memory(
-        proc.memory_base,
-        proc.memory_size,
-        proc.stack
-    );
+    // Tell Bochs which slot owns this CPU context
+    bochs_activate_slot(slot);
 
-    // First run: set entry point and stack
+    // ── First-run initialisation ─────────────────────────────────────
     if (!proc.cpu_initialized) {
+        // Register ring-buffer callbacks for sys_read/write/exit
+        bochs_register_io_callbacks(slot, elf_io_read, elf_io_write, elf_io_exit);
+
+        // Map the process memory slab at its VIRTUAL address range.
+        bochs_set_process_memory(
+            proc.memory_base, proc.memory_size, proc.vaddr_base);
+
+        // brk starts just after the loaded image segments
+        bochs_set_brk(slot, proc.vaddr_end);
+
+        // ── Build Linux ABI initial stack ──────────────────────────
+        // musl _start does: pop eax (argc), mov ecx,esp (argv ptr)
+        // We must write [argc][argv ptrs][NULL][envp][NULL][auxv] onto
+        // the stack before the first instruction executes.
+        //
+        // Stack lives at the TOP of our slab (high addresses, grows down).
+        // The argv[0] string "sh" sits just above the pointer array.
+        // busybox inspects argv[0] to choose its applet; "sh" -> shell.
+        //
+        // Use the cmdline field: if it contains a space, the part after
+        // the space is the subcommand (e.g. "busybox sh" -> "sh").
+        // If no space, default to "sh".
+
+        // Determine argv[0] string (the subcommand / applet name)
+        const char* sub = "sh";  // default: run as shell
+        static char sub_buf[64];
+        const char* sp = proc.cmdline;
+        while (*sp && *sp != ' ') sp++;  // skip first word ("busybox")
+        if (*sp == ' ') {
+            sp++;  // skip space
+            if (*sp) {
+                // copy subcommand
+                int si = 0;
+                while (sp[si] && si < 62) { sub_buf[si] = sp[si]; si++; }
+                sub_buf[si] = ' ';
+                sub = sub_buf;
+            }
+        }
+
+        // Stack layout (ESP points to argc, grows down from stack_top_va):
+        //   [argc]        4 bytes
+        //   [argv[0] VA]  4 bytes  -> points to string below
+        //   [NULL]        4 bytes  (argv terminator)
+        //   [NULL]        4 bytes  (envp terminator)
+        //   [0][0]        8 bytes  (AT_NULL auxv entry)
+        //   "sh "        string   (or whatever sub is)
+        // Total: ~27 bytes. Place at top of slab with a gap.
+
+        uint32_t slab_top_va = proc.vaddr_base + proc.memory_size;
+
+        // String at very top of slab
+        uint32_t str_len = 0;
+        while (sub[str_len]) str_len++;
+        str_len++;  // include null terminator
+
+        uint32_t str_va = slab_top_va - 16 - str_len;  // 16-byte pad at top
+
+        // Pointer array just below the string
+        // 6 dwords: argc, argv[0], NULL, NULL, 0, 0
+        uint32_t arr_va = str_va - 6 * 4;
+        uint32_t esp_va = arr_va;
+
+        // Write string into slab
+        uint32_t str_off = str_va - proc.vaddr_base;
+        if (str_off + str_len <= proc.memory_size) {
+            for (uint32_t i = 0; i < str_len; i++)
+                proc.memory_base[str_off + i] = (uint8_t)sub[i];
+        }
+
+        // Write pointer array into slab
+        uint32_t arr_off = arr_va - proc.vaddr_base;
+        if (arr_off + 24 <= proc.memory_size) {
+            auto write32 = [&](uint32_t off, uint32_t val) {
+                proc.memory_base[off+0] = val & 0xFF;
+                proc.memory_base[off+1] = (val>>8) & 0xFF;
+                proc.memory_base[off+2] = (val>>16) & 0xFF;
+                proc.memory_base[off+3] = (val>>24) & 0xFF;
+            };
+            write32(arr_off +  0, 1);        // argc = 1
+            write32(arr_off +  4, str_va);   // argv[0] -> "sh"
+            write32(arr_off +  8, 0);        // argv NULL
+            write32(arr_off + 12, 0);        // envp NULL
+            write32(arr_off + 16, 0);        // AT_NULL type
+            write32(arr_off + 20, 0);        // AT_NULL value
+        }
+
         bochs_cpu_set_eip(proc.entry_point);
-        bochs_cpu_set_esp(SB + ELF_STACK_SIZE - 16);
+        bochs_cpu_set_esp(esp_va);
+
         proc.cpu_initialized = true;
+        proc.waiting_for_input = false;
+    } else {
+        // Subsequent ticks: re-register memory in case another process ran
+        bochs_set_process_memory(
+            proc.memory_base, proc.memory_size, proc.vaddr_base);
     }
 
-    // Run steps instructions
+    // If blocked on input, only resume when data has arrived
+    if (proc.waiting_for_input) {
+        if (in_empty(slot)) return true;
+        proc.waiting_for_input = false;
+    }
+
     bochs_cpu_tick(steps);
 
-    // Check if process ended via bad EIP
+    // ── Exit detection ───────────────────────────────────────────────
     uint32_t eip = bochs_cpu_get_eip();
-    if (eip == 0 || eip >= proc.memory_size) {
+    bool exited = (eip == 0)
+               || (eip < proc.vaddr_base)
+               || (eip >= proc.vaddr_base + proc.memory_size);
+    if (exited) {
         proc.completed = true;
         proc.active    = false;
+        bochs_activate_slot(-1);
         return false;
+    }
+
+    // Suspend ticking if the guest just issued sys_read with no data.
+    // bochs_process_wants_input() is set by the syscall handler in bochs_glue.cpp
+    // only when sys_read returned 0 bytes. This avoids busy-spinning.
+    if (bochs_process_wants_input(slot)) {
+        proc.waiting_for_input = true;
     }
 
     return true;
@@ -6791,39 +7007,54 @@ bool x86_tick(int slot, int steps = 200) {
 // And definition without default:
 void tick_elf_processes(int steps) {
     for (int i = 0; i < MAXelf_processes; ++i) {
-        if (!elf_processes[i].active || elf_processes[i].completed) continue;
+        ElfProcess& proc = elf_processes[i];
+        if (!proc.active || proc.completed) continue;
 
-        if (elf_processes[i].waiting_for_input) {
-            // Drain output while waiting
-            if (elf_processes[i].terminal && !out_empty(i)) {
-                char tmp[256]; int n = 0;
-                while (!out_empty(i) && n < 255) tmp[n++] = pop_output(i);
-                tmp[n] = 0;
-                if (n) elf_processes[i].terminal->console_print(tmp);
-            }
-            continue;
-        }
-
-        bool running = x86_tick(i, steps);
-
-        // Drain output after tick
-        if (elf_processes[i].terminal && !out_empty(i)) {
+        // Always drain any pending output first (produced by previous ticks
+        // or by the syscall handler during waiting_for_input periods).
+        if (proc.terminal && !out_empty(i)) {
             char tmp[256]; int n = 0;
             while (!out_empty(i) && n < 255) tmp[n++] = pop_output(i);
             tmp[n] = 0;
-            if (n) elf_processes[i].terminal->console_print(tmp);
+            if (n) {
+                proc.terminal->console_print(tmp);
+                // Mark screen dirty so output appears immediately
+                mark_screen_dirty();
+            }
+        }
+
+        // Skip ticking if guest is blocked on input AND none has arrived
+        if (proc.waiting_for_input && in_empty(i)) continue;
+
+        bool running = x86_tick(i, steps);
+
+        // Drain output produced during this tick
+        if (proc.terminal && !out_empty(i)) {
+            char tmp[256]; int n = 0;
+            while (!out_empty(i) && n < 255) tmp[n++] = pop_output(i);
+            tmp[n] = 0;
+            if (n) {
+                proc.terminal->console_print(tmp);
+                mark_screen_dirty();
+            }
         }
 
         if (!running) {
-            elf_processes[i].active = false;
-            if (elf_processes[i].terminal)
-                elf_processes[i].terminal->captured_elf_slot = -1;
+            proc.active = false;
+            proc.completed = true;
+            if (proc.terminal) {
+                proc.terminal->console_print("[process exited]\n");
+                proc.terminal->captured_elf_slot = -1;
+                mark_screen_dirty();
+            }
         }
     }
 }
 extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
     // --- INITIALIZATION --- (unchanged)
-    static uint8_t kernelheap[4 * 1024 * 1024];
+    // 12 MB heap: BusyBox ELF image (~2 MB) + process memory + stacks
+    // + FAT32 buffers + backbuffer + general use.
+    static uint8_t kernelheap[12 * 1024 * 1024];
     g_allocator.init(kernelheap, sizeof(kernelheap));
     
     multiboot_info* mbi = (multiboot_info*)multiboot_addr;
@@ -6835,20 +7066,52 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
             mbi->framebuffer_pitch
         };
     } else {
-        // Fallback: QEMU standard VGA linear framebuffer
-        fb_info = { (uint32_t*)0xE0000000, 1024, 768, 1024 * 4 };
+        // Fallback: probe PCI for the VGA/display adapter framebuffer BAR.
+        // QEMU -vga std exposes a Bochs VBE-compatible device (1234:1111)
+        // whose BAR0 is the linear framebuffer.  Other common VGA BARs are
+        // also tried.  If none found, use the legacy VGA text-mode region as
+        // a safe no-op address (writes ignored, reads return 0).
+        uint32_t fb_phys = 0;
+        for (uint16_t bus = 0; bus < 8 && !fb_phys; bus++) {
+            for (uint8_t dev = 0; dev < 32 && !fb_phys; dev++) {
+                uint32_t vid_did = pci_read_config_dword(bus, dev, 0, 0);
+                if ((vid_did & 0xFFFF) == 0xFFFF) continue;
+                uint32_t class_rev = pci_read_config_dword(bus, dev, 0, 0x08);
+                uint32_t dev_class = class_rev >> 16;
+                // Display controller (0x03xx) or Bochs VBE (1234:1111)
+                bool is_display = (dev_class == 0x0300 || dev_class == 0x0380);
+                bool is_bochs   = (vid_did == 0x11111234);
+                if (is_display || is_bochs) {
+                    // Try BARs 0..1 for a memory BAR >= 1 MB
+                    for (int bar = 0; bar < 2 && !fb_phys; bar++) {
+                        uint32_t bar_val = pci_read_config_dword(bus, dev, 0, 0x10 + bar*4);
+                        if (bar_val & 1) continue;     // I/O BAR
+                        uint32_t addr = bar_val & 0xFFFFFFF0;
+                        if (addr >= 0x1000000) fb_phys = addr;  // >= 16 MB PA
+                    }
+                }
+            }
+        }
+        if (!fb_phys) {
+            // Last resort: QEMU standard address for Bochs VBE framebuffer
+            fb_phys = 0xFD000000;
+        }
+        fb_info = { (uint32_t*)(uintptr_t)fb_phys, 1024, 768, 1024 * 4 };
     }
     
-    backbuffer = new uint32_t[fb_info.width * fb_info.height];
+    /* backbuffer is the static backbuffer_storage[1024*768] array in BSS. */
+    /* Cap fb dimensions to the buffer size to prevent out-of-bounds writes. */
+    if (fb_info.width  > 1024) fb_info.width  = 1024;
+    if (fb_info.height > 768)  fb_info.height = 768;
+    backbuffer = backbuffer_storage;
     
     g_gfx.init(false);
     launch_new_terminal();
-    enable_usb_legacy_support();
+    /* USB legacy support is handled inside initialize_universal_mouse() */
 
-    for (int i = 0; i < 100000; i++) io_wait_short();
-
-    outb(0x64, 0xFF);
-    io_delay_long();
+    /* PS/2 controller init: flush output buffer only.
+       Do NOT send 0xFF (reset) to 0x64 – on many QEMU configs this
+       triggers a system reset via the keyboard controller. */
     ps2_flush_output_buffer();
     
     if (initialize_universal_mouse()) {
@@ -6869,10 +7132,19 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
 
 	if (current_directory_cluster) {
 		wm.load_desktop_items();
+		// Save BusyBox from the embedded ramdisk to FAT32 so the shell
+		// can execute it by filename (e.g. "busybox", "busybox ls").
+		if (extract_busybox_to_filesystem()) {
+			wm.print_to_focused("BusyBox saved to filesystem.\n");
+		} else {
+			wm.print_to_focused("BusyBox: ramdisk empty or FS write failed.\n");
+		}
 	} else {
 		wm.print_to_focused("FAT32 init failed.\n");
 	}
-    init_screen_timer(30);
+    /* PIT not programmed – g_timer_ticks is driven by the poll_counter
+       in the main loop.  Programming the PIT causes IRQ0 to fire which,
+       even after PIC remap, we have no handler for beyond the catch-all. */
 
     uint32_t last_paint_tick = 0;
     const uint32_t TICKS_PER_FRAME = 1;
@@ -6909,6 +7181,29 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
             g_input_state.hasNewInput = true;
             prev_mouse_x = mouse_x;
             prev_mouse_y = mouse_y;
+        }
+
+        // 2b. Route keystrokes to the active ELF process if one is running.
+        // The terminal's captured_elf_slot holds the slot index while a
+        // guest process owns the input focus.
+        if (last_key_press != 0) {
+            // Find the focused terminal and check if it has an ELF running
+            Window* focused_win = (wm.get_focused_idx() >= 0)
+                ? wm.get_window(wm.get_focused_idx()) : nullptr;
+            // We can't dynamic_cast without RTTI; use the global elf_processes
+            // table to check all active processes for a terminal match.
+            for (int _s = 0; _s < MAXelf_processes; _s++) {
+                if (elf_processes[_s].active && !elf_processes[_s].completed
+                    && elf_processes[_s].terminal != nullptr
+                    && (Window*)elf_processes[_s].terminal == focused_win) {
+                    // Push the key into the guest's input ring buffer
+                    push_input(_s, last_key_press);
+                    // Wake the process if it was waiting
+                    elf_processes[_s].waiting_for_input = false;
+                    last_key_press = 0;  // consumed by guest
+                    break;
+                }
+            }
         }
 
         // 3. Timer
