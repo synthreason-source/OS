@@ -6,4 +6,6 @@ TODO: more GUI features, install busybox.
 
 uses sata port 0
 
-TODO: fix out of memory error/fileseek error
+TODO: fix bochs execution, fix FAT32 init & format.
+
+
