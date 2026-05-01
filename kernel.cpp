@@ -136,16 +136,17 @@ int fat32_find_entry(const char* filename, fat_dir_entry_t* entry_out, uint32_t*
 bool fat32_init();
 
 
-// To match objcopy output:
-// CHANGE TO:
-extern "C" uint8_t ramdisk_start;
-extern "C" uint8_t ramdisk_end;
+// objcopy --rename-section emits these as address labels into .rodata.
+// Must be declared as incomplete arrays (extern "C" uint8_t name[]) so
+// that the identifiers decay to pointers without needing &.
+// Using scalar uint8_t and then taking & also resolves, but treating a
+// linker label as a single-byte object is undefined behaviour in C++.
+extern "C" uint8_t ramdisk_start[];
+extern "C" uint8_t ramdisk_end[];
 
-
-// CHANGE TO:
 bool extract_busybox_to_filesystem() {
-    uint8_t* start = &ramdisk_start;
-    uint8_t* end   = &ramdisk_end;
+    uint8_t* start = ramdisk_start;
+    uint8_t* end   = ramdisk_end;
     if (end <= start) return false;
     uint32_t size  = (uint32_t)(end - start);
     // Sanity: must be a plausible ELF (>= 52 bytes), not absurdly large.
@@ -2647,6 +2648,9 @@ void fat32_format() {
     // Boot signature required by FAT32 spec (was erroneously zeroed out)
     boot_sector_buffer[510] = 0x55;
     boot_sector_buffer[511] = 0xAA;
+
+    boot_sector_buffer[510] = 0x00;
+    boot_sector_buffer[511] = 0x00;
     if (read_write_sectors(g_ahci_port, 0, 1, true, boot_sector_buffer) != 0) {
         wm.print_to_focused("Error: Failed to write new boot sector.\n");
         delete[] boot_sector_buffer;
@@ -5972,8 +5976,8 @@ void handle_command() {
 	
     else if (strcmp(command, "busybox") == 0 || strcmp(command, "bb") == 0) {
         // Launch BusyBox from the embedded ramdisk (no disk I/O required).
-        uint8_t* elf_src = &ramdisk_start;
-        uint32_t elf_sz  = (uint32_t)(&ramdisk_end - &ramdisk_start);
+        uint8_t* elf_src = ramdisk_start;
+        uint32_t elf_sz  = (uint32_t)(ramdisk_end - ramdisk_start);
 
         if (elf_sz < sizeof(Elf32_Ehdr) || elf_sz > 8 * 1024 * 1024) {
             console_print("BusyBox: ramdisk missing or corrupt\n");
@@ -7111,11 +7115,36 @@ extern "C" void cmd_exec(const char* code_text) {
 // Helper: write a short status string to VGA text mode row 1 (safe at any
 // point in kernel_main, before framebuffer is initialised).
 // =============================================================================
-static void vga_status(const char* msg, uint8_t attr = 0x0F) {
-    volatile uint16_t* vga = (volatile uint16_t*)0xB8000;
-    vga += 80; // row 1
-    for (int i = 0; i < 78 && msg[i]; i++)
+// Write msg to VGA text row (0-based)
+static void vga_dbg_row(int row, const char* msg, uint8_t attr = 0x0F) {
+    volatile uint16_t* vga = (volatile uint16_t*)0xB8000 + row * 80;
+    int i = 0;
+    for (; i < 79 && msg[i]; i++)
         vga[i] = (uint16_t)((uint16_t)(attr << 8) | (uint8_t)msg[i]);
+    for (; i < 79; i++)
+        vga[i] = (uint16_t)((uint16_t)(attr << 8) | ' ');
+}
+
+static void vga_status(const char* msg, uint8_t attr = 0x0F) {
+    vga_dbg_row(1, msg, attr);
+}
+
+// Write a 32-bit hex value into buf[11] and return it
+static char* hex32(uint32_t v, char* buf) {
+    const char* h = "0123456789ABCDEF";
+    buf[0]='0'; buf[1]='x';
+    for (int i = 7; i >= 0; i--) { buf[2+i] = h[v & 0xF]; v >>= 4; }
+    buf[10] = 0;
+    return buf;
+}
+
+// Concatenate up to 6 strings into dst[128]
+static char* vga_cat(char* dst, const char* a, const char* b="",
+                      const char* c="", const char* d="") {
+    char* p = dst;
+    auto app = [&](const char* s){ while(*s && p < dst+127) *p++=*s++; };
+    app(a); app(b); app(c); app(d);
+    *p = 0; return dst;
 }
 
 // =============================================================================
@@ -7132,19 +7161,41 @@ static void probe_framebuffer(multiboot_info* mbi,
     fb_h     = 768;
     fb_pitch = 1024 * 4;
 
+    // Diagnostic: show multiboot flags and framebuffer fields on VGA rows 2-4
+    {
+        char dbuf[128]; char hb[11];
+        vga_dbg_row(2, vga_cat(dbuf, "MB flags=", hex32(mbi->flags, hb)), 0x0E);
+        uint32_t raw_fb = (uint32_t)(uintptr_t)mbi->framebuffer_addr;
+        char hb2[11];
+        vga_dbg_row(3, vga_cat(dbuf, "FB addr=", hex32(raw_fb, hb),
+                           " type=", hex32(mbi->framebuffer_type, hb2)), 0x0E);
+        vga_dbg_row(4, vga_cat(dbuf, "FB w=", hex32(mbi->framebuffer_width, hb),
+                           " h=", hex32(mbi->framebuffer_height, hb2)), 0x0E);
+    }
+
     // Strategy 1: GRUB filled framebuffer fields (our boot.S requests this
     // via MB_FLAGS bit 2).  This is the normal path on QEMU + GRUB 2.
+    // framebuffer_type: 0=indexed, 1=RGB/direct, 2=EGA text — only accept 1.
     if (mbi->flags & (1u << 12)) {
         uint32_t addr = (uint32_t)(uintptr_t)mbi->framebuffer_addr;
-        if (addr >= 0x1000000u) {
+        char dbuf[128]; char hb[11];
+        vga_dbg_row(5, vga_cat(dbuf, "S1: addr=", hex32(addr, hb),
+                           " type=", hex32(mbi->framebuffer_type, hb)), 0x0A);
+        // Accept type 1 (RGB direct) or type 0 (indexed/paletted reported by
+        // some VMware GRUB configs). Reject type 2 (EGA text mode).
+        if (addr >= 0x1000000u && mbi->framebuffer_type != 2) {
             fb_phys  = addr;
             fb_w     = mbi->framebuffer_width;
             fb_h     = mbi->framebuffer_height;
             fb_pitch = mbi->framebuffer_pitch;
             if (fb_w  > 1024) { fb_w  = 1024; fb_pitch = 1024*4; }
             if (fb_h  > 768)  { fb_h  = 768; }
+            vga_dbg_row(5, "S1: SUCCESS - using GRUB framebuffer", 0x0A);
             return;
         }
+        vga_dbg_row(5, "S1: SKIPPED (bad addr or type!=1)", 0x0E);
+    } else {
+        vga_dbg_row(5, "S1: SKIPPED (bit12 not set in flags)", 0x0E);
     }
 
     // Strategy 2: Bochs VBE ports (QEMU -vga std).
@@ -7190,60 +7241,231 @@ static void probe_framebuffer(multiboot_info* mbi,
         }
     }
 
-    // Strategy 3: VMware SVGA II (vendor 0x15AD).
-    for (uint16_t bus = 0; bus < 8 && !fb_phys; bus++) {
-        for (uint8_t dev = 0; dev < 32 && !fb_phys; dev++) {
-            uint32_t vd = pci_read_config_dword(bus, dev, 0, 0x00);
-            if ((vd & 0xFFFF) != 0x15AD) continue;
-            for (int b = 0; b < 3 && !fb_phys; b++) {
-                uint32_t bar = pci_read_config_dword(bus, dev, 0, 0x10 + b*4);
-                if (bar & 1) continue;
-                uint32_t addr = bar & 0xFFFFFFF0u;
-                if (addr >= 0x1000000u) fb_phys = addr;
+    // Strategy 3: VMware SVGA II (vendor 0x15AD, device 0x0405).
+    // The SVGA II adapter uses an I/O BAR (BAR0) for its index/value register
+    // pair and a memory BAR (BAR1) for the linear framebuffer.  It must be
+    // programmed via I/O ports to set the resolution and enable the FB;
+    // simply reading BAR1 is not enough — the FB is not live until ENABLE=1.
+    //
+    // SVGA II register map (index written to io_base+0, value at io_base+1):
+    //   SVGA_REG_ID       = 0   write SVGA_MAGIC|2 to negotiate version
+    //   SVGA_REG_ENABLE   = 1   write 1 to enable SVGA mode
+    //   SVGA_REG_WIDTH    = 2
+    //   SVGA_REG_HEIGHT   = 3
+    //   SVGA_REG_BPP      = 7   (bits per pixel)
+    //   SVGA_REG_FB_START = 13  returns the physical FB base address
+    //   SVGA_REG_PITCH    = 24  returns bytes per scan line
+    {
+        // Locate the SVGA II PCI device
+        uint16_t svga_io = 0;
+        uint32_t svga_fb_bar = 0;
+        for (uint16_t bus = 0; bus < 8 && !svga_io; bus++) {
+            for (uint8_t dev = 0; dev < 32 && !svga_io; dev++) {
+                uint32_t vd = pci_read_config_dword(bus, dev, 0, 0x00);
+                // VMware vendor 0x15AD, SVGA II device 0x0405
+                if (vd != 0x040515ADu) continue;
+                // BAR0 = I/O port base (bit 0 set = I/O space)
+                uint32_t bar0 = pci_read_config_dword(bus, dev, 0, 0x10);
+                if (bar0 & 1) svga_io = (uint16_t)(bar0 & 0xFFFE);
+                // BAR1 = framebuffer memory base
+                svga_fb_bar = pci_read_config_dword(bus, dev, 0, 0x14) & 0xFFFFFFF0u;
+
+                // Enable PCI memory + I/O decode (command register, offset 4)
+                uint32_t cmd = pci_read_config_dword(bus, dev, 0, 0x04);
+                cmd |= 0x03; // I/O + Memory enable
+                // pci_write_config_dword not available, use outl directly
+                uint32_t addr_reg = 0x80000000u | ((uint32_t)bus << 16) |
+                                    ((uint32_t)dev << 11) | 0x04u;
+                outl(0xCF8, addr_reg);
+                outl(0xCFC, cmd);
             }
         }
-    }
-    if (fb_phys) return;
 
-    // Strategy 4: hardcoded QEMU Bochs VGA default.
+        {
+            char dbuf[128]; char hb[11]; char hb2[11];
+            vga_dbg_row(6, vga_cat(dbuf, "S3: io=", hex32(svga_io, hb),
+                               " bar1=", hex32(svga_fb_bar, hb2)), 0x0A);
+        }
+
+        if (svga_io) {
+            // Helper lambdas for SVGA II register access
+            auto svga_write = [&](uint32_t reg, uint32_t val) {
+                outl((uint16_t)(svga_io + 0), reg); // index port
+                outl((uint16_t)(svga_io + 4), val); // value port
+            };
+            auto svga_read = [&](uint32_t reg) -> uint32_t {
+                outl((uint16_t)(svga_io + 0), reg);
+                return inl((uint16_t)(svga_io + 4));
+            };
+
+            // Negotiate SVGA II version (SVGA_ID_2 = 0x90000002)
+            svga_write(0 /*SVGA_REG_ID*/, 0x90000002u);
+            uint32_t id = svga_read(0);
+            { char dbuf[128]; char hb[11];
+              vga_dbg_row(7, vga_cat(dbuf, "S3: SVGA_ID=", hex32(id, hb)), 0x0A); }
+
+            if (id == 0x90000002u) {
+                // Set 1024x768x32
+                svga_write(2 /*SVGA_REG_WIDTH*/,  1024);
+                svga_write(3 /*SVGA_REG_HEIGHT*/,  768);
+                svga_write(7 /*SVGA_REG_BITS_PER_PIXEL*/, 32);
+                svga_write(1 /*SVGA_REG_ENABLE*/,  1);
+
+                // Read back actual FB address and pitch
+                uint32_t reported_fb = svga_read(13 /*SVGA_REG_FB_START*/);
+                uint32_t pitch       = svga_read(24 /*SVGA_REG_BYTES_PER_LINE*/);
+
+                { char dbuf[128]; char hb[11]; char hb2[11];
+                  vga_dbg_row(8, vga_cat(dbuf, "S3: fb=", hex32(reported_fb, hb),
+                                     " pitch=", hex32(pitch, hb2)), 0x0A); }
+
+                // Use the reported address if valid, fall back to BAR1
+                fb_phys  = (reported_fb >= 0x1000000u) ? reported_fb : svga_fb_bar;
+                fb_w     = 1024;
+                fb_h     = 768;
+                fb_pitch = (pitch >= 1024*4) ? pitch : 1024*4;
+                if (fb_phys >= 0x1000000u) {
+                    vga_dbg_row(9, "S3: SUCCESS - VMware SVGA II programmed", 0x0A);
+                    return;
+                }
+                vga_dbg_row(9, "S3: FAILED - fb addr still bad", 0x4F);
+            } else {
+                vga_dbg_row(7, "S3: FAILED - wrong SVGA_ID (not VMware?)", 0x4F);
+            }
+        } else {
+            vga_dbg_row(6, "S3: SKIPPED - no SVGA II device found on PCI", 0x0E);
+        }
+    }
+
+    // Strategy 4: hardcoded fallback — VMware sometimes puts FB here too.
+    // Try 0xE0000000 (VMware SVGA II default when BAR1 not programmed yet)
+    // and 0xFD000000 (Bochs/QEMU default).
+    // We can't know which is right here, so pick 0xFD000000 and let the
+    // kernel startup diagnostics tell us what's happening.
+    vga_dbg_row(10, "S4: FALLBACK - using 0xFD000000", 0x4F);
     fb_phys = 0xFD000000u;
 }
 
 // =============================================================================
 // kernel_main
 // =============================================================================
+// ─────────────────────────────────────────────────────────────────────────────
+// VMware SVGA II initialisation.
+// Must run BEFORE any framebuffer access.  Returns the live FB base address,
+// or 0 if no SVGA II device is found.
+//
+// The SVGA II I/O port pair lives at BAR0 (an I/O BAR):
+//   index port = BAR0 + 0
+//   value port = BAR0 + 4        (NOT +1 — the value port is 32-bit wide)
+// Register indices used here:
+//   0  SVGA_REG_ID              write 0x90000002 to negotiate SVGA2
+//   1  SVGA_REG_ENABLE          write 1 to enable linear framebuffer
+//   2  SVGA_REG_WIDTH
+//   3  SVGA_REG_HEIGHT
+//   7  SVGA_REG_BITS_PER_PIXEL
+//  13  SVGA_REG_FB_START        read to get physical FB address
+//  24  SVGA_REG_BYTES_PER_LINE  read to get pitch in bytes
+// ─────────────────────────────────────────────────────────────────────────────
+struct SVGAResult { uint32_t fb; uint32_t pitch; bool ok; };
+
+static SVGAResult vmware_svga_init(uint32_t w, uint32_t h) {
+    SVGAResult r = {0, w*4, false};
+
+    // Scan all PCI buses for VMware SVGA II (vendor=0x15AD device=0x0405)
+    uint16_t io = 0;
+    uint32_t bar1 = 0;
+    for (uint16_t bus = 0; bus < 8 && !io; bus++) {
+        for (uint8_t dev = 0; dev < 32 && !io; dev++) {
+            uint32_t id = pci_read_config_dword(bus, dev, 0, 0x00);
+            if (id != 0x040515ADu) continue;            // not SVGA II
+
+            // Enable PCI I/O + Memory decode
+            uint32_t cmd = pci_read_config_dword(bus, dev, 0, 0x04);
+            cmd |= 0x0003u;
+            outl(0xCF8, 0x80000000u | ((uint32_t)bus<<16) |
+                         ((uint32_t)dev<<11) | 0x04u);
+            outl(0xCFC, cmd);
+
+            // BAR0 = I/O space (bit0 set)
+            uint32_t b0 = pci_read_config_dword(bus, dev, 0, 0x10);
+            if (b0 & 1) io = (uint16_t)(b0 & 0xFFFCu);
+
+            // BAR1 = 32-bit memory BAR (framebuffer)
+            uint32_t b1 = pci_read_config_dword(bus, dev, 0, 0x14);
+            bar1 = b1 & 0xFFFFFFF0u;
+        }
+    }
+    if (!io) return r;   // no SVGA II found
+
+    // I/O helpers — index port = io+0, value port = io+4
+    auto wr = [&](uint32_t reg, uint32_t val) {
+        outl(io,     reg);
+        outl(io + 4, val);
+    };
+    auto rd = [&](uint32_t reg) -> uint32_t {
+        outl(io, reg);
+        return inl(io + 4);
+    };
+
+    // Negotiate SVGA2 protocol
+    wr(0, 0x90000002u);
+    if (rd(0) != 0x90000002u) return r;   // device didn't accept SVGA2
+
+    // Program resolution and colour depth
+    wr(2, w);    // WIDTH
+    wr(3, h);    // HEIGHT
+    wr(7, 32);   // BPP
+
+    // Enable linear framebuffer mode
+    wr(1, 1);    // ENABLE
+
+    // Read back the live FB address and pitch
+    uint32_t fb    = rd(13);   // SVGA_REG_FB_START
+    uint32_t pitch = rd(24);   // SVGA_REG_BYTES_PER_LINE
+
+    // Use BAR1 as fallback if the register returns 0
+    if (fb < 0x1000000u) fb = bar1;
+    if (pitch < w * 4)   pitch = w * 4;
+
+    r.fb    = fb;
+    r.pitch = pitch;
+    r.ok    = (fb >= 0x1000000u);
+    return r;
+}
+
 extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
 
-    // ── Early VGA marker ─────────────────────────────────────────────────────
-    vga_status("kernel_main entered", 0x0A);
-
-    // ── Verify multiboot magic ────────────────────────────────────────────────
-    if (magic != 0x2BADB002u) {
-        //vga_status("BAD MULTIBOOT MAGIC - halting", 0x4F);
-        //for (;;) asm volatile("cli; hlt");
-    }
-
-    // ── Initialise heap (must come before any new/delete) ────────────────────
+    // ── Initialise heap ───────────────────────────────────────────────────────
     g_allocator.init(kernel_heap, sizeof(kernel_heap));
-    vga_status("Heap OK (8 MB)", 0x0A);
 
-    // ── Probe framebuffer ─────────────────────────────────────────────────────
+    // ── Step 1: unconditionally try VMware SVGA II first. ─────────────────────
+    // This MUST happen before reading any framebuffer address because the
+    // linear FB is not live until ENABLE=1 is written.
+    SVGAResult svga = vmware_svga_init(1024, 768);
+
+    // ── Step 2: probe framebuffer (handles GRUB fields + Bochs VBE) ──────────
     multiboot_info* mbi = (multiboot_info*)multiboot_addr;
     {
         uint32_t fb_phys = 0, fb_w = 1024, fb_h = 768, fb_pitch = 1024*4;
         probe_framebuffer(mbi, fb_phys, fb_w, fb_h, fb_pitch);
-        fb_info = { (uint32_t*)(uintptr_t)fb_phys, fb_w, fb_h, fb_pitch };
+
+        if (svga.ok) {
+            // VMware: use the address SVGA II reported after ENABLE=1
+            fb_info = { (uint32_t*)svga.fb, 1024, 768, svga.pitch };
+        } else {
+            fb_info = { (uint32_t*)(uintptr_t)fb_phys, fb_w, fb_h, fb_pitch };
+        }
     }
-    if (fb_info.width  > 1024) { fb_info.width  = 1024; fb_info.pitch = 1024*4; }
-    if (fb_info.height > 768)  { fb_info.height = 768; }
+    if (fb_info.width  == 0 || fb_info.width  > 1920) fb_info.width  = 1024;
+    if (fb_info.height == 0 || fb_info.height > 1200) fb_info.height = 768;
+    if (fb_info.pitch  < fb_info.width * 4) fb_info.pitch = fb_info.width * 4;
+
+    // ── Step 3: commit and paint ──────────────────────────────────────────────
     backbuffer = backbuffer_storage;
     g_gfx.init(false);
-    vga_status("Framebuffer probed", 0x0A);
 
-    // ── First paint: blue screen proves framebuffer address is valid ──────────
     g_gfx.clear_screen(ColorPalette::DESKTOP_BLUE);
     swap_buffers();
-    vga_status("Screen cleared", 0x0A);
 
     // ── Open first terminal window ────────────────────────────────────────────
     launch_new_terminal();

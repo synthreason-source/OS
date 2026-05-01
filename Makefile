@@ -52,7 +52,8 @@ run: $(MAIN) $(DISK_IMG)
 	    -m 256M \
 	    -vga std \
 	    -drive id=disk0,file=$(DISK_IMG),format=raw,if=none \
-	 
+	    -device ahci,id=ahci \
+	    -device ide-hd,drive=disk0,bus=ahci.0
 
 iso: $(MULTIBOOT)
 	mkdir -p iso/boot/grub
