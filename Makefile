@@ -5,6 +5,7 @@
 ISODIR   := iso
 MULTIBOOT := $(ISODIR)/boot/main.elf
 MAIN     := main.iso
+DISK_IMG := disk.img
 
 # ── Compiler flags ───────────────────────────────────────────
 CXXFLAGS := -ffreestanding -O2 -Wall -Wextra \
@@ -29,18 +30,55 @@ BUSYBOX_BIN := busybox
 # ============================================================
 #  Top-level targets
 # ============================================================
-all: $(MAIN)
+all: $(MAIN) $(DISK_IMG)
 
-run: $(MAIN)
-	qemu-system-i386 -cdrom $(MAIN) -m 256M -vga std
+# ── Disk image ────────────────────────────────────────────────
+# 128 MB FAT32 image, 8 sectors/cluster, 32 reserved sectors.
+# Built by mkfat32.py (pure Python, no dosfstools package needed).
+# Created once; preserved across builds so filesystem state survives reboots.
+$(DISK_IMG):
+	@echo ">>> Creating 128 MB FAT32 disk image (no external tools needed)..."
+	python3 mkfat32.py $(DISK_IMG) 128
+	@echo ">>> $(DISK_IMG) ready."
+
+# Run using Q35 machine which exposes the ICH9 AHCI controller on PCI.
+# -M q35        : Q35 chipset, has native ICH9 AHCI (PCI class 01:06)
+# -device ide-hd,drive=disk0,bus=ahci.0 : attach disk to AHCI port 0
+# No -no-acpi   : AHCI IRQ routing requires ACPI; removed so AHCI works
+run: $(MAIN) $(DISK_IMG)
+	qemu-system-i386 \
+	    -M q35 \
+	    -cdrom $(MAIN) -boot d \
+	    -m 256M \
+	    -vga std \
+	    -drive id=disk0,file=$(DISK_IMG),format=raw,if=none \
+	 
+
+iso: $(MULTIBOOT)
+	mkdir -p iso/boot/grub
+	cp $(MULTIBOOT) iso/boot/main.elf
+	printf '%s\n'                              \
+	    'set timeout=0'                         \
+	    'set default=0'                         \
+	    'terminal_input console'                \
+	    'terminal_output console'               \
+	    'menuentry "RTOS++" {'                  \
+	    '    multiboot /boot/main.elf'          \
+	    '    boot'                              \
+	    '}'                                     \
+	    > iso/boot/grub/grub.cfg
+	grub-mkrescue -o main.iso iso
+	@echo ">>> ISO ready: main.iso"
+
 
 clean:
 	rm -rf *.o main.iso iso
 
+# distclean also removes the disk image and downloaded sources
 distclean: clean
-	rm -rf $(BOCHS_DIR) $(BOCHS_ARCHIVE) $(BUSYBOX_BIN) ramdisk.o
+	rm -rf $(BOCHS_DIR) $(BOCHS_ARCHIVE) $(BUSYBOX_BIN) ramdisk.o $(DISK_IMG)
 
-.PHONY: all run clean distclean
+.PHONY: all run clean distclean iso
 
 # ============================================================
 #  Bochs: download -> extract -> configure -> build cpu libs
@@ -190,6 +228,7 @@ $(MAIN): $(MULTIBOOT)
 	    'set default=0'                   \
 	    'menuentry "RTOS++" {'            \
 	    '    multiboot /boot/main.elf'    \
+	    '    boot'                        \
 	    '}'                               \
 	    > iso/boot/grub/grub.cfg
 	grub-mkrescue -o $(MAIN) iso

@@ -467,7 +467,10 @@ int snprintf(char* buffer, size_t size, const char* fmt, ...) {
 
 // --- Basic Memory Allocator ---
 // Single 32MB global heap in BSS (not stack!) — enough for BusyBox + 4 ELF procs + FAT32 + backbuffer
-static uint8_t kernel_heap[32 * 1024 * 1024];
+/* 8 MB heap — keeps total BSS under ~12 MB so GRUB can zero it reliably.
+   32 MB caused boot crashes because the ELF BSS segment exceeded what most
+   GRUB 2 builds will zero before jumping to _start. */
+static uint8_t kernel_heap[8 * 1024 * 1024];
 static size_t heap_ptr = 0;
 void* operator new(size_t, void* p) { return p; }
 
@@ -1374,33 +1377,33 @@ static inline void io_delay_short() {
 }
 
 static inline void io_delay_medium() {
-    for (volatile int i = 0; i < 5; i++) {
+    for (volatile int i = 0; i < 2; i++) {
         io_wait_short();
     }
 }
 
 static inline void io_delay_long() {
-    for (volatile int i = 0; i < 100; i++) {
+    for (volatile int i = 0; i < 10; i++) {
         io_wait_short();
     }
 }
 
-static bool ps2_wait_input_ready(uint32_t timeout = 100000) {
+static bool ps2_wait_input_ready(uint32_t timeout = 1000) {
     while (timeout--) {
         if (!(inb(PS2_STATUS_PORT) & PS2_STATUS_INPUT_FULL)) {
             return true;
         }
-        if (timeout % 100000 == 0) io_delay_medium();
+        if (timeout % 1000 == 0) io_delay_medium();
     }
     return false;
 }
 
-static bool ps2_wait_output_ready(uint32_t timeout = 100000) {
+static bool ps2_wait_output_ready(uint32_t timeout = 1000) {
     while (timeout--) {
         if (inb(PS2_STATUS_PORT) & PS2_STATUS_OUTPUT_FULL) {
             return true;
         }
-        if (timeout % 100000 == 0) io_delay_medium();
+        if (timeout % 1000 == 0) io_delay_medium();
     }
     return false;
 }
@@ -1657,7 +1660,7 @@ static bool init_ps2_mouse_hardware() {
     
     if (!ps2_mouse_write_command(MOUSE_CMD_RESET)) return false;
     
-    uint32_t bat_timeout = 10000;
+    uint32_t bat_timeout = 500;
     bool bat_complete = false;
     
     while (bat_timeout-- > 0) {
@@ -1670,7 +1673,7 @@ static bool init_ps2_mouse_hardware() {
             } else if (data == 0xFC) {
                 io_delay_long();
                 ps2_mouse_write_command(MOUSE_CMD_RESET);
-                bat_timeout = 5000;
+                bat_timeout = 250;
             }
         }
         if (bat_timeout % 100 == 0) {
@@ -1753,7 +1756,7 @@ bool initialize_universal_mouse() {
 }
 void poll_input_universal() {
     last_key_press = 0;
-    // Last frame state is now handled in kernel_main loop
+    // Non-blocking: only read if data is immediately available
 
     for (int iterations = 0; iterations < 16; iterations++) {
         uint8_t status = inb(PS2_STATUS_PORT);
@@ -2047,13 +2050,13 @@ void cmd_list_and_select_disk(const char* arg) {
     port->ci = (1 << slot);
 
     int spin = 0;
-    while (spin < 1000000) {
+    while (spin < 100000) {
         if ((port->ci & (1 << slot)) == 0) break;
         spin++;
     }
 
     if (enc_buf) { delete[] enc_buf; enc_buf = nullptr; }
-    if (spin == 1000000) return -1;
+    if (spin == 100000) return -1;
     if (port->is & (1 << 30)) return -1;
 
     // --- READ PATH: decrypt in place after receiving from disk ---
@@ -2619,7 +2622,15 @@ void fat32_format() {
     new_bpb.num_heads = 64;
     uint32_t total_sectors = (128 * 1024 * 1024) / 512;
     new_bpb.tot_sec32 = total_sectors;
-    new_bpb.fat_sz32 = (total_sectors * 2) / (new_bpb.sec_per_clus + 512) + 1;
+    // Microsoft FAT32 FAT size formula (from FAT spec section 3.5):
+    // TmpVal1 = DskSize - BPB_RsvdSecCnt
+    // TmpVal2 = (256 * BPB_SecPerClus + BPB_NumFATs) / 2
+    // FATSz   = ceil(TmpVal1 / TmpVal2)
+    {
+        uint32_t tmp1 = total_sectors - new_bpb.rsvd_sec_cnt;
+        uint32_t tmp2 = (256u * new_bpb.sec_per_clus + new_bpb.num_fats) / 2u;
+        new_bpb.fat_sz32 = (tmp1 + tmp2 - 1u) / tmp2; // = 256 for 128MB/8sec-clus
+    }
     new_bpb.root_clus = 2;
     new_bpb.fs_info = 1;
     new_bpb.bk_boot_sec = 6;
@@ -2633,11 +2644,9 @@ void fat32_format() {
     char* boot_sector_buffer = new char[SECTOR_SIZE];
     memset(boot_sector_buffer, 0, SECTOR_SIZE);
     memcpy(boot_sector_buffer, &new_bpb, sizeof(fat32_bpb_t));
+    // Boot signature required by FAT32 spec (was erroneously zeroed out)
     boot_sector_buffer[510] = 0x55;
     boot_sector_buffer[511] = 0xAA;
-	
-	boot_sector_buffer[510] = 0x00; //dummy boot for testing
-    boot_sector_buffer[511] = 0x00; //dummy boot for testing
     if (read_write_sectors(g_ahci_port, 0, 1, true, boot_sector_buffer) != 0) {
         wm.print_to_focused("Error: Failed to write new boot sector.\n");
         delete[] boot_sector_buffer;
@@ -3477,7 +3486,7 @@ void int_to_string(int value, char* buffer) {
 // ============================================================
 
 // Simplified file buffer for storage
-static char file_buffer[65536]; // 64KB file buffer
+static char file_buffer[4096]; // 4KB — stub buffer (real I/O goes through heap)
 
 
 // ============================================================
@@ -4700,8 +4709,8 @@ struct TinyVM {
 
 // --- GLOBAL PROCESS TABLE ---
 #define MAX_PROCESSES 4
-TinyVM processes[MAX_PROCESSES];
-TProgram prog_pool[MAX_PROCESSES]; // Memory for loaded code
+/* processes[] and prog_pool[] removed — RunContext/ExecContext own their
+   own TinyVM+TProgram instances; these globals were dead weight (~400 KB). */
 
 // ============================================================
 // Enhanced Object I/O (TVM3 - with hardware support)
@@ -5055,6 +5064,7 @@ private:
 
     // Prompt visual state for multi-line input
     int prompt_visual_lines;
+    char private_startup_cmd[256];
 // Editor viewport settings
 static constexpr int EDIT_ROWS = 35;       // rows visible in the editor area
 static constexpr int EDIT_COL_PIX = 8;     // font width
@@ -5506,7 +5516,7 @@ bool aes_decrypt_file(const char* key_hex, const char* infile, const char* outfi
     delete[] enc_content;
     return result == 0;
 }	
-char startup_command_buffer[256];
+static char g_startup_cmd_unused[256];
 
 
 
@@ -6263,11 +6273,10 @@ public:
         prompt_visual_lines(0) {
         memset(buffer, 0, sizeof(buffer));
         current_line[0] = '\0';
-        startup_command_buffer[0] = '\0'; // Ensure buffer is empty by default
-
+        private_startup_cmd[0] = '\0';
         if (startup_command) {
-            // Save the command to be run on the first update cycle
-            strncpy(startup_command_buffer, startup_command, 127);
+            strncpy(private_startup_cmd, startup_command, 255);
+            private_startup_cmd[255] = '\0';
         }
         
         update_prompt_display(); // Show the initial prompt
@@ -6486,12 +6495,10 @@ public:
 			if (c == '\n') elf_processes[captured_elf_slot].waiting_for_input = false;
 			return;
 		}
-            if (c == '\n' && run_contexts[wm.get_focused_idx()].active) {
-                prompt_visual_lines = 0;
-                line_pos = 0;
-                current_line[0] = '\0';
-                update_prompt_display();
-            } else if (c == '\n' && !run_contexts[wm.get_focused_idx()].active) {
+            if (c == '\n') {
+                // run_contexts[] is indexed by its own slot, NOT by window index.
+                // There is no 1:1 mapping between windows and run slots, so we
+                // just always treat Enter as a command submission.
                 prompt_visual_lines = 0;
                 handle_command();
                 line_pos = 0;
@@ -6516,17 +6523,12 @@ public:
      // --- THIS IS THE CORRECTED UPDATE METHOD ---
     void update() override {
         // Check if there is a startup command waiting to be executed
-        if (startup_command_buffer[0] != '\0') {
-            // Copy the command to the current line to be processed
-            strncpy(current_line, startup_command_buffer, TERM_WIDTH - 1);
-            
-            // Clear the startup command so this only runs ONCE
-            startup_command_buffer[0] = '\0'; 
-
-            push_line(current_line);  // Display the command being run
-            handle_command();         // Execute it
-            
-            // Reset the input line for the user
+        if (private_startup_cmd[0] != '\0') {
+            strncpy(current_line, private_startup_cmd, TERM_WIDTH - 1);
+            current_line[TERM_WIDTH - 1] = '\0';
+            private_startup_cmd[0] = '\0';
+            push_line(current_line);
+            handle_command();
             line_pos = 0;
             current_line[0] = '\0';
             update_prompt_display();
@@ -6812,7 +6814,9 @@ void launch_terminal_with_command(const char* command) {
 }
 
 void swap_buffers() {
+    // Safety: never blit to VGA text region or below 16MB physical
     if (!fb_info.ptr || !backbuffer) return;
+    if ((uintptr_t)fb_info.ptr < 0x1000000u) return;
     uint32_t pitch_pixels = fb_info.pitch / 4;  // pitch is in bytes, convert to pixels
     if (pitch_pixels == fb_info.width) {
         // Fast path: pitch matches width, single blit
@@ -6872,11 +6876,17 @@ struct BochsCPURegs {
 void init_elf_system() {
     for (auto& p : elf_processes) {
         p.active          = false;
-        p.cpu_initialized = false;  // <-- ADD THIS
+        p.cpu_initialized = false;
         p.in_head  = p.in_tail  = 0;
         p.out_head = p.out_tail = 0;
     }
-    bochs_cpu_init();
+    // NOTE: bochs_cpu_init() is NOT called here.
+    // Calling reset() at startup points the CPU at the BIOS reset vector
+    // (0xFFFF0) with no memory mapped, which causes a triple fault and
+    // permanently disables the Bochs virtual CPU before any ELF runs.
+    // Instead, bochs_cpu_init() is called lazily inside x86_tick on the
+    // very first process launch, immediately before setting EIP to valid
+    // guest code. See the g_bochs_ever_initialized flag in x86_tick.
 }
 // I/O callback adapters
 static int  elf_io_read (int slot) { return pop_input(slot); }
@@ -6907,7 +6917,18 @@ bool x86_tick(int slot, int steps = 200) {
         // brk starts just after the loaded image segments
         bochs_set_brk(slot, proc.vaddr_end);
 
-        // ── Build Linux ABI initial stack ──────────────────────────
+        // ── Lazy Bochs CPU init ────────────────────────────────────
+        // We initialise the Bochs virtual CPU here (not at kernel boot)
+        // so that reset() is immediately followed by set_eip() pointing
+        // at real guest code. Calling reset() with no subsequent set_eip
+        // leaves the CPU at the BIOS vector (0xFFFF0), which triple-faults
+        // on the first cpu_loop() call and permanently disables the CPU.
+        static bool g_bochs_ever_initialized = false;
+        if (!g_bochs_ever_initialized) {
+            bochs_cpu_init();                // initialize() + reset()
+            g_bochs_ever_initialized = true;
+        }
+
         // musl _start does: pop eax (argc), mov ecx,esp (argv ptr)
         // We must write [argc][argv ptrs][NULL][envp][NULL][auxv] onto
         // the stack before the first instruction executes.
@@ -6931,7 +6952,7 @@ bool x86_tick(int slot, int steps = 200) {
                 // copy subcommand
                 int si = 0;
                 while (sp[si] && si < 62) { sub_buf[si] = sp[si]; si++; }
-                sub_buf[si] = ' ';
+                sub_buf[si] = '\0';
                 sub = sub_buf;
             }
         }
@@ -6942,7 +6963,7 @@ bool x86_tick(int slot, int steps = 200) {
         //   [NULL]        4 bytes  (argv terminator)
         //   [NULL]        4 bytes  (envp terminator)
         //   [0][0]        8 bytes  (AT_NULL auxv entry)
-        //   "sh "        string   (or whatever sub is)
+        //   "sh"        string   (or whatever sub is)
         // Total: ~27 bytes. Place at top of slab with a gap.
 
         uint32_t slab_top_va = proc.vaddr_base + proc.memory_size;
@@ -7069,128 +7090,222 @@ void tick_elf_processes(int steps) {
         }
     }
 }
-extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
-    // --- INITIALIZATION ---
-    // Use the 32MB global kernel_heap[] in BSS (NOT a local stack variable).
-    // A local 12MB array on the kernel stack would overflow the 64KB stack immediately.
-    g_allocator.init(kernel_heap, sizeof(kernel_heap));
-    
-    multiboot_info* mbi = (multiboot_info*)multiboot_addr;
-    if (mbi->flags & (1 << 12)) {
-        fb_info = {
-            (uint32_t*)(uintptr_t)mbi->framebuffer_addr,
-            mbi->framebuffer_width,
-            mbi->framebuffer_height,
-            mbi->framebuffer_pitch
+
+extern "C" void cmd_exec(const char* code_text) {
+    if (!code_text) return;
+    TCompiler C;
+    int ok = C.compile(code_text);
+    if (ok < 0) return;
+    for (int i = 0; i < MAX_EXEC_PROCESSES; i++) {
+        if (!exec_contexts[i].active) {
+            exec_contexts[i].active = true;
+            exec_contexts[i].exec_id = i;
+            exec_contexts[i].prog = C.pr;
+            const char* av[] = {"exec", nullptr};
+            exec_contexts[i].vm.start_execution(exec_contexts[i].prog,1,av,0,0,nullptr);
+            return;
+        }
+    }
+}
+// =============================================================================
+// Helper: write a short status string to VGA text mode row 1 (safe at any
+// point in kernel_main, before framebuffer is initialised).
+// =============================================================================
+static void vga_status(const char* msg, uint8_t attr = 0x0F) {
+    volatile uint16_t* vga = (volatile uint16_t*)0xB8000;
+    vga += 80; // row 1
+    for (int i = 0; i < 78 && msg[i]; i++)
+        vga[i] = (uint16_t)((uint16_t)(attr << 8) | (uint8_t)msg[i]);
+}
+
+// =============================================================================
+// Framebuffer probe — four strategies, always returns something safe.
+// =============================================================================
+static void probe_framebuffer(multiboot_info* mbi,
+                              uint32_t& fb_phys,
+                              uint32_t& fb_w,
+                              uint32_t& fb_h,
+                              uint32_t& fb_pitch)
+{
+    fb_phys  = 0;
+    fb_w     = 1024;
+    fb_h     = 768;
+    fb_pitch = 1024 * 4;
+
+    // Strategy 1: GRUB filled framebuffer fields (our boot.S requests this
+    // via MB_FLAGS bit 2).  This is the normal path on QEMU + GRUB 2.
+    if (mbi->flags & (1u << 12)) {
+        uint32_t addr = (uint32_t)(uintptr_t)mbi->framebuffer_addr;
+        if (addr >= 0x1000000u) {
+            fb_phys  = addr;
+            fb_w     = mbi->framebuffer_width;
+            fb_h     = mbi->framebuffer_height;
+            fb_pitch = mbi->framebuffer_pitch;
+            if (fb_w  > 1024) { fb_w  = 1024; fb_pitch = 1024*4; }
+            if (fb_h  > 768)  { fb_h  = 768; }
+            return;
+        }
+    }
+
+    // Strategy 2: Bochs VBE ports (QEMU -vga std).
+    {
+        auto vbe_out = [](uint16_t idx, uint16_t val) {
+            asm volatile("outw %0,%1" :: "a"(idx), "d"((uint16_t)0x01CE));
+            asm volatile("outw %0,%1" :: "a"(val), "d"((uint16_t)0x01CF));
         };
-    } else {
-        // Fallback: probe PCI for the VGA/display adapter framebuffer BAR.
-        // QEMU -vga std exposes a Bochs VBE-compatible device (1234:1111)
-        // whose BAR0 is the linear framebuffer.  Other common VGA BARs are
-        // also tried.  If none found, use the legacy VGA text-mode region as
-        // a safe no-op address (writes ignored, reads return 0).
-        uint32_t fb_phys = 0;
-        for (uint16_t bus = 0; bus < 8 && !fb_phys; bus++) {
-            for (uint8_t dev = 0; dev < 32 && !fb_phys; dev++) {
-                uint32_t vid_did = pci_read_config_dword(bus, dev, 0, 0);
-                if ((vid_did & 0xFFFF) == 0xFFFF) continue;
-                uint32_t class_rev = pci_read_config_dword(bus, dev, 0, 0x08);
-                uint32_t dev_class = class_rev >> 16;
-                // Display controller (0x03xx) or Bochs VBE (1234:1111)
-                bool is_display = (dev_class == 0x0300 || dev_class == 0x0380);
-                bool is_bochs   = (vid_did == 0x11111234);
-                if (is_display || is_bochs) {
-                    // Try BARs 0..1 for a memory BAR >= 1 MB
-                    for (int bar = 0; bar < 2 && !fb_phys; bar++) {
-                        uint32_t bar_val = pci_read_config_dword(bus, dev, 0, 0x10 + bar*4);
-                        if (bar_val & 1) continue;     // I/O BAR
-                        uint32_t addr = bar_val & 0xFFFFFFF0;
-                        if (addr >= 0x1000000) fb_phys = addr;  // >= 16 MB PA
+        auto vbe_in = [](uint16_t idx) -> uint16_t {
+            uint16_t v;
+            asm volatile("outw %0,%1" :: "a"(idx), "d"((uint16_t)0x01CE));
+            asm volatile("inw %1,%0"  : "=a"(v)   : "d"((uint16_t)0x01CF));
+            return v;
+        };
+        vbe_out(0x04, 0x00);
+        uint16_t id = vbe_in(0x00);
+        if (id >= 0xB0C0) {
+            vbe_out(0x01, 1024);
+            vbe_out(0x02, 768);
+            vbe_out(0x03, 32);
+            vbe_out(0x05, 1024);
+            vbe_out(0x06, 768);
+            vbe_out(0x07, 0);
+            vbe_out(0x08, 0);
+            vbe_out(0x04, 0x41); // ENABLE | LFB_ENABLED
+            for (uint16_t bus = 0; bus < 8 && !fb_phys; bus++) {
+                for (uint8_t dev = 0; dev < 32 && !fb_phys; dev++) {
+                    uint32_t vd = pci_read_config_dword(bus, dev, 0, 0x00);
+                    if ((vd & 0xFFFF) == 0xFFFF) continue;
+                    bool is_bochs   = (vd == 0x11111234u);
+                    uint32_t cc     = pci_read_config_dword(bus, dev, 0, 0x08) >> 16;
+                    bool is_display = (cc == 0x0300 || cc == 0x0380);
+                    if (!is_bochs && !is_display) continue;
+                    for (int b = 0; b < 3 && !fb_phys; b++) {
+                        uint32_t bar = pci_read_config_dword(bus, dev, 0, 0x10 + b*4);
+                        if (bar & 1) continue;
+                        uint32_t addr = bar & 0xFFFFFFF0u;
+                        if (addr >= 0x1000000u) fb_phys = addr;
                     }
                 }
             }
+            if (fb_phys) return;
         }
-        if (!fb_phys) {
-            // Last resort: QEMU standard address for Bochs VBE framebuffer
-            fb_phys = 0xFD000000;
-        }
-        fb_info = { (uint32_t*)(uintptr_t)fb_phys, 1024, 768, 1024 * 4 };
     }
-    
-    /* backbuffer is the static backbuffer_storage[1024*768] array in BSS. */
-    /* Cap fb dimensions to the buffer size to prevent out-of-bounds writes. */
-    if (fb_info.width  > 1024) fb_info.width  = 1024;
-    if (fb_info.height > 768)  fb_info.height = 768;
+
+    // Strategy 3: VMware SVGA II (vendor 0x15AD).
+    for (uint16_t bus = 0; bus < 8 && !fb_phys; bus++) {
+        for (uint8_t dev = 0; dev < 32 && !fb_phys; dev++) {
+            uint32_t vd = pci_read_config_dword(bus, dev, 0, 0x00);
+            if ((vd & 0xFFFF) != 0x15AD) continue;
+            for (int b = 0; b < 3 && !fb_phys; b++) {
+                uint32_t bar = pci_read_config_dword(bus, dev, 0, 0x10 + b*4);
+                if (bar & 1) continue;
+                uint32_t addr = bar & 0xFFFFFFF0u;
+                if (addr >= 0x1000000u) fb_phys = addr;
+            }
+        }
+    }
+    if (fb_phys) return;
+
+    // Strategy 4: hardcoded QEMU Bochs VGA default.
+    fb_phys = 0xFD000000u;
+}
+
+// =============================================================================
+// kernel_main
+// =============================================================================
+extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
+
+    // ── Early VGA marker ─────────────────────────────────────────────────────
+    vga_status("kernel_main entered", 0x0A);
+
+    // ── Verify multiboot magic ────────────────────────────────────────────────
+    if (magic != 0x2BADB002u) {
+        //vga_status("BAD MULTIBOOT MAGIC - halting", 0x4F);
+        //for (;;) asm volatile("cli; hlt");
+    }
+
+    // ── Initialise heap (must come before any new/delete) ────────────────────
+    g_allocator.init(kernel_heap, sizeof(kernel_heap));
+    vga_status("Heap OK (8 MB)", 0x0A);
+
+    // ── Probe framebuffer ─────────────────────────────────────────────────────
+    multiboot_info* mbi = (multiboot_info*)multiboot_addr;
+    {
+        uint32_t fb_phys = 0, fb_w = 1024, fb_h = 768, fb_pitch = 1024*4;
+        probe_framebuffer(mbi, fb_phys, fb_w, fb_h, fb_pitch);
+        fb_info = { (uint32_t*)(uintptr_t)fb_phys, fb_w, fb_h, fb_pitch };
+    }
+    if (fb_info.width  > 1024) { fb_info.width  = 1024; fb_info.pitch = 1024*4; }
+    if (fb_info.height > 768)  { fb_info.height = 768; }
     backbuffer = backbuffer_storage;
-    
     g_gfx.init(false);
-    launch_new_terminal();
-    /* USB legacy support is handled inside initialize_universal_mouse() */
+    vga_status("Framebuffer probed", 0x0A);
 
-    /* PS/2 controller init: flush output buffer only.
-       Do NOT send 0xFF (reset) to 0x64 – on many QEMU configs this
-       triggers a system reset via the keyboard controller. */
+    // ── First paint: blue screen proves framebuffer address is valid ──────────
+    g_gfx.clear_screen(ColorPalette::DESKTOP_BLUE);
+    swap_buffers();
+    vga_status("Screen cleared", 0x0A);
+
+    // ── Open first terminal window ────────────────────────────────────────────
+    launch_new_terminal();
+
+    // ── PS/2 mouse ────────────────────────────────────────────────────────────
     ps2_flush_output_buffer();
-    
     if (initialize_universal_mouse()) {
-        wm.print_to_focused("Universal mouse driver initialized.\n");
+        wm.print_to_focused("Mouse: initialised.\n");
     } else {
-        wm.print_to_focused("WARNING: Mouse initialization failed.\n");
+        wm.print_to_focused("Mouse: init failed (keyboard-only mode).\n");
     }
 
-    // Replace the block after disk_init():
-	disk_init();
-	if (ahci_base) {
-		// Read BPB raw (fat32_init disables crypto for sector 0 itself now)
-		fat32_init();
-		wm.print_to_focused("AHCI disk found.\n");
-	} else {
-		wm.print_to_focused("AHCI disk NOT found.\n");
-	}
+    // ── AHCI disk + FAT32 ─────────────────────────────────────────────────────
+    disk_init();
+    if (ahci_base) {
+        fat32_init();
+        wm.print_to_focused("Disk: AHCI found.\n");
+    } else {
+        wm.print_to_focused("Disk: no AHCI controller.\n");
+    }
+    if (current_directory_cluster) {
+        wm.load_desktop_items();
+        if (extract_busybox_to_filesystem())
+            wm.print_to_focused("BusyBox: saved to FAT32.\n");
+        else
+            wm.print_to_focused("BusyBox: ramdisk empty or write failed.\n");
+    } else {
+        wm.print_to_focused("FAT32: not initialised.\n");
+    }
 
-	if (current_directory_cluster) {
-		wm.load_desktop_items();
-		// Save BusyBox from the embedded ramdisk to FAT32 so the shell
-		// can execute it by filename (e.g. "busybox", "busybox ls").
-		if (extract_busybox_to_filesystem()) {
-			wm.print_to_focused("BusyBox saved to filesystem.\n");
-		} else {
-			wm.print_to_focused("BusyBox: ramdisk empty or FS write failed.\n");
-		}
-	} else {
-		wm.print_to_focused("FAT32 init failed.\n");
-	}
-    /* PIT not programmed – g_timer_ticks is driven by the poll_counter
-       in the main loop.  Programming the PIT causes IRQ0 to fire which,
-       even after PIC remap, we have no handler for beyond the catch-all. */
+    // ── Bochs CPU / ELF subsystem ─────────────────────────────────────────────
+    init_elf_system();
+    vga_status("Init complete - entering main loop", 0x0A);
 
+    // ── Main loop ─────────────────────────────────────────────────────────────
     uint32_t last_paint_tick = 0;
     const uint32_t TICKS_PER_FRAME = 1;
-
     int prev_mouse_x = mouse_x;
     int prev_mouse_y = mouse_y;
-    
-    g_gfx.clear_screen(ColorPalette::DESKTOP_BLUE);
-	init_elf_system();
 
-    // =============================================================================
-    // MAIN LOOP - PERFECT: KEYBOARD + MOUSE CLICKS BOTH WORK
-    // =============================================================================
+    // Force an immediate first render — don't wait 500 poll iterations
+    // for the software timer to tick before the desktop appears.
+    g_evt_timer = true;
+    g_evt_dirty = true;
+
+    // Spinning heartbeat at VGA column 79, row 0 (green)
+    volatile uint16_t* vga_hb = (volatile uint16_t*)(0xB8000 + 2*79);
+    uint32_t hb_counter = 0;
+    const char hb_chars[] = "|/-\\";
+
     for (;;) {
-		tick_elf_processes(100);
-        // **CRITICAL MOUSE FIX #1**: Save mouse state BEFORE polling
-        bool prev_left = mouse_left_down;
+        if (++hb_counter % 10000 == 0)
+            *vga_hb = (uint16_t)(0x0A00u | (uint8_t)hb_chars[(hb_counter/10000)%4]);
+
+        tick_elf_processes(100);
+
+        bool prev_left  = mouse_left_down;
         bool prev_right = mouse_right_down;
-		
-        // 1. Poll input (updates mouse_left_down, mouse_right_down, last_key_press)
         poll_input_universal();
 
-		// ===== MAIN LOOP (add to main loop) =====
-        // **CRITICAL MOUSE FIX #2**: Detect clicks using PREVIOUS frame state
-        bool leftClickedThisFrame = (mouse_left_down && !prev_left);
+        bool leftClickedThisFrame  = (mouse_left_down  && !prev_left);
         bool rightClickedThisFrame = (mouse_right_down && !prev_right);
-
-        // 2. Set input flags
         bool mouse_moved = (mouse_x != prev_mouse_x || mouse_y != prev_mouse_y);
         bool key_pressed = (last_key_press != 0);
 
@@ -7201,59 +7316,48 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
             prev_mouse_y = mouse_y;
         }
 
-        // 2b. Route keystrokes to the active ELF process if one is running.
-        // The terminal's captured_elf_slot holds the slot index while a
-        // guest process owns the input focus.
+        // Route keypresses to any active ELF guest process
         if (last_key_press != 0) {
-            // Find the focused terminal and check if it has an ELF running
             Window* focused_win = (wm.get_focused_idx() >= 0)
                 ? wm.get_window(wm.get_focused_idx()) : nullptr;
-            // We can't dynamic_cast without RTTI; use the global elf_processes
-            // table to check all active processes for a terminal match.
             for (int _s = 0; _s < MAXelf_processes; _s++) {
-                if (elf_processes[_s].active && !elf_processes[_s].completed
+                if (elf_processes[_s].active
+                    && !elf_processes[_s].completed
                     && elf_processes[_s].terminal != nullptr
                     && (Window*)elf_processes[_s].terminal == focused_win) {
-                    // Push the key into the guest's input ring buffer
                     push_input(_s, last_key_press);
-                    // Wake the process if it was waiting
                     elf_processes[_s].waiting_for_input = false;
-                    last_key_press = 0;  // consumed by guest
+                    last_key_press = 0;
                     break;
                 }
             }
         }
 
-        // 3. Timer
+        // Software timer (no PIT — IRQ0 would fire into an unhandled vector)
         static uint32_t poll_counter = 0;
         if (++poll_counter >= 500) {
-            poll_counter = 0;
-            g_evt_timer = true;
+            poll_counter  = 0;
+            g_evt_timer   = true;
             g_timer_ticks++;
         }
 
-        // 4. Handle input with proper isolation
-		if (g_evt_input) {
-			g_evt_input = false;
-			
-	
-			wm.handle_input(last_key_press, mouse_x, mouse_y, 
-							   mouse_left_down, leftClickedThisFrame, rightClickedThisFrame);
-			
-			
-			if (last_key_press != 0) last_key_press = 0;
-			g_evt_dirty = true;
-		}
+        if (g_evt_input) {
+            g_evt_input = false;
+            wm.handle_input(last_key_press, mouse_x, mouse_y,
+                            mouse_left_down,
+                            leftClickedThisFrame,
+                            rightClickedThisFrame);
+            if (last_key_press != 0) last_key_press = 0;
+            g_evt_dirty = true;
+        }
 
         wm.cleanup_closed_windows();
 
-        // 5. Render
         if (g_evt_timer && (g_timer_ticks - last_paint_tick) >= TICKS_PER_FRAME) {
             if (g_evt_dirty || g_input_state.hasNewInput) {
-                last_paint_tick = g_timer_ticks;
-                g_evt_dirty = false;
+                last_paint_tick           = g_timer_ticks;
+                g_evt_dirty               = false;
                 g_input_state.hasNewInput = false;
-
                 g_gfx.clear_screen(ColorPalette::DESKTOP_BLUE);
                 wm.update_all();
                 draw_cursor(mouse_x, mouse_y, ColorPalette::CURSOR_WHITE);
