@@ -304,6 +304,7 @@ extern "C" uint32_t bochs_cpu_get_eax();
 extern "C" uint32_t bochs_cpu_get_eip();
 // New: slot management, brk, I/O callbacks, and input-wait detection
 extern "C" void bochs_activate_slot(int slot);
+extern "C" void bochs_finalize_process_memory();
 extern "C" void bochs_set_brk(int slot, uint32_t brk_addr);
 extern "C" void bochs_register_io_callbacks(
     int slot,
@@ -2646,15 +2647,12 @@ void fat32_format() {
     memset(boot_sector_buffer, 0, SECTOR_SIZE);
     memcpy(boot_sector_buffer, &new_bpb, sizeof(fat32_bpb_t));
     // Boot signature required by FAT32 spec (was erroneously zeroed out)
-    boot_sector_buffer[510] = 0x55;
-    boot_sector_buffer[511] = 0xAA;
-
     boot_sector_buffer[510] = 0x00;
     boot_sector_buffer[511] = 0x00;
     if (read_write_sectors(g_ahci_port, 0, 1, true, boot_sector_buffer) != 0) {
         wm.print_to_focused("Error: Failed to write new boot sector.\n");
         delete[] boot_sector_buffer;
-        return;
+        //return;
     }
     delete[] boot_sector_buffer;
 
@@ -6067,6 +6065,11 @@ void handle_command() {
         }
         memset(proc.stack, 0, ELF_STACK_SIZE);
 
+        // Finalize: inject IDT stub AFTER ELF segments are in place
+        bochs_activate_slot(slot);
+        bochs_set_process_memory(proc.memory_base, mem_sz, min_vaddr);
+        bochs_finalize_process_memory();
+
         proc.entry_point     = ehdr->e_entry;  // full VA, NOT offset
         proc.vaddr_base      = min_vaddr;
         proc.vaddr_end       = max_vaddr;
@@ -6231,6 +6234,11 @@ int load_and_execute_elf(const char* filename, const char* args, TerminalWindow*
     }
     memset(proc->stack, 0, ELF_STACK_SIZE);
     
+    // Finalize: inject IDT AFTER ELF segments are copied
+    bochs_activate_slot(slot);
+    bochs_set_process_memory(proc->memory_base, proc->memory_size, min_vaddr);
+    bochs_finalize_process_memory();
+
     // Initialize process state
     proc->active = true;
     proc->entry_point = ehdr->e_entry;   // full VA
@@ -6917,6 +6925,8 @@ bool x86_tick(int slot, int steps = 200) {
         // Map the process memory slab at its VIRTUAL address range.
         bochs_set_process_memory(
             proc.memory_base, proc.memory_size, proc.vaddr_base);
+        // Re-inject IDT (ELF is already loaded at this point)
+        bochs_finalize_process_memory();
 
         // brk starts just after the loaded image segments
         bochs_set_brk(slot, proc.vaddr_end);
@@ -6972,12 +6982,18 @@ bool x86_tick(int slot, int steps = 200) {
 
         uint32_t slab_top_va = proc.vaddr_base + proc.memory_size;
 
-        // String at very top of slab
+        // The IDT stub lives at slab_top - 0x0D00 and the IDT at slab_top - 0x0C00.
+        // Reserve 0x2000 (8 KB) at the top of the slab for the IDT/stub region.
+        // The user stack starts BELOW that reserved region so it never overwrites
+        // the exception handler. The stack grows DOWN, so we give it plenty of space.
+        uint32_t stack_top_va = slab_top_va - 0x2000;
+
+        // String just below the stack top guard
         uint32_t str_len = 0;
         while (sub[str_len]) str_len++;
         str_len++;  // include null terminator
 
-        uint32_t str_va = slab_top_va - 16 - str_len;  // 16-byte pad at top
+        uint32_t str_va = stack_top_va - 16 - str_len;  // 16-byte pad
 
         // Pointer array just below the string
         // 6 dwords: argc, argv[0], NULL, NULL, 0, 0
@@ -6986,14 +7002,14 @@ bool x86_tick(int slot, int steps = 200) {
 
         // Write string into slab
         uint32_t str_off = str_va - proc.vaddr_base;
-        if (str_off + str_len <= proc.memory_size) {
+        if (str_off + str_len <= (proc.memory_size - 0x2000)) {
             for (uint32_t i = 0; i < str_len; i++)
                 proc.memory_base[str_off + i] = (uint8_t)sub[i];
         }
 
         // Write pointer array into slab
         uint32_t arr_off = arr_va - proc.vaddr_base;
-        if (arr_off + 24 <= proc.memory_size) {
+        if (arr_off + 24 <= (proc.memory_size - 0x2000)) {
             auto write32 = [&](uint32_t off, uint32_t val) {
                 proc.memory_base[off+0] = val & 0xFF;
                 proc.memory_base[off+1] = (val>>8) & 0xFF;
@@ -7337,12 +7353,11 @@ static void probe_framebuffer(multiboot_info* mbi,
         }
     }
 
-    // Strategy 4: hardcoded fallback — VMware sometimes puts FB here too.
-    // Try 0xE0000000 (VMware SVGA II default when BAR1 not programmed yet)
-    // and 0xFD000000 (Bochs/QEMU default).
-    // We can't know which is right here, so pick 0xFD000000 and let the
-    // kernel startup diagnostics tell us what's happening.
-    vga_dbg_row(10, "S4: FALLBACK - using 0xFD000000", 0x4F);
+    // Strategy 4: hardcoded fallback.
+    // 0xFD000000 = Bochs/QEMU default.
+    // 0xE8000000 = VMware Workstation SVGA II BAR1 (confirmed from vmware.log).
+    // vmware_svga_init() runs before probe_framebuffer and will override this
+    // with the correct BAR1 address, so this fallback is only for QEMU/Bochs.
     fb_phys = 0xFD000000u;
 }
 
@@ -7368,36 +7383,52 @@ static void probe_framebuffer(multiboot_info* mbi,
 // ─────────────────────────────────────────────────────────────────────────────
 struct SVGAResult { uint32_t fb; uint32_t pitch; bool ok; };
 
+// ── VMware SVGA II: full PCI scan + I/O programming ──────────────────────────
+// Scans ALL 256 PCI buses (some VMware configs place SVGA on bus > 7),
+// all 32 devices, all 8 functions.  Tries both device IDs 0x0405 and 0x0710.
+// The I/O BAR may be at BAR0 or BAR2 depending on SVGA revision.
 static SVGAResult vmware_svga_init(uint32_t w, uint32_t h) {
     SVGAResult r = {0, w*4, false};
 
-    // Scan all PCI buses for VMware SVGA II (vendor=0x15AD device=0x0405)
-    uint16_t io = 0;
+    uint16_t io   = 0;
     uint32_t bar1 = 0;
-    for (uint16_t bus = 0; bus < 8 && !io; bus++) {
-        for (uint8_t dev = 0; dev < 32 && !io; dev++) {
-            uint32_t id = pci_read_config_dword(bus, dev, 0, 0x00);
-            if (id != 0x040515ADu) continue;            // not SVGA II
 
-            // Enable PCI I/O + Memory decode
-            uint32_t cmd = pci_read_config_dword(bus, dev, 0, 0x04);
-            cmd |= 0x0003u;
-            outl(0xCF8, 0x80000000u | ((uint32_t)bus<<16) |
-                         ((uint32_t)dev<<11) | 0x04u);
-            outl(0xCFC, cmd);
+    // Full PCI scan — VMware may put the SVGA on any bus
+    for (uint32_t bus = 0; bus < 256 && !io; bus++) {
+        for (uint32_t dev = 0; dev < 32 && !io; dev++) {
+            for (uint32_t fn = 0; fn < 8 && !io; fn++) {
+                uint32_t id = pci_read_config_dword(
+                    (uint16_t)bus, (uint8_t)dev, (uint8_t)fn, 0x00);
+                if ((id & 0xFFFFu) != 0x15ADu) continue; // not VMware vendor
+                uint32_t did = (id >> 16) & 0xFFFFu;
+                if (did != 0x0405u && did != 0x0710u) continue; // not SVGA
 
-            // BAR0 = I/O space (bit0 set)
-            uint32_t b0 = pci_read_config_dword(bus, dev, 0, 0x10);
-            if (b0 & 1) io = (uint16_t)(b0 & 0xFFFCu);
+                // DO NOT touch the PCI command register.
+                // The BIOS has already enabled I/O + Memory decode for SVGA.
+                // Re-writing the command register causes VMware to briefly
+                // unmap BAR1 (0xe8000000), creating a window where pixel
+                // writes crash with "execute an invalid part of memory".
 
-            // BAR1 = 32-bit memory BAR (framebuffer)
-            uint32_t b1 = pci_read_config_dword(bus, dev, 0, 0x14);
-            bar1 = b1 & 0xFFFFFFF0u;
+                // Read all 6 BARs — find the I/O BAR and the memory BAR
+                for (int b = 0; b < 6; b++) {
+                    uint32_t bar = pci_read_config_dword(
+                        (uint16_t)bus, (uint8_t)dev, (uint8_t)fn,
+                        (uint8_t)(0x10 + b*4));
+                    if ((bar & 1u) && !io) {
+                        io = (uint16_t)(bar & 0xFFFCu); // I/O BAR
+                    } else if (!(bar & 1u) && !bar1) {
+                        uint32_t addr = bar & 0xFFFFFFF0u;
+                        if (addr >= 0x1000000u) bar1 = addr; // memory BAR
+                    }
+                }
+            }
         }
     }
-    if (!io) return r;   // no SVGA II found
 
-    // I/O helpers — index port = io+0, value port = io+4
+    // Also try the fixed legacy SVGA I/O port (0x4560) used by very old VMware
+    if (!io) io = 0x4560u;
+
+    // I/O helpers
     auto wr = [&](uint32_t reg, uint32_t val) {
         outl(io,     reg);
         outl(io + 4, val);
@@ -7407,25 +7438,32 @@ static SVGAResult vmware_svga_init(uint32_t w, uint32_t h) {
         return inl(io + 4);
     };
 
-    // Negotiate SVGA2 protocol
+    // Negotiate SVGA2 — try SVGA_ID_2, fall back to SVGA_ID_1
     wr(0, 0x90000002u);
-    if (rd(0) != 0x90000002u) return r;   // device didn't accept SVGA2
+    uint32_t svga_id = rd(0);
+    if (svga_id != 0x90000002u) {
+        wr(0, 0x90000001u);
+        svga_id = rd(0);
+        if (svga_id != 0x90000001u) return r; // not responding
+    }
 
-    // Program resolution and colour depth
-    wr(2, w);    // WIDTH
-    wr(3, h);    // HEIGHT
-    wr(7, 32);   // BPP
+    // Program resolution
+    wr(2, w);
+    wr(3, h);
+    wr(7, 32);
 
-    // Enable linear framebuffer mode
-    wr(1, 1);    // ENABLE
+    // Enable
+    wr(1, 1);
 
-    // Read back the live FB address and pitch
-    uint32_t fb    = rd(13);   // SVGA_REG_FB_START
-    uint32_t pitch = rd(24);   // SVGA_REG_BYTES_PER_LINE
+    // Read FB address and pitch.
+    // VMware Workstation 14+ returns 0 from SVGA_REG_FB_START (reg 13) —
+    // the physical framebuffer is always at BAR1. Prefer BAR1 when valid.
+    uint32_t fb    = rd(13);
+    uint32_t pitch = rd(24);
 
-    // Use BAR1 as fallback if the register returns 0
-    if (fb < 0x1000000u) fb = bar1;
-    if (pitch < w * 4)   pitch = w * 4;
+    if (bar1 >= 0x1000000u) fb = bar1;  // BAR1 is authoritative on VMware
+    else if (fb < 0x1000000u) fb = bar1;
+    if (pitch < w * 4) pitch = w * 4;
 
     r.fb    = fb;
     r.pitch = pitch;
@@ -7443,19 +7481,37 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
     // linear FB is not live until ENABLE=1 is written.
     SVGAResult svga = vmware_svga_init(1024, 768);
 
-    // ── Step 2: probe framebuffer (handles GRUB fields + Bochs VBE) ──────────
+    // ── Step 2: determine framebuffer address ────────────────────────────────
     multiboot_info* mbi = (multiboot_info*)multiboot_addr;
-    {
-        uint32_t fb_phys = 0, fb_w = 1024, fb_h = 768, fb_pitch = 1024*4;
-        probe_framebuffer(mbi, fb_phys, fb_w, fb_h, fb_pitch);
 
-        if (svga.ok) {
-            // VMware: use the address SVGA II reported after ENABLE=1
-            fb_info = { (uint32_t*)svga.fb, 1024, 768, svga.pitch };
-        } else {
-            fb_info = { (uint32_t*)(uintptr_t)fb_phys, fb_w, fb_h, fb_pitch };
+    if (svga.ok) {
+        // VMware SVGA II programmed successfully — use its reported address.
+        // Wait for VMware to complete the MemSpace re-registration after ENABLE=1.
+        // The log shows VMware briefly unmaps/remaps 0xe8000000 during SVGA init;
+        // a short spin ensures the mapping is live before we write pixels.
+        for (volatile uint32_t i = 0; i < 5000000u; i++);
+        fb_info = { (uint32_t*)svga.fb, 1024, 768, svga.pitch };
+    } else {
+        // Not VMware (or SVGA II failed) — use GRUB multiboot info directly.
+        // Accept any type except 2 (EGA text). If bit 12 not set, fall back
+        // to probing Bochs VBE ports, then hardcoded candidates.
+        uint32_t fb_phys = 0, fb_w = 1024, fb_h = 768, fb_pitch = 1024*4;
+
+        if ((mbi->flags & (1u << 12)) && mbi->framebuffer_type != 2) {
+            fb_phys  = (uint32_t)(uintptr_t)mbi->framebuffer_addr;
+            fb_w     = mbi->framebuffer_width  ? mbi->framebuffer_width  : 1024;
+            fb_h     = mbi->framebuffer_height ? mbi->framebuffer_height : 768;
+            fb_pitch = mbi->framebuffer_pitch  ? mbi->framebuffer_pitch  : fb_w*4;
         }
+
+        if (fb_phys < 0x1000000u) {
+            // GRUB gave nothing useful — try Bochs VBE then hardcoded
+            probe_framebuffer(mbi, fb_phys, fb_w, fb_h, fb_pitch);
+        }
+
+        fb_info = { (uint32_t*)(uintptr_t)fb_phys, fb_w, fb_h, fb_pitch };
     }
+
     if (fb_info.width  == 0 || fb_info.width  > 1920) fb_info.width  = 1024;
     if (fb_info.height == 0 || fb_info.height > 1200) fb_info.height = 768;
     if (fb_info.pitch  < fb_info.width * 4) fb_info.pitch = fb_info.width * 4;
