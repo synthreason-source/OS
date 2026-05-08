@@ -79,8 +79,17 @@ bx_devices_c::bx_devices_c() {
 bx_devices_c::~bx_devices_c() {}
 void bx_devices_c::init_stubs() {}
 
+// Forward decl from bochs_glue.cpp - lets a guest write a byte to the
+// active slot's output buffer by doing `out 0xE9, al`. Useful for tiny
+// test ELFs and for a minimal syscall protocol from the IDT stub.
+extern "C" void bochs_guest_putc(char c);
+
 Bit32u bx_devices_c::inp (Bit16u, unsigned) { return 0xFFFF; }
-void   bx_devices_c::outp(Bit16u, Bit32u, unsigned) {}
+void   bx_devices_c::outp(Bit16u port, Bit32u val, unsigned) {
+    if (port == 0xE9) {
+        bochs_guest_putc((char)(val & 0xFF));
+    }
+}
 
 // ═══ bx_pc_system_c ══════════════════════════════════════════════════════════
 

@@ -50,3 +50,12 @@
 #define BX_INSTR_EXCEPTION(a,b,c)
 #define BX_INSTR_HWINTERRUPT(a,b,c,d)
 #endif
+#ifndef BX_INSTRUMENTATION
+#define BX_INSTRUMENTATION
+extern "C" {
+void bx_instr_interrupt(unsigned, unsigned) {}
+void bx_instr_opcode(unsigned) {}
+void bx_instr_hlt(unsigned) {}
+void bx_instr_mwait(unsigned, unsigned, unsigned) {}
+}
+#endif

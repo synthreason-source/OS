@@ -143,6 +143,8 @@ bool fat32_init();
 // linker label as a single-byte object is undefined behaviour in C++.
 extern "C" uint8_t ramdisk_start[];
 extern "C" uint8_t ramdisk_end[];
+extern "C" uint8_t hello_start[];
+extern "C" uint8_t hello_end[];
 
 bool extract_busybox_to_filesystem() {
     uint8_t* start = ramdisk_start;
@@ -166,6 +168,26 @@ bool extract_busybox_to_filesystem() {
         if (existing.file_size == size) return true;  // already current
     }
     int result = fat32_write_file("busybox", start, size);
+    return (result == 0);
+}
+
+// Write the embedded hello test ELF to FAT32 as "hello".
+// Same shape as extract_busybox_to_filesystem.
+bool extract_hello_to_filesystem() {
+    uint8_t* start = hello_start;
+    uint8_t* end   = hello_end;
+    if (end <= start) return false;
+    uint32_t size  = (uint32_t)(end - start);
+    if (size < 52 || size > 1 * 1024 * 1024) return false;
+    if (start[0] != 0x7f || start[1] != 'E' ||
+        start[2] != 'L'  || start[3] != 'F') return false;
+
+    fat_dir_entry_t existing;
+    uint32_t esec = 0, eoff = 0;
+    if (fat32_find_entry("hello", &existing, &esec, &eoff) == 0) {
+        if (existing.file_size == size) return true;
+    }
+    int result = fat32_write_file("hello", start, size);
     return (result == 0);
 }
 // --- Global Clipboard ---
@@ -5974,7 +5996,7 @@ void handle_command() {
         delete[] args_copy;
     }
 	
-    else if (strcmp(command, "busybox") == 0 || strcmp(command, "bb") == 0) {
+    else if (strcmp(command, "x") == 0 || strcmp(command, "bb") == 0) {
         // Launch BusyBox from the embedded ramdisk (no disk I/O required).
         uint8_t* elf_src = ramdisk_start;
         uint32_t elf_sz  = (uint32_t)(ramdisk_end - ramdisk_start);
@@ -6857,6 +6879,11 @@ struct BochsCPURegs {
     uint32_t eax, ebx, ecx, edx, esi, edi, esp, ebp;
 };
 
+// Forward decls for I/O callback adapters defined just below.
+static int  elf_io_read (int slot);
+static void elf_io_write(int slot, char c);
+static void elf_io_exit (int slot, int code);
+
 // Replace init_elf_system() call in kernel_main with:
 void init_elf_system() {
     for (auto& p : elf_processes) {
@@ -6865,13 +6892,23 @@ void init_elf_system() {
         p.in_head  = p.in_tail  = 0;
         p.out_head = p.out_tail = 0;
     }
+    // Register IO callbacks for every slot. These are what make
+    // port-0xE9 writes from the guest reach the terminal: the chain is
+    //   guest: out 0xE9, al
+    //   -> bx_devices_c::outp (bochs_infra.cpp)
+    //   -> bochs_guest_putc   (bochs_glue.cpp)
+    //   -> write_cb = elf_io_write
+    //   -> push_output(slot, c)
+    //   -> tick_elf_processes drains it to terminal->console_print
+    for (int s = 0; s < MAX_ELF_PROCESSES; ++s) {
+        bochs_register_io_callbacks(s, elf_io_read, elf_io_write, elf_io_exit);
+    }
     // NOTE: bochs_cpu_init() is NOT called here.
     // Calling reset() at startup points the CPU at the BIOS reset vector
     // (0xFFFF0) with no memory mapped, which causes a triple fault and
     // permanently disables the Bochs virtual CPU before any ELF runs.
     // Instead, bochs_cpu_init() is called lazily inside x86_tick on the
-    // very first process launch, immediately before setting EIP to valid
-    // guest code. See the g_bochs_ever_initialized flag in x86_tick.
+    // very first process launch.
 }
 // I/O callback adapters
 static int  elf_io_read (int slot) { return pop_input(slot); }
@@ -7029,12 +7066,38 @@ static bool x86_tick(int slot, int steps) {
     if (!proc.active || proc.completed) return false;
 
     bochs_activate_slot(slot);
+
+    // Lazy first-time wiring. Both load paths (the "bb"/"x" command and
+    // load_and_execute_elf) populate the ElfProcess struct and set
+    // cpu_initialized=false. We finish the wiring on the first tick
+    // because calling bochs_cpu_init() at kernel startup would reset the
+    // virtual CPU before any process exists and triple-fault it.
+    if (!proc.cpu_initialized) {
+        if (!proc.memory_base || proc.memory_size == 0) {
+            proc.active    = false;
+            proc.completed = true;
+            return false;
+        }
+        // Re-register the slab. The "bb" path already did this; the disk
+        // load path (load_and_execute_elf) did not. The glue unregisters
+        // any previous mapping for the slot first, so this is idempotent.
+        bochs_set_process_memory(proc.memory_base, proc.memory_size,
+                                 proc.vaddr_base);
+        // Hardware reset, enter protected mode, then point CPU at guest.
+        bochs_cpu_init();
+        bochs_cpu_set_esp(proc.esp);
+        bochs_cpu_set_eip(proc.entry_point);   // sets g_cpu_ready=true
+        bochs_set_brk(slot, proc.vaddr_base + proc.memory_size - ELFHEAPSIZE);
+        proc.cpu_initialized = true;
+    }
+
     bochs_cpu_tick(steps);
 
     unsigned int eip = bochs_cpu_get_eip();
-    if (eip == 0 || eip < proc.vaddr_base) {
+    if (eip == 0 || eip < proc.vaddr_base ||
+        eip >= proc.vaddr_base + proc.memory_size) {
         proc.completed = true;
-        proc.active = false;
+        proc.active    = false;
         return false;
     }
 
@@ -7511,6 +7574,8 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
             wm.print_to_focused("BusyBox: saved to FAT32.\n");
         else
             wm.print_to_focused("BusyBox: ramdisk empty or write failed.\n");
+        if (extract_hello_to_filesystem())
+            wm.print_to_focused("hello: saved to FAT32.\n");
     } else {
         wm.print_to_focused("FAT32: not initialised.\n");
     }
@@ -7540,7 +7605,8 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
         if (++hb_counter % 10000 == 0)
             *vga_hb = (uint16_t)(0x0A00u | (uint8_t)hb_chars[(hb_counter/10000)%4]);
 
-        
+        tick_elf_processes(1);
+
 
         bool prev_left  = mouse_left_down;
         bool prev_right = mouse_right_down;
@@ -7594,7 +7660,6 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
                 last_paint_tick           = g_timer_ticks;
                 g_evt_dirty               = false;
                 g_input_state.hasNewInput = false;
-				tick_elf_processes(100);
                 g_gfx.clear_screen(ColorPalette::DESKTOP_BLUE);
                 wm.update_all();
                 draw_cursor(mouse_x, mouse_y, ColorPalette::CURSOR_WHITE);

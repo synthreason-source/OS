@@ -106,6 +106,45 @@ static void inject_idt_into_slab(SlotState& s) {
     __builtin_memcpy(s.mem_base + 0x000, stub, sizeof(stub));
     s.mem_base[sizeof(stub)] = 0xF4;
 
+    // ── GDT at slab offset 0x80 ──────────────────────────────────────────
+    // Three flat descriptors matching the segment selectors used by
+    // bochs_cpu_enter_protected_mode():
+    //   selector 0x00 — null
+    //   selector 0x08 — ring-0 code, base=0, limit=4G, 32-bit, executable
+    //   selector 0x10 — ring-0 data, base=0, limit=4G, 32-bit, writable
+    //
+    // Without a real GDT loaded into gdtr, any guest segment-register
+    // reload (e.g. busybox's "mov $0x10, %ds") triggers Bochs to walk an
+    // empty GDT and raise #GP, which then triple-faults via our IDT stub.
+    Bit8u* gdt_base = s.mem_base + 0x80;
+    __builtin_memset(gdt_base, 0, 8);                  // null descriptor
+
+    // Code segment (selector 0x08): type=0x9A, S=1, P=1, DPL=0,
+    // G=1 (4K granularity), D=1 (32-bit), limit=0xFFFFF.
+    Bit8u code_desc[8] = {
+        0xFF, 0xFF,        /* limit 15:0 = 0xFFFF */
+        0x00, 0x00, 0x00,  /* base 23:0 = 0 */
+        0x9A,              /* access: P=1 DPL=0 S=1 type=execute/read */
+        0xCF,              /* flags: G=1 D=1 limit 19:16 = 0xF */
+        0x00               /* base 31:24 = 0 */
+    };
+    __builtin_memcpy(gdt_base + 8, code_desc, 8);
+
+    // Data segment (selector 0x10): type=0x92 (read/write).
+    Bit8u data_desc[8] = {
+        0xFF, 0xFF,
+        0x00, 0x00, 0x00,
+        0x92,
+        0xCF,
+        0x00
+    };
+    __builtin_memcpy(gdt_base + 16, data_desc, 8);
+
+    Bit32u gdt_va = s.vaddr_base + 0x80;
+    BX_CPU(0)->gdtr.base  = gdt_va;
+    BX_CPU(0)->gdtr.limit = 24 - 1;   // 3 descriptors
+
+    // ── IDT at slab offset 0x100 (unchanged) ─────────────────────────────
     Bit32u handler_va = s.vaddr_base + 0x000;
     Bit8u* idt_base = s.mem_base + 0x100;
     Bit32u idt_va = s.vaddr_base + 0x100;
@@ -126,6 +165,15 @@ static void inject_idt_into_slab(SlotState& s) {
 
     BX_CPU(0)->idtr.base = idt_va;
     BX_CPU(0)->idtr.limit = 256 * 8 - 1;
+}
+
+// Called from bx_devices_c::outp when the guest writes port 0xE9.
+// Forwards the byte to the active slot's output ring buffer via the
+// kernel-supplied write_cb.
+extern "C" void bochs_guest_putc(char c) {
+    if (g_active_slot < 0 || g_active_slot >= MAX_BOCHS_SLOTS) return;
+    SlotState& s = g_slots[g_active_slot];
+    if (s.write_cb) s.write_cb(g_active_slot, c);
 }
 
 extern "C" void bochs_register_io_callbacks(

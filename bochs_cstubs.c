@@ -102,35 +102,8 @@ int close(int fd){(void)fd;return 0;}
 /* ── bochs-specific globals ───────────────────────────────────────────────── */
 int simulate_xapic = 0;
 
-/* _setjmp and __longjmp_chk: bochs cpu_loop uses these for exception handling.
-   We provide real implementations so bochs can use them at runtime. */
-
-/* jmp_buf layout for i386: eip, esp, ebp, ebx, esi, edi + padding */
-typedef unsigned int jmp_buf_i386[8];
-
-int _setjmp(jmp_buf_i386 env) {
-    unsigned int eip_ret, esp_ret;
-    __asm__ volatile(
-        "movl %%esp, %0\n"
-        "movl $0, %%eax\n"
-        : "=m"(env[1]), "=a"(eip_ret)
-        :
-        : "memory"
-    );
-    /* Store caller's return address as the saved EIP */
-    env[0] = (unsigned int)__builtin_return_address(0);
-    env[2] = (unsigned int)__builtin_frame_address(0);
-    return 0;
-}
-
-/* longjmp halts — in bochs this is only called on fatal CPU exceptions
-   (double fault, triple fault) which should terminate the process anyway. */
-void __longjmp_chk(jmp_buf_i386 env, int val) {
-    (void)env; (void)val;
-    /* The calling process should be killed; halt the bochs CPU path */
-    __asm__ volatile("cli; hlt");
-    __builtin_unreachable();
-}
+/* _setjmp / longjmp / __longjmp_chk are now provided by setjmp.S
+   in pure assembly to avoid any compiler-introduced frame issues. */
 
 /* pthread_mutex_destroy - called by iofunctions dtor (which we never trigger) */
 int pthread_mutex_destroy(int* m) { (void)m; return 0; }

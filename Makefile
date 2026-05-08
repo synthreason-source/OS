@@ -135,6 +135,30 @@ ramdisk.o: $(BUSYBOX_BIN)
 	    $(BUSYBOX_BIN) $@
 	@echo ">>> ramdisk.o created."
 
+# Tiny test ELF that prints "HELLO\n" via port 0xE9 and halts.
+# Used to verify the GDT/IDT/port-IO chain end-to-end without dragging
+# in busybox's full Linux ABI requirements.
+hello: hello.c
+	@echo ">>> Building hello test ELF..."
+	gcc -m32 -nostdlib -nostartfiles -static -fno-pie -no-pie \
+	    -Wl,-Ttext=0x08048000 \
+	    -o $@ hello.c
+	@echo ">>> hello built."
+
+# Embed the hello ELF as a second blob with its own symbols.
+hello_blob.o: hello
+	@echo ">>> Embedding hello into hello_blob.o..."
+	objcopy \
+	    -I binary \
+	    -O elf32-i386 \
+	    -B i386 \
+	    --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	    --redefine-sym _binary_hello_start=hello_start \
+	    --redefine-sym _binary_hello_end=hello_end   \
+	    --redefine-sym _binary_hello_size=hello_size  \
+	    hello $@
+	@echo ">>> hello_blob.o created."
+
 # ============================================================
 #  Bochs CPU emulation: ON by default (set BOCHS=0 to disable)
 #  bochs_infra.o provides all Bochs infrastructure globals
@@ -143,7 +167,7 @@ ramdisk.o: $(BUSYBOX_BIN)
 BOCHS ?= 1
 
 ifeq ($(BOCHS),1)
-BOCHS_OBJ    := bochs_glue.o bochs_infra.o bochs_paramtree.o bochs_pc_system.o bochs_cstubs.o
+BOCHS_OBJ    := bochs_glue.o bochs_infra.o bochs_paramtree.o bochs_pc_system.o bochs_cstubs.o setjmp.o
 BOCHS_LIBS   := $(BOCHS_DIR)/cpu/libcpu.a \
                 $(BOCHS_DIR)/cpu/fpu/libfpu.a \
                 $(BOCHS_DIR)/cpu/cpudb/libcpudb.a \
@@ -207,14 +231,20 @@ bochs_cstubs.o: bochs_cstubs.c
 	gcc -m32 -O2 -ffreestanding -fno-pie -fno-pic \
 	    -c bochs_cstubs.c -o bochs_cstubs.o
 
+# setjmp.o — pure-asm i386 setjmp/longjmp/__longjmp_chk matching glibc layout.
+# Required by libcpu.a (Bochs' internal exception unwinding) and by
+# bochs_glue.cpp's rescue path.
+setjmp.o: setjmp.S
+	as --32 setjmp.S -o setjmp.o
+
 # ============================================================
 #  Link
 # ============================================================
-$(MULTIBOOT): boot.o kernel.o ramdisk.o $(BOCHS_OBJ) $(BOCHS_DEP)
+$(MULTIBOOT): boot.o kernel.o ramdisk.o hello_blob.o $(BOCHS_OBJ) $(BOCHS_DEP)
 	mkdir -p iso/boot
 	g++ -m32 -T linker.ld -nostdlib -no-pie -static \
 	    -o $(MULTIBOOT)              \
-	    boot.o kernel.o ramdisk.o $(BOCHS_OBJ) \
+	    boot.o kernel.o ramdisk.o hello_blob.o $(BOCHS_OBJ) \
 	    $(BOCHS_LIBS)                \
 	    -lgcc $(LIBGCC_EH)           \
 	    -Wl,--allow-multiple-definition
