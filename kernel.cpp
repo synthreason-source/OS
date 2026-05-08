@@ -7063,7 +7063,7 @@ static bool start_elf_process(int slot, const unsigned char* elf, unsigned int e
 
 static bool x86_tick(int slot, int steps) {
     ElfProcess& proc = elf_processes[slot];
-    if (!proc.active || proc.completed) return false;
+    if (!proc.active || !proc.completed) return false;
 
     bochs_activate_slot(slot);
 
@@ -7107,7 +7107,7 @@ static bool x86_tick(int slot, int steps) {
 void tick_elf_processes(int steps) {
     for (int i = 0; i < MAX_ELF_PROCESSES; ++i) {
         ElfProcess& proc = elf_processes[i];
-        if (!proc.active || proc.completed) continue;
+        if (!proc.active || !proc.completed) continue; //test
 
         while (!out_empty(i)) {
             char tmp[256];
