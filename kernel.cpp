@@ -7576,7 +7576,7 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
         if (++hb_counter % 10000 == 0)
             *vga_hb = (uint16_t)(0x0A00u | (uint8_t)hb_chars[(hb_counter/10000)%4]);
 
-        tick_elf_processes(100);
+        //tick_elf_processes(1); //fix me
 
         bool prev_left  = mouse_left_down;
         bool prev_right = mouse_right_down;
