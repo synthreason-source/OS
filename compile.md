@@ -1,6 +1,6 @@
 sudo apt update
 
-sudo apt install make gcc-multilib gcc gcc-multilib binutils grub-common xorriso qemu-system-x86 build-essential nasm gcc binutils qemu-system-x86 xorriso grub-pc-bin mtools g++-multilib libncurses-dev bison flex git bc libssl-dev xorg-dev libx11-dev
+sudo apt install make gcc-multilib gcc gcc-13 binutils grub-common xorriso qemu-system-x86 build-essential nasm gcc binutils qemu-system-x86 xorriso grub-pc-bin mtools g++-multilib libncurses-dev bison flex git bc libssl-dev xorg-dev libx11-dev
 
 # 1 Kernel Build
 
