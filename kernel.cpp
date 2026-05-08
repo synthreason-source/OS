@@ -5996,7 +5996,7 @@ void handle_command() {
         delete[] args_copy;
     }
 	
-    else if (strcmp(command, "x") == 0 || strcmp(command, "bb") == 0) {
+    else if (strcmp(command, "busybox") == 0 || strcmp(command, "bb") == 0) {
         // Launch BusyBox from the embedded ramdisk (no disk I/O required).
         uint8_t* elf_src = ramdisk_start;
         uint32_t elf_sz  = (uint32_t)(ramdisk_end - ramdisk_start);
@@ -6126,28 +6126,6 @@ void handle_command() {
         console_print(buf); 
     }
     else if (strcmp(command, "version") == 0) { console_print("RTOS++ v1.0 - Robust Parsing\n"); }
-    else if (strlen(command) > 0) {
-        // Try to execute the command as a filename stored on the FAT32
-        // filesystem (e.g. typing "busybox" directly, or any ELF binary
-        // that was written to the disk).
-        fat_dir_entry_t fentry;
-        uint32_t fsec = 0, foff = 0;
-        if (fat32_find_entry(command, &fentry, &fsec, &foff) == 0) {
-            // File exists on disk – load and run it as a 32-bit ELF.
-            int slot = load_and_execute_elf(command, args, this);
-            if (slot >= 0) {
-                captured_elf_slot = slot;
-            } else {
-                console_print("Exec failed: ");
-                console_print(command);
-                console_print("\n");
-            }
-        } else {
-            console_print("Unknown command: ");
-            console_print(command);
-            console_print("\n");
-        }
-    }
     
     if(!in_editor) print_prompt();
 }
@@ -7610,10 +7588,11 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
     static uint32_t poll_counter = 0;
 
     for (;;) {
-        if (++hb_counter % 10000 == 0)
+        if (++hb_counter % 10000 == 0) {
             *vga_hb = (uint16_t)(0x0A00u | (uint8_t)hb_chars[(hb_counter/10000)%4]);
 
-        tick_elf_processes(1);
+			tick_elf_processes(1);
+		}
 
 
         bool prev_left  = mouse_left_down;
