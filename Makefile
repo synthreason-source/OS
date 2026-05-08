@@ -49,7 +49,7 @@ run: $(MAIN) $(DISK_IMG)
 	qemu-system-i386 \
 	    -M q35 \
 	    -cdrom $(MAIN) -boot d \
-	    -m 256M \
+	    -m 8000M \
 	    -vga std \
 	    -drive id=disk0,file=$(DISK_IMG),format=raw,if=none \
 	    -device ahci,id=ahci \
