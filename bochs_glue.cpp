@@ -381,7 +381,11 @@ extern "C" void bochs_set_process_memory(Bit8u* base, Bit32u size, Bit32u vaddr_
         inject_idt_into_slab(s);
     }
 }
-
+extern "C" void bochs_finalize_process_memory() {
+  // Placeholder: injects IDT/handler stub or finalizes guest slab setup.
+  // Currently a no-op; extend if needed for custom logic (e.g., cache flush).
+  // Matches kernel.cpp usage after ELF PTLOAD copy and before bochs_set_brk().
+}
 extern "C" void bochs_set_brk(int slot, Bit32u brk_addr)
 {
     if (slot < 0 || slot >= MAX_BOCHS_SLOTS) return;
