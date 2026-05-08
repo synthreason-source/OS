@@ -5974,7 +5974,7 @@ void handle_command() {
         delete[] args_copy;
     }
 	
-    else if (strcmp(command, "x") == 0 || strcmp(command, "bb") == 0) {
+    else if (strcmp(command, "busybox") == 0 || strcmp(command, "bb") == 0) {
         // Launch BusyBox from the embedded ramdisk (no disk I/O required).
         uint8_t* elf_src = ramdisk_start;
         uint32_t elf_sz  = (uint32_t)(ramdisk_end - ramdisk_start);
