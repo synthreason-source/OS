@@ -5972,7 +5972,7 @@ void handle_command() {
         delete[] args_copy;
     }
 	
-    else if (strcmp(command, "busybox") == 0 || strcmp(command, "bb") == 0) {
+    else if (strcmp(command, "busybox_command") == 0 || strcmp(command, "bb") == 0) {
         // Launch BusyBox from the embedded ramdisk (no disk I/O required).
         uint8_t* elf_src = ramdisk_start;
         uint32_t elf_sz  = (uint32_t)(ramdisk_end - ramdisk_start);
@@ -7079,7 +7079,7 @@ void tick_elf_processes(int steps) {
             if (n) {
                 proc.terminal->console_print(tmp);
                 // Mark screen dirty so output appears immediately
-                mark_screen_dirty();
+                //mark_screen_dirty();
             }
         }
 
@@ -7576,7 +7576,7 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
         if (++hb_counter % 10000 == 0)
             *vga_hb = (uint16_t)(0x0A00u | (uint8_t)hb_chars[(hb_counter/10000)%4]);
 
-        //tick_elf_processes(1); //fix me
+        //tick_elf_processes(100); fix me
 
         bool prev_left  = mouse_left_down;
         bool prev_right = mouse_right_down;
