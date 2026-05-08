@@ -7063,7 +7063,11 @@ static bool start_elf_process(int slot, const unsigned char* elf, unsigned int e
 
 static bool x86_tick(int slot, int steps) {
     ElfProcess& proc = elf_processes[slot];
-    if (!proc.active || !proc.completed) return false;
+    // Tick a process that is alive: active and NOT yet completed.
+    // The previous form (`!proc.active || !proc.completed`) was inverted —
+    // it returned for every live process, so the guest never advanced and
+    // its port-0xE9 output never reached the terminal display.
+    if (!proc.active || proc.completed) return false;
 
     bochs_activate_slot(slot);
 
@@ -7107,7 +7111,11 @@ static bool x86_tick(int slot, int steps) {
 void tick_elf_processes(int steps) {
     for (int i = 0; i < MAX_ELF_PROCESSES; ++i) {
         ElfProcess& proc = elf_processes[i];
-        if (!proc.active || !proc.completed) continue; //test
+        // Drain output and step a process that is alive: active and not
+        // completed. Inverting this gate (the old `!active || !completed`)
+        // skipped every live process, leaving the terminal display silent
+        // even though the Bochs guest had written bytes to port 0xE9.
+        if (!proc.active || proc.completed) continue;
 
         while (!out_empty(i)) {
             char tmp[256];

@@ -26,10 +26,41 @@ void logfunctions::put(const char*, const char*) {}
 void logfunctions::info (const char*, ...)       {}
 void logfunctions::error(const char*, ...)       {}
 void logfunctions::ldebug(const char*, ...)      {}
-void logfunctions::panic(const char*, ...) { asm volatile("cli; hlt"); __builtin_unreachable(); }
-void logfunctions::fatal1(const char*, ...) { asm volatile("cli; hlt"); __builtin_unreachable(); }
-void logfunctions::fatal(int, const char*, const char*, va_list, int) {
+
+// ─── DIAGNOSTIC: don't kill the host on Bochs panic ──────────────────────────
+// The original handlers did `cli; hlt`, which freezes the entire kernel
+// (no spinner, no input, no redraw). That makes any internal Bochs error
+// indistinguishable from a tight-loop hang. Instead, write a single-letter
+// breadcrumb to VGA row 0 so we can see *which* path fired, then longjmp
+// back to a sigsetjmp set up by bochs_cpu_tick(). The kernel main loop
+// resumes, the spinner spins, and we get to keep diagnosing.
+
+#include <setjmp.h>
+extern "C" jmp_buf bx_panic_jmpbuf;
+extern "C" int     bx_panic_jmpbuf_armed;
+extern "C" volatile int bx_last_panic_code;
+
+static void vga_breadcrumb(char c) {
+    // Row 0, column 70 — visible, away from the spinner at column 79.
+    volatile unsigned short* p = (volatile unsigned short*)(0xB8000 + 2*70);
+    *p = (unsigned short)(0x4F00 | (unsigned char)c);  // white-on-red
+}
+
+static void bx_recover(char tag, int code) {
+    vga_breadcrumb(tag);
+    bx_last_panic_code = code;
+    if (bx_panic_jmpbuf_armed) {
+        bx_panic_jmpbuf_armed = 0;
+        longjmp(bx_panic_jmpbuf, 1);
+    }
+    // Not armed — last-resort halt, but at least the breadcrumb is visible.
     asm volatile("cli; hlt"); __builtin_unreachable();
+}
+
+void logfunctions::panic (const char*, ...) { bx_recover('P', 1); }
+void logfunctions::fatal1(const char*, ...) { bx_recover('F', 2); }
+void logfunctions::fatal (int, const char*, const char*, va_list, int) {
+    bx_recover('X', 3);
 }
 void logfunctions::warn(int, const char*, const char*, va_list) {}
 void logfunctions::ask (int, const char*, const char*, va_list) {}
@@ -113,7 +144,7 @@ bx_list_c* root_param = nullptr;
 
 class KernelSIM : public bx_simulator_interface_c {
 public:
-    void quit_sim(int) override { asm volatile("cli; hlt"); __builtin_unreachable(); }
+    void quit_sim(int) override { bx_recover('Q', 4); }
     int  get_exit_code() override { return 0; }
 };
 static KernelSIM s_sim;
@@ -143,7 +174,7 @@ extern "C" {
 
 // ═══ C++ ABI stubs ══════════════════════════════════════════════════════════
 extern "C" {
-    void _Unwind_Resume(void*) { asm volatile("cli; hlt"); __builtin_unreachable(); }
+    void _Unwind_Resume(void*) { bx_recover('U', 5); }
     int  __gxx_personality_v0(...) { return 0; }
     int  __gcc_personality_v0(...) { return 0; }
     void __cxa_guard_abort(long long*) {}

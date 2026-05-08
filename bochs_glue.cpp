@@ -1,6 +1,7 @@
 #include "bochs-2.7/bochs.h"
 #include "bochs-2.7/cpu/cpu.h"
 #include "bochs-2.7/memory/memory-bochs.h"
+#include "bochs-2.7/pc_system.h"
 
 extern "C" void* __dso_handle = nullptr;
 extern "C" int __cxa_atexit(void (*)(void*), void*, void*) { return 0; }
@@ -228,10 +229,46 @@ extern "C" void bochs_activate_slot(int slot) {
 }
 
 extern "C" void bochs_cpu_init() {
+    // Breadcrumbs at columns 65/66/67/68 to trace each init step. If the
+    // freeze is in init (not tick), one of these is the last to appear.
+    auto bc = [](int col, char c){
+        volatile unsigned short* p = (volatile unsigned short*)(0xB8000 + 2*col);
+        *p = (unsigned short)(0x1F00 | (unsigned char)c);  // white-on-blue
+    };
+    bc(65, '1');
     BX_CPU(0)->initialize();
+    bc(65, '2');
     BX_CPU(0)->reset(BX_RESET_HARDWARE);
+    bc(65, '3');
     bochs_cpu_enter_protected_mode();
+    bc(65, '4');
     g_cpu_ready = false;
+}
+
+// ─── DIAGNOSTIC: panic recovery state ────────────────────────────────────────
+// bochs_infra.cpp's panic/fatal/quit_sim/Unwind handlers longjmp here instead
+// of halting the whole kernel. bochs_cpu_tick() arms the buffer before each
+// cpu_loop call so a Bochs internal panic returns control to the kernel
+// main loop with a VGA breadcrumb identifying which path fired:
+//   P = logfunctions::panic   F = fatal1   X = fatal
+//   Q = quit_sim              U = _Unwind_Resume
+//
+// Breadcrumb columns on VGA row 0:
+//   col 70: panic tag          (red BG, set by infra recover handler)
+//   col 72: 'B' = entered cpu_loop, 'A' = returned cleanly
+//   col 73: rotating digit so we can see ticks happening
+//   col 79: kernel main-loop spinner (set by kernel.cpp)
+
+#include <setjmp.h>
+extern "C" {
+    jmp_buf bx_panic_jmpbuf;
+    int     bx_panic_jmpbuf_armed = 0;
+    volatile int bx_last_panic_code = 0;
+}
+
+static void glue_breadcrumb(int col, char c) {
+    volatile unsigned short* p = (volatile unsigned short*)(0xB8000 + 2*col);
+    *p = (unsigned short)(0x2F00 | (unsigned char)c);  // white-on-green
 }
 
 extern "C" int bochs_cpu_tick(int n) {
@@ -239,8 +276,41 @@ extern "C" int bochs_cpu_tick(int n) {
     if (!g_slots[g_active_slot].mem_base) return 0;
 
     g_slots[g_active_slot].wants_input = false;
+
+    // Cooperative budget: cpu_loop() only returns through handleAsyncEvent().
+    // handleAsyncEvent() is only entered when async_event != 0. So we set
+    // both async_event and kill_bochs_request before each call so the very
+    // first iteration of cpu_loop's outer while() returns to us.
+    if (n < 1) n = 1;
+    if (n > 4) n = 4;
+
+    static unsigned tick_seq = 0;
+    glue_breadcrumb(73, '0' + (char)((tick_seq++) % 10));
+
     for (int i = 0; i < n; ++i) {
+        // Arm panic recovery: any BX_PANIC/BX_FATAL/_Unwind_Resume inside
+        // cpu_loop will longjmp back here instead of halting the host.
+        bx_panic_jmpbuf_armed = 1;
+        if (setjmp(bx_panic_jmpbuf) != 0) {
+            // Came back via longjmp from a Bochs panic. The breadcrumb is
+            // already on screen at column 70. Stop ticking this slot so we
+            // don't keep re-entering the same panic path every frame.
+            bx_panic_jmpbuf_armed = 0;
+            if (g_active_slot >= 0 && g_active_slot < MAX_BOCHS_SLOTS) {
+                SlotState& s = g_slots[g_active_slot];
+                if (s.exit_cb) s.exit_cb(g_active_slot, -1);
+            }
+            return 0;
+        }
+
+        glue_breadcrumb(72, 'B');               // before cpu_loop
+        bx_pc_system.kill_bochs_request = 1;
+        BX_CPU(0)->async_event = 1;
         BX_CPU(0)->cpu_loop();
+        bx_pc_system.kill_bochs_request = 0;
+        glue_breadcrumb(72, 'A');               // after cpu_loop
+
+        bx_panic_jmpbuf_armed = 0;
     }
     return 0;
 }
