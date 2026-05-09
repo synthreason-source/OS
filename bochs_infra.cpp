@@ -14,7 +14,6 @@
 #include <stdarg.h>
 
 // ═══ logfunctions ════════════════════════════════════════════════════════════
-// N_LOGLEV = 4
 
 int logfunctions::default_onoff[N_LOGLEV] = {0, 0, 0, 0};
 
@@ -27,23 +26,15 @@ void logfunctions::info (const char*, ...)       {}
 void logfunctions::error(const char*, ...)       {}
 void logfunctions::ldebug(const char*, ...)      {}
 
-// ─── DIAGNOSTIC: don't kill the host on Bochs panic ──────────────────────────
-// The original handlers did `cli; hlt`, which freezes the entire kernel
-// (no spinner, no input, no redraw). That makes any internal Bochs error
-// indistinguishable from a tight-loop hang. Instead, write a single-letter
-// breadcrumb to VGA row 0 so we can see *which* path fired, then longjmp
-// back to a sigsetjmp set up by bochs_cpu_tick(). The kernel main loop
-// resumes, the spinner spins, and we get to keep diagnosing.
-
+// ─── DIAGNOSTIC: longjmp recovery instead of cli;hlt ─────────────────────────
 #include <setjmp.h>
 extern "C" jmp_buf bx_panic_jmpbuf;
 extern "C" int     bx_panic_jmpbuf_armed;
 extern "C" volatile int bx_last_panic_code;
 
 static void vga_breadcrumb(char c) {
-    // Row 0, column 70 — visible, away from the spinner at column 79.
     volatile unsigned short* p = (volatile unsigned short*)(0xB8000 + 2*70);
-    *p = (unsigned short)(0x4F00 | (unsigned char)c);  // white-on-red
+    *p = (unsigned short)(0x4F00 | (unsigned char)c);
 }
 
 static void bx_recover(char tag, int code) {
@@ -53,7 +44,6 @@ static void bx_recover(char tag, int code) {
         bx_panic_jmpbuf_armed = 0;
         longjmp(bx_panic_jmpbuf, 1);
     }
-    // Not armed — last-resort halt, but at least the breadcrumb is visible.
     asm volatile("cli; hlt"); __builtin_unreachable();
 }
 
@@ -75,10 +65,10 @@ void iofunctions::out(int, const char*, const char*, va_list) {}
 void iofunctions::set_log_action(int, int) {}
 
 static logfunc_t s_log;
-logfunc_t* genlog    = &s_log;
-logfunc_t* pluginlog = &s_log;
-logfunc_t* siminterface_log = &s_log;
-iofunc_t*  io        = nullptr;
+logfunc_t* genlog            = &s_log;
+logfunc_t* pluginlog         = &s_log;
+logfunc_t* siminterface_log  = &s_log;
+iofunc_t*  io                = nullptr;
 
 // ═══ bochs globals ════════════════════════════════════════════════════════════
 
@@ -90,8 +80,7 @@ BX_MEM_C        bx_mem;
 bx_debug_t      bx_dbg   = {};
 Bit8u           bx_cpu_count = 1;
 Bit32u          apic_id_mask = 0;
-// simulate_xapic is in bochs_cstubs.c as int; declare extern int here
-extern int simulate_xapic;
+extern int      simulate_xapic;
 
 // ═══ bx_devices_c ════════════════════════════════════════════════════════════
 
@@ -110,17 +99,14 @@ bx_devices_c::bx_devices_c() {
 bx_devices_c::~bx_devices_c() {}
 void bx_devices_c::init_stubs() {}
 
-// Forward decl from bochs_glue.cpp - lets a guest write a byte to the
-// active slot's output buffer by doing `out 0xE9, al`. Useful for tiny
-// test ELFs and for a minimal syscall protocol from the IDT stub.
 extern "C" void bochs_guest_putc(char c);
 
 Bit32u bx_devices_c::inp (Bit16u, unsigned) { return 0xFFFF; }
 void   bx_devices_c::outp(Bit16u port, Bit32u val, unsigned) {
-    if (port == 0xE9) {
-        bochs_guest_putc((char)(val & 0xFF));
-    }
+    if (port == 0xE9) bochs_guest_putc((char)(val & 0xFF));
 }
+void bx_devices_c::reset(unsigned) {}
+void bx_devices_c::exit()          {}
 
 // ═══ bx_pc_system_c ══════════════════════════════════════════════════════════
 
@@ -135,44 +121,170 @@ int  bx_pc_system_c::register_timer_ticks(void*, bx_timer_handler_t, Bit64u, boo
     return 0;
 }
 
-// ═══ Param tree globals ═══════════════════════════════════════════════════════
-// bx_param_c / bx_shadow_num_c / bx_list_c etc. are provided by bochs_paramtree.o
+// ═══ Param tree globals ══════════════════════════════════════════════════════
 
 bx_list_c* root_param = nullptr;
 
-// ═══ SIM stub ════════════════════════════════════════════════════════════════
+// ═══ SIM stub — single definition, all virtuals stubbed ══════════════════════
+// Every virtual in bx_simulator_interface_c must have a body here or the
+// vtable will be left incomplete and the linker emits "undefined reference
+// to vtable for KernelSIM".  All methods that are non-void in the base
+// return a safe zero/null/false value.  Methods that should cause a kernel
+// panic delegate to bx_recover().
 
 class KernelSIM : public bx_simulator_interface_c {
 public:
-    void quit_sim(int) override { bx_recover('Q', 4); }
-    int  get_exit_code() override { return 0; }
+    // ── lifecycle ────────────────────────────────────────────────────────────
+    void quit_sim(int)      override { bx_recover('Q', 4); }
+    int  get_exit_code()    override { return 0; }
+    void set_quit_context(jmp_buf*) override {}
+
+    // ── init flags ───────────────────────────────────────────────────────────
+    bool get_init_done()        override { return false; }
+    int  set_init_done(bool)    override { return 0; }
+    void reset_all_param()      override {}
+
+    // ── param tree ───────────────────────────────────────────────────────────
+    bx_param_c*        get_param       (const char*, bx_param_c* = nullptr) override { return nullptr; }
+    bx_param_num_c*    get_param_num   (const char*, bx_param_c* = nullptr) override { return nullptr; }
+    bx_param_string_c* get_param_string(const char*, bx_param_c* = nullptr) override { return nullptr; }
+    bx_param_bool_c*   get_param_bool  (const char*, bx_param_c* = nullptr) override { return nullptr; }
+    bx_param_enum_c*   get_param_enum  (const char*, bx_param_c* = nullptr) override { return nullptr; }
+    unsigned           gen_param_id()  override { return 0; }
+
+    // ── logging ──────────────────────────────────────────────────────────────
+    int          get_n_log_modules()              override { return 0; }
+    const char*  get_logfn_name(int)              override { return ""; }
+    int          get_logfn_id(const char*)        override { return 0; }
+    const char*  get_prefix(int)                  override { return ""; }
+    int          get_log_action(int, int)         override { return 0; }
+    void         set_log_action(int, int, int)    override {}
+    int          get_default_log_action(int)      override { return 0; }
+    void         set_default_log_action(int, int) override {}
+    const char*  get_action_name(int)             override { return ""; }
+    int          is_action_name(const char*)      override { return 0; }
+    const char*  get_log_level_name(int)          override { return ""; }
+    int          get_max_log_level()              override { return 0; }
+
+    // ── RC / log file paths ──────────────────────────────────────────────────
+    int get_default_rc(char*, int)           override { return -1; }
+    int read_rc(const char*)                 override { return -1; }
+    int write_rc(const char*, int)           override { return -1; }
+    int get_log_file(char*, int)             override { return -1; }
+    int set_log_file(const char*)            override { return -1; }
+    int get_log_prefix(char*, int)           override { return -1; }
+    int set_log_prefix(const char*)          override { return -1; }
+    int get_debugger_log_file(char*, int)    override { return -1; }
+    int set_debugger_log_file(const char*)   override { return -1; }
+
+    // ── event / notify ───────────────────────────────────────────────────────
+    void      set_notify_callback(bxevent_handler, void*) override {}
+    void      get_notify_callback(bxevent_handler*, void**) override {}
+    BxEvent*  sim_to_ci_event(BxEvent* e)  override { return e; }
+    int       log_dlg(const char*, int, const char*, int) override { return 0; }
+    void      log_msg(const char*, int, const char*)      override {}
+    void      set_log_viewer(bool)         override {}
+    bool      has_log_viewer() const       override { return false; }
+
+    // ── ask / dialog ─────────────────────────────────────────────────────────
+    int  ask_param(bx_param_c*)                                               override { return 0; }
+    int  ask_param(const char*)                                               override { return 0; }
+    int  ask_filename(const char*, int, const char*, const char*, int)        override { return -1; }
+    int  ask_yes_no(const char*, const char*, bool the_default)               override { return (int)the_default; }
+    void message_box(const char*, const char*)                                override {}
+
+    // ── periodic / refresh ───────────────────────────────────────────────────
+    void periodic()      override {}
+    void refresh_ci()    override {}
+    void refresh_vga()   override {}
+    void handle_events() override {}
+
+    // ── disk / PCI / device queries ──────────────────────────────────────────
+    int         create_disk_image(const char*, int, bool) override { return -1; }
+    bx_param_c* get_first_hd()                            override { return nullptr; }
+    bx_param_c* get_first_cdrom()                         override { return nullptr; }
+    bool        is_pci_device(const char*)                override { return false; }
+    bool        is_agp_device(const char*)                override { return false; }
+
+    // ── config interface ─────────────────────────────────────────────────────
+    void register_configuration_interface(const char*, config_interface_callback_t, void*) override {}
+    int  configuration_interface(const char*, ci_command_t) override { return 0; }
+    int  begin_simulation(int, char*[])                      override { return 0; }
+
+    // ── runtime config ───────────────────────────────────────────────────────
+    int  register_runtime_config_handler(void*, rt_conf_handler_t) override { return 0; }
+    void unregister_runtime_config_handler(int)                    override {}
+    void update_runtime_options()                                   override {}
+
+    // ── threading ────────────────────────────────────────────────────────────
+    void set_sim_thread_func(is_sim_thread_func_t f) override { is_sim_thread_func = f; }
+    bool is_sim_thread()     override { return false; }
+    bool is_wx_selected() const override { return false; }
+
+    // ── GUI mode ─────────────────────────────────────────────────────────────
+    void set_debug_gui(bool)        override {}
+    bool has_debug_gui() const      override { return false; }
+    void set_display_mode(disp_mode_t) override {}
+    bool test_for_text_console()    override { return false; }
+
+    // ── addon options ────────────────────────────────────────────────────────
+    bool    register_addon_option(const char*, addon_option_parser_t, addon_option_save_t) override { return false; }
+    bool    unregister_addon_option(const char*)     override { return false; }
+    bool    is_addon_option(const char*)             override { return false; }
+    Bit32s  parse_addon_option(const char*, int, char*[]) override { return 0; }
+    Bit32s  save_addon_options(FILE*)                override { return 0; }
+
+    // ── statistics ───────────────────────────────────────────────────────────
+    void       init_statistics()     override {}
+    void       cleanup_statistics()  override {}
+    bx_list_c* get_statistics_root() override { return nullptr; }
+
+    // ── save / restore ───────────────────────────────────────────────────────
+    void       init_save_restore()                                        override {}
+    void       cleanup_save_restore()                                     override {}
+    bool       save_state(const char*)                                    override { return false; }
+    bool       restore_config()                                           override { return false; }
+    bool       restore_logopts()                                          override { return false; }
+    bool       restore_hardware()                                         override { return false; }
+    bx_list_c* get_bochs_root()                                           override { return nullptr; }
+    bool       restore_bochs_param(bx_list_c*, const char*, const char*) override { return false; }
+
+    // ── plugin ctrl ──────────────────────────────────────────────────────────
+    bool opt_plugin_ctrl(const char*, bool) override { return false; }
+
+    // ── NIC / USB helpers ────────────────────────────────────────────────────
+    void init_std_nic_options(const char*, bx_list_c*)           override {}
+    int  parse_param_from_list(const char*, const char*, bx_list_c*) override { return 0; }
+    int  parse_nic_params(const char*, const char*, bx_list_c*)  override { return 0; }
+    int  parse_usb_port_params(const char*, const char*, int, bx_list_c*) override { return 0; }
+    int  split_option_list(const char*, const char*, char**, int) override { return 0; }
+    int  write_param_list(FILE*, bx_list_c*, const char*, bool)  override { return 0; }
+    int  write_usb_options(FILE*, int, bx_list_c*)               override { return 0; }
 };
+
 static KernelSIM s_sim;
 bx_simulator_interface_c* SIM = &s_sim;
 
-// ═══ bx_user_quit (bool in siminterface.h) ════════════════════════════════════
+// ═══ bx_user_quit ════════════════════════════════════════════════════════════
 bool bx_user_quit = false;
 
-// ═══ bx_gui stub ══════════════════════════════════════════════════════════════
-// bx_gui_c is declared in gui.h as a class inheriting logfunctions.
-// We just need a nullptr pointer and a stub cleanup() override.
+// ═══ bx_gui stub ═════════════════════════════════════════════════════════════
 bx_gui_c* bx_gui = nullptr;
+void bx_gui_c::cleanup() {}
 
-// ═══ Misc bochs globals ════════════════════════════════════════════════════════
+// ═══ Misc ════════════════════════════════════════════════════════════════════
 void print_statistics_tree(bx_param_c*, int) {}
 
-// ═══ RTTI for logfunctions (needed by BX_CPU_C and BX_MEM_C typeinfo) ═══════
-// These symbols must be provided so the RTTI chain for BX_CPU_C and BX_MEM_C resolves.
-// The mangled names match what the linker expects.
+// ═══ RTTI for logfunctions ═══════════════════════════════════════════════════
 extern "C" {
-    extern char _ZTS12logfunctions[] = "12logfunctions";
+    extern char  _ZTS12logfunctions[] = "12logfunctions";
     extern void* _ZTI12logfunctions[] = {
-        nullptr,                         // vptr placeholder
+        nullptr,
         (void*)_ZTS12logfunctions
     };
 }
 
-// ═══ C++ ABI stubs ══════════════════════════════════════════════════════════
+// ═══ C++ ABI stubs ═══════════════════════════════════════════════════════════
 extern "C" {
     void _Unwind_Resume(void*) { bx_recover('U', 5); }
     int  __gxx_personality_v0(...) { return 0; }
@@ -181,10 +293,9 @@ extern "C" {
     void* __dso_handle = nullptr;
 }
 
-// operator delete with alignment (C++17)
 void operator delete(void*, unsigned int, std::align_val_t) noexcept {}
 
-// ═══ Plugin function pointers (from plugin.h, last arg is Bit8u) ═════════════
+// ═══ Plugin function pointers ════════════════════════════════════════════════
 int  (*pluginRegisterIOReadHandler)        (void*, ioReadHandler_t,  unsigned,          const char*, Bit8u) = nullptr;
 int  (*pluginRegisterIOWriteHandler)       (void*, ioWriteHandler_t, unsigned,          const char*, Bit8u) = nullptr;
 int  (*pluginUnregisterIOReadHandler)      (void*, ioReadHandler_t,  unsigned,          Bit8u)              = nullptr;
@@ -200,13 +311,5 @@ void (*pluginUnregisterIRQ)     (unsigned, const char*) = nullptr;
 void (*pluginSetHRQ)            (unsigned)              = nullptr;
 void (*pluginSetHRQHackCallback)(void (*)(void))        = nullptr;
 
-// ─── bx_devices_c remaining methods ──────────────────────────────────────────
-void bx_devices_c::reset(unsigned) {}
-void bx_devices_c::exit()          {}
-
-// ─── bx_gui_c::cleanup stub ──────────────────────────────────────────────────
-void bx_gui_c::cleanup() {}
-
-// ─── bx_pci_device_c ─────────────────────────────────────────────────────────
-// pci_read_handler and pci_write_handler are pure virtual — provide bodies.
-Bit32u bx_pci_device_c::pci_read_handler(Bit8u, unsigned) { return 0; }
+// ═══ bx_pci_device_c stubs ═══════════════════════════════════════════════════
+Bit32u bx_pci_device_c::pci_read_handler (Bit8u, unsigned)        { return 0; }

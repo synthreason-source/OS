@@ -55,6 +55,22 @@ static void bochs_cpu_enter_protected_mode() {
     setup_flat_segment(cpu->sregs[BX_SEG_REG_FS], 0x10, false);
     setup_flat_segment(cpu->sregs[BX_SEG_REG_GS], 0x10, false);
 
+    // ── Re-arm GDTR/IDTR from the active slot's injected tables ────────────
+    // BX_CPU_C::reset(BX_RESET_HARDWARE) zeros gdtr/idtr; bochs_cpu_init() is
+    // generally called AFTER bochs_set_process_memory() (which had injected
+    // those tables and set the registers). Re-pointing them here ensures the
+    // first guest instruction that touches a segment register or raises an
+    // exception sees the correct tables.
+    if (g_active_slot >= 0 && g_active_slot < MAX_BOCHS_SLOTS) {
+        SlotState& s = g_slots[g_active_slot];
+        if (s.mem_base && s.mem_size) {
+            cpu->gdtr.base  = s.vaddr_base + 0x80;
+            cpu->gdtr.limit = 24 - 1;
+            cpu->idtr.base  = s.vaddr_base + 0x100;
+            cpu->idtr.limit = 256 * 8 - 1;
+        }
+    }
+
     cpu->invalidate_prefetch_q();
 }
 
@@ -170,11 +186,20 @@ static void inject_idt_into_slab(SlotState& s) {
 
 // Called from bx_devices_c::outp when the guest writes port 0xE9.
 // Forwards the byte to the active slot's output ring buffer via the
-// kernel-supplied write_cb.
+// kernel-supplied write_cb, then asks cpu_loop to yield back to the host
+// so the kernel main loop can drain output / poll input / redraw.
+//
+// cpu_loop only checks for a yield at the top of each iteration, gated on
+// BX_CPU_THIS_PTR async_event being non-zero. Inside handleAsyncEvent,
+// kill_bochs_request causes a return-1 → cpu_loop returns to caller.
+// Setting both here guarantees a clean yield after each emitted character.
 extern "C" void bochs_guest_putc(char c) {
     if (g_active_slot < 0 || g_active_slot >= MAX_BOCHS_SLOTS) return;
     SlotState& s = g_slots[g_active_slot];
     if (s.write_cb) s.write_cb(g_active_slot, c);
+
+    bx_pc_system.kill_bochs_request = 1;
+    BX_CPU(0)->async_event = 1;
 }
 
 extern "C" void bochs_register_io_callbacks(
@@ -229,19 +254,9 @@ extern "C" void bochs_activate_slot(int slot) {
 }
 
 extern "C" void bochs_cpu_init() {
-    // Breadcrumbs at columns 65/66/67/68 to trace each init step. If the
-    // freeze is in init (not tick), one of these is the last to appear.
-    auto bc = [](int col, char c){
-        volatile unsigned short* p = (volatile unsigned short*)(0xB8000 + 2*col);
-        *p = (unsigned short)(0x1F00 | (unsigned char)c);  // white-on-blue
-    };
-    bc(65, '1');
     BX_CPU(0)->initialize();
-    bc(65, '2');
     BX_CPU(0)->reset(BX_RESET_HARDWARE);
-    bc(65, '3');
     bochs_cpu_enter_protected_mode();
-    bc(65, '4');
     g_cpu_ready = false;
 }
 
@@ -264,6 +279,15 @@ extern "C" {
     jmp_buf bx_panic_jmpbuf;
     int     bx_panic_jmpbuf_armed = 0;
     volatile int bx_last_panic_code = 0;
+    // Symbol-resolved panic-diag buffer. Readable from the host (e.g. via
+    // QEMU monitor `pmemsave`) when the kernel is in graphics mode and
+    // VGA text-mode breadcrumbs aren't visible. Written by vga_breadcrumb()
+    // in bochs_infra.cpp on every Bochs panic/fatal path.
+    //   [0]  last tag char ('P' panic, 'F' fatal1, 'X' fatal, 'Q' quit_sim,
+    //                       'U' unwind)
+    //   [1]  total recovery count (uint8 wraps)
+    //   [2..63] ring of last 62 tags
+    volatile unsigned char bx_panic_breadcrumbs[64] = {0};
 }
 
 static void glue_breadcrumb(int col, char c) {
@@ -304,8 +328,13 @@ extern "C" int bochs_cpu_tick(int n) {
         }
 
         glue_breadcrumb(72, 'B');               // before cpu_loop
-        bx_pc_system.kill_bochs_request = 1;
-        BX_CPU(0)->async_event = 1;
+        // Make sure both yield flags are CLEAR so cpu_loop actually runs
+        // instructions. The yield is requested from bochs_guest_putc when
+        // the guest writes a byte to port 0xE9 (or other I/O paths). If we
+        // pre-armed them here, the very first iteration of cpu_loop's
+        // while(1) would call handleAsyncEvent and bail out without
+        // executing a single guest instruction.
+        bx_pc_system.kill_bochs_request = 0;
         BX_CPU(0)->cpu_loop();
         bx_pc_system.kill_bochs_request = 0;
         glue_breadcrumb(72, 'A');               // after cpu_loop

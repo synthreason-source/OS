@@ -6126,7 +6126,126 @@ void handle_command() {
         console_print(buf); 
     }
     else if (strcmp(command, "version") == 0) { console_print("RTOS++ v1.0 - Robust Parsing\n"); }
-    
+
+    // ── 'hello' command: launch the embedded hello test ELF ───────────────
+    // Mirrors the 'bb'/'busybox' launcher above but uses the hello blob
+    // (`hello_start..hello_end`) instead of the busybox ramdisk. Skipping
+    // FAT32 entirely lets us smoke-test the Bochs CPU emulation path
+    // independently of disk round-trip bugs.
+    else if (strcmp(command, "hello") == 0) {
+        uint8_t* elf_src = hello_start;
+        uint32_t elf_sz  = (uint32_t)(hello_end - hello_start);
+
+        if (elf_sz < sizeof(Elf32_Ehdr)) {
+            console_print("hello: embedded blob missing\n");
+            return;
+        }
+
+        Elf32_Ehdr* ehdr = (Elf32_Ehdr*)elf_src;
+        if (ehdr->e_ident[EI_MAG0] != ELFMAG0 ||
+            ehdr->e_ident[EI_MAG1] != ELFMAG1 ||
+            ehdr->e_ident[EI_MAG2] != ELFMAG2 ||
+            ehdr->e_ident[EI_MAG3] != ELFMAG3 ||
+            ehdr->e_ident[EI_CLASS] != ELFCLASS32 ||
+            ehdr->e_machine != EM_386) {
+            console_print("hello: invalid ELF header\n");
+            return;
+        }
+
+        int slot = -1;
+        for (int i = 0; i < MAXelf_processes; i++)
+            if (!elf_processes[i].active) { slot = i; break; }
+        if (slot < 0) { console_print("No free process slots\n"); return; }
+
+        Elf32_Phdr* phdr = (Elf32_Phdr*)(elf_src + ehdr->e_phoff);
+        uint32_t min_vaddr = 0xFFFFFFFFu, max_vaddr = 0;
+        for (int i = 0; i < ehdr->e_phnum; i++) {
+            if (phdr[i].p_type == PT_LOAD) {
+                if (phdr[i].p_vaddr < min_vaddr) min_vaddr = phdr[i].p_vaddr;
+                uint32_t seg_end = phdr[i].p_vaddr + phdr[i].p_memsz;
+                if (seg_end > max_vaddr) max_vaddr = seg_end;
+            }
+        }
+        if (min_vaddr == 0xFFFFFFFFu || max_vaddr <= min_vaddr) {
+            console_print("hello: no PT_LOAD segments\n");
+            return;
+        }
+
+        uint32_t img_sz = max_vaddr - min_vaddr;
+        uint32_t mem_sz = img_sz + ELF_HEAP_SIZE;
+        if (mem_sz > 6 * 1024 * 1024) {
+            console_print("hello: process image too large\n");
+            return;
+        }
+
+        ElfProcess& proc = elf_processes[slot];
+        proc.memory_base = new uint8_t[mem_sz];
+        if (!proc.memory_base) { console_print("hello: oom\n"); return; }
+        memset(proc.memory_base, 0, mem_sz);
+        proc.memory_size = mem_sz;
+
+        for (int i = 0; i < ehdr->e_phnum; i++) {
+            if (phdr[i].p_type == PT_LOAD) {
+                uint32_t dst_off = phdr[i].p_vaddr - min_vaddr;
+                if (dst_off + phdr[i].p_filesz > mem_sz ||
+                    phdr[i].p_offset + phdr[i].p_filesz > elf_sz) {
+                    delete[] proc.memory_base;
+                    proc.memory_base = nullptr;
+                    console_print("hello: segment out of bounds\n");
+                    return;
+                }
+                memcpy(proc.memory_base + dst_off,
+                       elf_src + phdr[i].p_offset,
+                       phdr[i].p_filesz);
+                if (phdr[i].p_memsz > phdr[i].p_filesz)
+                    memset(proc.memory_base + dst_off + phdr[i].p_filesz,
+                           0, phdr[i].p_memsz - phdr[i].p_filesz);
+            }
+        }
+
+        proc.stack = new uint8_t[ELF_STACK_SIZE];
+        if (!proc.stack) {
+            delete[] proc.memory_base; proc.memory_base = nullptr;
+            console_print("hello: stack oom\n");
+            return;
+        }
+        memset(proc.stack, 0, ELF_STACK_SIZE);
+
+        // Activate slot first, THEN inject memory + GDT/IDT. The order
+        // matters: the previous order (init→set_process_memory) caused
+        // bochs_cpu_init's reset() to wipe the gdtr/idtr we just set.
+        // bochs_glue.cpp now restores gdtr/idtr from the active slot
+        // inside enter_protected_mode, so x86_tick's lazy init does
+        // (set_process_memory → cpu_init) and the descriptors survive.
+        bochs_activate_slot(slot);
+        bochs_set_process_memory(proc.memory_base, mem_sz, min_vaddr);
+        bochs_finalize_process_memory();
+
+        proc.entry_point       = ehdr->e_entry;
+        proc.vaddr_base        = min_vaddr;
+        proc.vaddr_end         = max_vaddr;
+        proc.eip               = proc.entry_point;
+        proc.esp               = min_vaddr + img_sz + ELF_HEAP_SIZE - 64;
+        proc.active            = true;
+        proc.cpu_initialized   = false;
+        proc.completed         = false;
+        proc.waiting_for_input = false;
+        proc.terminal          = this;
+        proc.cmdline[0]        = 0;
+
+        captured_elf_slot = slot;
+        console_print("hello started.\n");
+    }
+
+    // Fall-through: try to load 'command' as an ELF file from FAT32.
+    // The ELF runs inside the Bochs CPU emulator via x86_tick / cpu_loop.
+    else {
+        // handle_command() is a TerminalWindow method, so `this` is the
+        // owning terminal — that's what we want bound to the new process
+        // so its port-0xE9 output gets routed back to this terminal.
+        load_and_execute_elf(command, args, this);
+    }
+
     if(!in_editor) print_prompt();
 }
 int load_and_execute_elf(const char* filename, const char* args, TerminalWindow* terminal) {
@@ -6891,8 +7010,15 @@ void init_elf_system() {
 // I/O callback adapters
 static int  elf_io_read (int slot) { return pop_input(slot); }
 static void elf_io_write(int slot, char c) { push_output(slot, c); }
-static void elf_io_exit (int slot, int /*code*/) {
+static void elf_io_exit (int slot, int code) {
     if (slot >= 0 && slot < MAXelf_processes) {
+        // Print the cause to the terminal before tearing down.
+        ElfProcess& p = elf_processes[slot];
+        if (p.terminal) {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "[diag] elf_io_exit slot=%d code=%d\n", slot, code);
+            p.terminal->console_print(buf);
+        }
         elf_processes[slot].completed = true;
         elf_processes[slot].active    = false;
     }
@@ -7039,6 +7165,7 @@ static bool start_elf_process(int slot, const unsigned char* elf, unsigned int e
     return true;
 }
 
+extern "C" volatile unsigned char bx_panic_breadcrumbs[64];
 static bool x86_tick(int slot, int steps) {
     ElfProcess& proc = elf_processes[slot];
     // Tick a process that is alive: active and NOT yet completed.
@@ -7060,15 +7187,14 @@ static bool x86_tick(int slot, int steps) {
             proc.completed = true;
             return false;
         }
-        // Re-register the slab. The "bb" path already did this; the disk
-        // load path (load_and_execute_elf) did not. The glue unregisters
-        // any previous mapping for the slot first, so this is idempotent.
+        // Re-register the slab (the glue unregisters any previous mapping
+        // for the slot first, so this is idempotent). Then hardware-reset
+        // the CPU, enter protected mode, and point it at the guest entry.
         bochs_set_process_memory(proc.memory_base, proc.memory_size,
                                  proc.vaddr_base);
-        // Hardware reset, enter protected mode, then point CPU at guest.
         bochs_cpu_init();
         bochs_cpu_set_esp(proc.esp);
-        bochs_cpu_set_eip(proc.entry_point);   // sets g_cpu_ready=true
+        bochs_cpu_set_eip(proc.entry_point);
         bochs_set_brk(slot, proc.vaddr_base + proc.memory_size - ELFHEAPSIZE);
         proc.cpu_initialized = true;
     }
@@ -7591,7 +7717,6 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
         if (++hb_counter % 10000 == 0) {
             *vga_hb = (uint16_t)(0x0A00u | (uint8_t)hb_chars[(hb_counter/10000)%4]);
 
-			tick_elf_processes(1);
 		}
 
 
@@ -7652,6 +7777,8 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
                 draw_cursor(mouse_x, mouse_y, ColorPalette::CURSOR_WHITE);
                 swap_buffers();
             }
+						tick_elf_processes(100);
+
             g_evt_timer = false;
         }
     }
