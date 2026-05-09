@@ -7,7 +7,7 @@ sudo apt install make gcc-multilib gcc-13-multilib gcc gcc-13 binutils grub-comm
 
 sudo make clean
 
-make clean && make BOCHS=0 // must be 0 for bochs to work...
+make clean && make BOCHS=1 // must be 1 for bochs to work...
 
 	qemu-system-i386 \
 	    -M q35 \
