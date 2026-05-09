@@ -1,87 +1,116 @@
 #!/usr/bin/env python3
+"""mkfat32.py — create a blank FAT32 disk image, no external tools needed.
+
+Usage:
+    python3 mkfat32.py <image_path> <size_megabytes>
+
+Layout (per Microsoft FAT32 spec, simplified):
+    LBA 0:           Boot sector (BPB)
+    LBA 1:           FSInfo
+    LBA 6:           Backup boot sector
+    LBA 7:           Backup FSInfo
+    LBA RSV..:       FAT1
+    LBA RSV+FATSZ..: FAT2
+    LBA DATA..:      Data area, root dir at cluster 2
+
+This produces an image that the kernel's FAT32 driver and Linux's
+`mtools` / `mount -o loop` can read, with an empty root directory.
 """
-mkfat32.py — Create a minimal FAT32 disk image with no external dependencies.
-Usage: python3 mkfat32.py <output.img> [size_mb]
-Default size: 128 MB.
-"""
-import struct, sys, os
+import os
+import struct
+import sys
 
-def mkfat32(path, size_mb=128):
-    SEC  = 512
-    CLUS = 8          # sectors per cluster (4 KB clusters)
-    RSVD = 32         # reserved sectors
-    FATS = 2
-    LABEL  = b'MYOS       '   # 11 bytes
-    FSTYPE = b'FAT32   '      # 8 bytes
+SECTOR = 512
+RESERVED_SECTORS = 32
+NUM_FATS = 2
+SECTORS_PER_CLUSTER = 8        # 4 KiB clusters
+ROOT_CLUSTER = 2
 
-    total = (size_mb * 1024 * 1024) // SEC  # total sectors
+def make_fat32(path: str, size_mb: int) -> None:
+    total_sectors = (size_mb * 1024 * 1024) // SECTOR
+    # FAT entries needed = clusters + 2 reserved entries
+    # Each FAT entry is 4 bytes.
+    # Iterate to a stable FAT size.
+    fat_sectors = 1
+    for _ in range(8):
+        data_sectors = total_sectors - RESERVED_SECTORS - NUM_FATS * fat_sectors
+        clusters = data_sectors // SECTORS_PER_CLUSTER
+        needed_bytes = (clusters + 2) * 4
+        new_fat_sectors = (needed_bytes + SECTOR - 1) // SECTOR
+        if new_fat_sectors == fat_sectors:
+            break
+        fat_sectors = new_fat_sectors
 
-    # Microsoft FAT32 FAT size formula (FAT spec §3.5)
-    tmp1   = total - RSVD
-    tmp2   = (256 * CLUS + FATS) // 2
-    fat_sz = (tmp1 + tmp2 - 1) // tmp2      # sectors per FAT
+    fat1_lba = RESERVED_SECTORS
+    fat2_lba = fat1_lba + fat_sectors
+    data_lba = fat2_lba + fat_sectors
 
-    # ── Boot sector (BPB) ─────────────────────────────────────────────────────
-    bpb = bytearray(SEC)
-    bpb[0:3]  = bytes([0xEB, 0x58, 0x90])   # JMP SHORT + NOP
-    bpb[3:11] = b'MSWIN4.1'
-    struct.pack_into('<H', bpb, 11, SEC)     # bytes per sector
-    bpb[13]   = CLUS                         # sectors per cluster
-    struct.pack_into('<H', bpb, 14, RSVD)   # reserved sectors
-    bpb[16]   = FATS                         # number of FATs
-    struct.pack_into('<H', bpb, 17, 0)       # root entry count (0 = FAT32)
-    struct.pack_into('<H', bpb, 19, 0)       # total16 (0 = use total32)
-    bpb[21]   = 0xF8                         # media type = fixed disk
-    struct.pack_into('<H', bpb, 22, 0)       # FAT size 16 (0 = FAT32)
-    struct.pack_into('<H', bpb, 24, 32)      # sectors/track (geometry)
-    struct.pack_into('<H', bpb, 26, 64)      # number of heads
-    struct.pack_into('<I', bpb, 28, 0)       # hidden sectors
-    struct.pack_into('<I', bpb, 32, total)   # total sectors 32
-    struct.pack_into('<I', bpb, 36, fat_sz)  # FAT size 32
-    struct.pack_into('<H', bpb, 40, 0)       # ext flags
-    struct.pack_into('<H', bpb, 42, 0)       # FS version
-    struct.pack_into('<I', bpb, 44, 2)       # root cluster = 2
-    struct.pack_into('<H', bpb, 48, 1)       # FSInfo sector
-    struct.pack_into('<H', bpb, 50, 6)       # backup boot sector
-    bpb[64]   = 0x80                         # drive number
-    bpb[66]   = 0x29                         # extended boot sig
-    struct.pack_into('<I', bpb, 67, 0x12345678)  # volume serial
-    bpb[71:82] = LABEL
-    bpb[82:90] = FSTYPE
-    bpb[510]  = 0x55                         # boot sector signature
-    bpb[511]  = 0xAA
+    # ── Boot sector (BPB) ──
+    bs = bytearray(SECTOR)
+    bs[0:3]  = b'\xEB\x58\x90'               # JMP + NOP
+    bs[3:11] = b'MSWIN4.1'                   # OEM
+    struct.pack_into('<H', bs, 11, SECTOR)   # BytesPerSector
+    bs[13]   = SECTORS_PER_CLUSTER
+    struct.pack_into('<H', bs, 14, RESERVED_SECTORS)
+    bs[16]   = NUM_FATS
+    struct.pack_into('<H', bs, 17, 0)        # RootEntCnt (0 for FAT32)
+    struct.pack_into('<H', bs, 19, 0)        # TotSec16
+    bs[21]   = 0xF8                           # MediaType = fixed
+    struct.pack_into('<H', bs, 22, 0)        # FATSz16 (0 for FAT32)
+    struct.pack_into('<H', bs, 24, 63)       # SecPerTrk (placeholder)
+    struct.pack_into('<H', bs, 26, 255)      # NumHeads (placeholder)
+    struct.pack_into('<I', bs, 28, 0)        # HiddSec
+    struct.pack_into('<I', bs, 32, total_sectors)
+    struct.pack_into('<I', bs, 36, fat_sectors)  # FATSz32
+    struct.pack_into('<H', bs, 40, 0)        # ExtFlags
+    struct.pack_into('<H', bs, 42, 0)        # FSVer
+    struct.pack_into('<I', bs, 44, ROOT_CLUSTER)
+    struct.pack_into('<H', bs, 48, 1)        # FSInfo sector
+    struct.pack_into('<H', bs, 50, 6)        # BkBootSec
+    bs[64]   = 0x80                           # DrvNum
+    bs[66]   = 0x29                           # BootSig
+    struct.pack_into('<I', bs, 67, 0xDEADBEEF)  # VolID
+    bs[71:82] = b'NO NAME    '
+    bs[82:90] = b'FAT32   '
+    bs[510]  = 0x55
+    bs[511]  = 0xAA
 
-    # ── FSInfo (sector 1) ─────────────────────────────────────────────────────
-    fsi = bytearray(SEC)
-    struct.pack_into('<I', fsi,   0, 0x41615252)  # lead signature
-    struct.pack_into('<I', fsi, 484, 0x61417272)  # structure signature
-    struct.pack_into('<I', fsi, 488, 0xFFFFFFFF)  # free cluster count (unknown)
-    struct.pack_into('<I', fsi, 492, 0xFFFFFFFF)  # next free cluster (unknown)
-    fsi[510] = 0x55; fsi[511] = 0xAA
+    # ── FSInfo ──
+    fs = bytearray(SECTOR)
+    struct.pack_into('<I', fs, 0,   0x41615252)
+    struct.pack_into('<I', fs, 484, 0x61417272)
+    struct.pack_into('<I', fs, 488, 0xFFFFFFFF)  # FreeCount unknown
+    struct.pack_into('<I', fs, 492, 3)            # NextFree hint
+    struct.pack_into('<I', fs, 508, 0xAA550000)
 
-    # ── FAT (first three entries) ─────────────────────────────────────────────
-    fat = bytearray(fat_sz * SEC)
-    struct.pack_into('<I', fat,  0, 0x0FFFFFF8)   # FAT[0] = media descriptor
-    struct.pack_into('<I', fat,  4, 0x0FFFFFFF)   # FAT[1] = reserved/EOC
-    struct.pack_into('<I', fat,  8, 0x0FFFFFFF)   # FAT[2] = root dir EOC
+    # ── FAT (one sector with reserved entries; rest is zero) ──
+    fat0 = bytearray(SECTOR)
+    struct.pack_into('<I', fat0, 0, 0x0FFFFFF8)  # entry 0
+    struct.pack_into('<I', fat0, 4, 0x0FFFFFFF)  # entry 1
+    struct.pack_into('<I', fat0, 8, 0x0FFFFFFF)  # entry 2 = root, EOC
 
-    # ── Write image ───────────────────────────────────────────────────────────
     with open(path, 'wb') as f:
-        f.write(bytes(total * SEC))   # zero-fill entire image
+        # Boot sector + FSInfo
+        f.write(bs)
+        f.write(fs)
+        # zeros up to backup boot sector (LBA 6)
+        f.seek(6 * SECTOR)
+        f.write(bs)                       # backup boot
+        f.write(fs)                       # backup FSInfo
+        # zeros up to FAT1
+        f.seek(fat1_lba * SECTOR)
+        f.write(fat0)
+        # zeros up to FAT2
+        f.seek(fat2_lba * SECTOR)
+        f.write(fat0)
+        # extend file to total size
+        f.truncate(total_sectors * SECTOR)
 
-    with open(path, 'r+b') as f:
-        f.seek(0 * SEC);           f.write(bpb)   # boot sector
-        f.seek(1 * SEC);           f.write(fsi)   # FSInfo
-        f.seek(6 * SEC);           f.write(bpb)   # backup boot sector
-        f.seek(7 * SEC);           f.write(fsi)   # backup FSInfo
-        f.seek(RSVD * SEC);        f.write(fat)   # FAT1
-        f.seek((RSVD+fat_sz)*SEC); f.write(fat)   # FAT2
-        # Root directory cluster (cluster 2) is already zeroed — empty dir
-
-    print(f"FAT32 image: {path}  ({size_mb} MB, {fat_sz} FAT sectors, "
-          f"{(total - RSVD - FATS*fat_sz)//CLUS} data clusters)")
+    print(f"FAT32 image: {path}  ({size_mb} MiB, "
+          f"FATsz={fat_sectors}, data_lba={data_lba})")
 
 if __name__ == '__main__':
-    out  = sys.argv[1] if len(sys.argv) > 1 else 'disk.img'
-    size = int(sys.argv[2]) if len(sys.argv) > 2 else 128
-    mkfat32(out, size)
+    if len(sys.argv) != 3:
+        print(__doc__)
+        sys.exit(1)
+    make_fat32(sys.argv[1], int(sys.argv[2]))

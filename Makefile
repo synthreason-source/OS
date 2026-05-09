@@ -41,20 +41,6 @@ $(DISK_IMG):
 	python3 mkfat32.py $(DISK_IMG) 128
 	@echo ">>> $(DISK_IMG) ready."
 
-# Run using Q35 machine which exposes the ICH9 AHCI controller on PCI.
-# -M q35        : Q35 chipset, has native ICH9 AHCI (PCI class 01:06)
-# -device ide-hd,drive=disk0,bus=ahci.0 : attach disk to AHCI port 0
-# No -no-acpi   : AHCI IRQ routing requires ACPI; removed so AHCI works
-run: $(MAIN) $(DISK_IMG)
-	qemu-system-i386 \
-	    -M q35 \
-	    -cdrom $(MAIN) -boot d \
-	    -m 8000M \
-	    -vga std \
-	    -drive id=disk0,file=$(DISK_IMG),format=raw,if=none \
-	    -device ahci,id=ahci \
-	    -device ide-hd,drive=disk0,bus=ahci.0
-
 iso: $(MULTIBOOT)
 	mkdir -p iso/boot/grub
 	cp $(MULTIBOOT) iso/boot/main.elf
@@ -79,7 +65,7 @@ clean:
 distclean: clean
 	rm -rf $(BOCHS_DIR) $(BOCHS_ARCHIVE) $(BUSYBOX_BIN) ramdisk.o $(DISK_IMG)
 
-.PHONY: all run clean distclean iso
+.PHONY: all clean distclean iso
 
 # ============================================================
 #  Bochs: download -> extract -> configure -> build cpu libs
@@ -162,7 +148,7 @@ hello_blob.o: hello
 #  bochs_infra.o provides all Bochs infrastructure globals
 #  (logfunctions, SIM, bx_cpu, bx_mem, bx_devices, etc.)
 # ============================================================
-BOCHS ?= 1
+BOCHS ?= 0
 
 ifeq ($(BOCHS),1)
 BOCHS_OBJ    := bochs_glue.o bochs_infra.o bochs_paramtree.o bochs_pc_system.o bochs_cstubs.o setjmp.o
