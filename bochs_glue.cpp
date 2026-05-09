@@ -2,6 +2,14 @@
 #include "bochs-2.7/cpu/cpu.h"
 #include "bochs-2.7/memory/memory-bochs.h"
 #include "bochs-2.7/pc_system.h"
+#include <setjmp.h>
+
+// Forward decls for the panic-rescue jmp_buf defined later in this TU.
+// We need them visible up here so bochs_cpu_init() can guard the
+// BX_CPU::initialize() call (see fix at bochs_cpu_init).
+extern "C" jmp_buf bx_panic_jmpbuf;
+extern "C" int     bx_panic_jmpbuf_armed;
+extern "C" volatile int bx_last_panic_code;
 
 extern "C" void* __dso_handle = nullptr;
 extern "C" int __cxa_atexit(void (*)(void*), void*, void*) { return 0; }
@@ -269,17 +277,80 @@ extern "C" void bochs_activate_slot(int slot) {
 // kernel.cpp, but is now an idempotent guarded one-shot. Subsequent
 // calls fall through to bochs_cpu_reset_for_launch().
 static bool g_cpu_inited_once = false;
+static bool g_cpu_init_failed  = false;   // set if BX_CPU::initialize() panicked
 
 static void bochs_cpu_reset_for_launch() {
     BX_CPU(0)->reset(BX_RESET_HARDWARE);
     bochs_cpu_enter_protected_mode();
 }
 
-extern "C" void bochs_cpu_init() {
-    if (!g_cpu_inited_once) {
-        BX_CPU(0)->initialize();
-        g_cpu_inited_once = true;
+// VGA breadcrumb at row 0, col 68 — distinct from the cpu_loop tags at
+// columns 70/72/73. 'i' = entered initialize(), 'I' = returned cleanly,
+// '!' = panicked through setjmp during initialize().
+static inline void glue_init_crumb(char c) {
+    volatile unsigned short* p = (volatile unsigned short*)(0xB8000 + 2*68);
+    *p = (unsigned short)(0x2F00 | (unsigned char)c);   // white-on-green
+}
+
+// ─── FIX v2: BX_CPU(0)->initialize() rescue path ─────────────────────────
+// initialize() walks the bochs param tree (SIM->get_param_*). Our KernelSIM
+// returns nullptr for every get_param query. Empirically, calling it from
+// a freestanding kernel either:
+//   (a) hangs in an infinite loop walking the tree,
+//   (b) host-faults dereferencing a nullptr (caught by the boot.S host
+//       IDT, painting a red HOST FAULT bar), or
+//   (c) panics through BX_PANIC / fatal / quit_sim.
+//
+// Only (c) is recoverable via setjmp. (a) and (b) are not — a running
+// kernel just stops with no breadcrumb past 'L'/'M'.
+//
+// The good news: we don't need initialize() for anything. The
+// reset(BX_RESET_HARDWARE) call alone produces a CPU sufficient to run
+// our guests (it sets GPRs, segment registers, EFLAGS, MSRs, and the
+// CPUID feature bits that have static defaults from BX_CPU_C's ctor).
+// initialize() exists to register the CPUID feature *parameters* with
+// the param tree for runtime configuration — something we never use.
+//
+// Default (BX_GLUE_SKIP_INITIALIZE=1, the safe path): never call
+// BX_CPU::initialize(). Skip straight to reset(). This is what fixes
+// the "stops at LM" hang.
+//
+// Opt-in (BX_GLUE_SKIP_INITIALIZE=0): try initialize() once, guarded by
+// setjmp so the (c)-class panic path is recoverable. Kept for anyone
+// who wants to investigate further without ripping the call out.
+#ifndef BX_GLUE_SKIP_INITIALIZE
+#define BX_GLUE_SKIP_INITIALIZE 1
+#endif
+
+static void bochs_cpu_initialize_guarded() {
+    if (g_cpu_inited_once || g_cpu_init_failed) return;
+
+#if BX_GLUE_SKIP_INITIALIZE
+    // Default path: skip initialize() entirely. The static ctor of
+    // BX_CPU_C plus reset(BX_RESET_HARDWARE) is enough.
+    glue_init_crumb('S');                // 'S' = Skipped initialize()
+    g_cpu_inited_once = true;
+    return;
+#else
+    glue_init_crumb('i');
+    bx_panic_jmpbuf_armed = 1;
+    if (setjmp(bx_panic_jmpbuf) != 0) {
+        // initialize() panicked. Mark it failed so we don't retry on the
+        // next launch, and let the caller fall through to reset().
+        bx_panic_jmpbuf_armed = 0;
+        g_cpu_init_failed = true;
+        glue_init_crumb('!');
+        return;
     }
+    BX_CPU(0)->initialize();
+    bx_panic_jmpbuf_armed = 0;
+    g_cpu_inited_once = true;
+    glue_init_crumb('I');
+#endif
+}
+
+extern "C" void bochs_cpu_init() {
+    bochs_cpu_initialize_guarded();
     bochs_cpu_reset_for_launch();
     // Note: do NOT clear g_cpu_ready here. bochs_cpu_set_eip() will set
     // it to true when the kernel hands us an entry point. Clearing it
@@ -294,10 +365,7 @@ extern "C" void bochs_cpu_init() {
 // first call to bochs_cpu_init() but is named for clarity at the
 // startup site. Safe to call zero or many times.
 extern "C" void bochs_cpu_prewarm() {
-    if (!g_cpu_inited_once) {
-        BX_CPU(0)->initialize();
-        g_cpu_inited_once = true;
-    }
+    bochs_cpu_initialize_guarded();
 }
 
 // ─── DIAGNOSTIC: panic recovery state ────────────────────────────────────────
@@ -314,7 +382,7 @@ extern "C" void bochs_cpu_prewarm() {
 //   col 73: rotating digit so we can see ticks happening
 //   col 79: kernel main-loop spinner (set by kernel.cpp)
 
-#include <setjmp.h>
+// (setjmp.h already included at top of file; jmp_buf forward-declared there.)
 extern "C" {
     jmp_buf bx_panic_jmpbuf;
     int     bx_panic_jmpbuf_armed = 0;

@@ -73,7 +73,7 @@ iso: $(MULTIBOOT)
 
 
 clean:
-	rm -rf *.o main.iso iso
+	rm -rf *.o main.iso iso hello hello_blob.o
 
 # distclean also removes the disk image and downloaded sources
 distclean: clean
