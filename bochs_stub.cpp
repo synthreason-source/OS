@@ -9,6 +9,7 @@ extern "C" {
              int  (*)(int),
              void (*)(int, char),
              void (*)(int, int))                                       {}
+    void bochs_finalize_process_memory()                              {}
     void bochs_cpu_set_eip(unsigned int)                              {}
     void bochs_cpu_set_esp(unsigned int)                              {}
     int  bochs_cpu_tick(int)                            { return 0;  }

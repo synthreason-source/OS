@@ -232,7 +232,7 @@ static inline uint32_t pci_read_config_dword(uint16_t bus, uint8_t device, uint8
 #include <cstdint>
 
 // Your existing includes/types/stdlib from paste.txt...
-#define SECTORSIZE 512
+// SECTORSIZE removed - use SECTOR_SIZE (defined above)
 typedef unsigned char uint8_t;
 typedef unsigned short uint16_t;
 typedef unsigned int uint32_t;
@@ -4934,6 +4934,28 @@ struct ExecContext {
 };
 static RunContext run_contexts[MAX_RUN_PROCESSES];
 static ExecContext exec_contexts[MAX_EXEC_PROCESSES];
+extern "C" void cmd_run(uint64_t ahci_base, int port, const char* filename) {
+    if (!filename) { return; }
+    // Find a free run slot
+    for (int i = 0; i < MAX_RUN_PROCESSES; i++) {
+        if (!run_contexts[i].active) {
+            RunContext& ctx = run_contexts[i];
+            ctx.active = false;
+            ctx.ahci_base = ahci_base;
+            ctx.port = port;
+            strncpy(ctx.filename, filename, 63);
+            ctx.filename[63] = '\0';
+            if (TVMObject::load(ahci_base, port, filename, ctx.prog) != 0) {
+                return;
+            }
+            const char* av[] = { filename, nullptr };
+            ctx.vm.start_execution(ctx.prog, 1, av, ahci_base, port, nullptr);
+            ctx.active = true;
+            return;
+        }
+    }
+}
+
 	
 	// List active run processes
 void list_run_processes() {
@@ -5095,7 +5117,8 @@ private:
 static constexpr int EDIT_ROWS = 35;       // rows visible in the editor area
 static constexpr int EDIT_COL_PIX = 8;     // font width
 static constexpr int EDIT_LINE_PIX = 10;   // line height
-void put_char(char c) {
+public:  // put_char overrides Window::put_char
+void put_char(char c) override {
         if (in_editor) return; // Don't mess with editor
 
         // Ensure we have at least one line
@@ -7025,19 +7048,6 @@ static void elf_io_exit (int slot, int code) {
 }static void dbg(const char* s) { /* write to VGA or terminal */ }
 // Minimal ELF execution path for Bochs-backed processes.
 // Assumes your existing kernel includes/types/helpers are already present.
-
-#define MAX_ELF_PROCESSES 4
-#define ELF_STACK_SIZE (64 * 1024)
-#define ELF_HEAP_SIZE  (256 * 1024)
-
-extern "C" void bochs_activate_slot(int slot);
-extern "C" void bochs_set_process_memory(unsigned char* base, unsigned int size, unsigned int vaddr_base);
-extern "C" void bochs_finalize_process_memory();
-extern "C" void bochs_set_brk(int slot, unsigned int brk_addr);
-extern "C" void bochs_cpu_init();
-extern "C" void bochs_cpu_set_eip(unsigned int eip);
-extern "C" void bochs_cpu_set_esp(unsigned int esp);
-extern "C" int bochs_cpu_tick(int steps);
 
 
 static inline unsigned int align_down(unsigned int v, unsigned int a) {

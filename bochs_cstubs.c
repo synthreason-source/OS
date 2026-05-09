@@ -53,7 +53,7 @@ int __snprintf_chk(char* b,size_t n,int f,size_t dsz,const char* fmt,...){(void)
 int __vsprintf_chk(char* b,int f,size_t dsz,const char* fmt,void* ap){(void)f;(void)dsz;(void)fmt;(void)ap;if(b)*b=0;return 0;}
 int __fprintf_chk(void* fp,int f,const char* fmt,...){(void)fp;(void)f;(void)fmt;return 0;}
 int __printf_chk(int f,const char* fmt,...){(void)f;(void)fmt;return 0;}
-void __stack_chk_fail(void){abort();}
+// __stack_chk_fail provided by fixes.h via -include
 void __assert_fail(const char* a,const char* b,unsigned c,const char* d){(void)a;(void)b;(void)c;(void)d;abort();}
 
 /* ── Math / random / time ─────────────────────────────────────────────────── */
