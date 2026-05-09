@@ -96,8 +96,6 @@ $(BOCHS_CPU_LIB): $(BOCHS_DIR)/.extracted
 	cd $(BOCHS_DIR) && ./configure          \
 	    --enable-cpu-level=6                \
 	    --enable-fpu                         \
-	    --disable-x86-64                     \
-	    --disable-debugger                   \
 	    --with-nogui                         \
 	    --host=i686-linux-gnu               \
 	    CXXFLAGS="-O2 -m32 -fno-stack-protector -fno-pie" \
