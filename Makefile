@@ -148,7 +148,7 @@ hello_blob.o: hello
 #  bochs_infra.o provides all Bochs infrastructure globals
 #  (logfunctions, SIM, bx_cpu, bx_mem, bx_devices, etc.)
 # ============================================================
-BOCHS ?= 1
+BOCHS ?= 0
 
 ifeq ($(BOCHS),1)
 BOCHS_OBJ    := bochs_glue.o bochs_infra.o bochs_paramtree.o bochs_pc_system.o bochs_cstubs.o setjmp.o
