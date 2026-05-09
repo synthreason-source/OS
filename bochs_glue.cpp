@@ -253,11 +253,51 @@ extern "C" void bochs_activate_slot(int slot) {
     g_active_slot = slot;
 }
 
-extern "C" void bochs_cpu_init() {
-    BX_CPU(0)->initialize();
+// ── Initialisation split ─────────────────────────────────────────────────
+// bochs_cpu_init() must run EXACTLY ONCE per boot. The libcpu.a path
+// BX_CPU::initialize() registers CPUID parameters via SIM->get_param_*
+// which our stub returns nullptr for; calling it a second time on a
+// fully-initialised CPU re-walks those registration paths and on QEMU
+// has been observed to host-fault (no host IDT present, so the box
+// triple-faults silently with the kernel heartbeat frozen).
+//
+// Per-launch we now only need to:
+//   1. reset the CPU to a known state (BX_RESET_HARDWARE)
+//   2. re-enter protected mode with the active slot's GDT/IDT
+//
+// bochs_cpu_init() remains exposed for backward compatibility with
+// kernel.cpp, but is now an idempotent guarded one-shot. Subsequent
+// calls fall through to bochs_cpu_reset_for_launch().
+static bool g_cpu_inited_once = false;
+
+static void bochs_cpu_reset_for_launch() {
     BX_CPU(0)->reset(BX_RESET_HARDWARE);
     bochs_cpu_enter_protected_mode();
-    g_cpu_ready = false;
+}
+
+extern "C" void bochs_cpu_init() {
+    if (!g_cpu_inited_once) {
+        BX_CPU(0)->initialize();
+        g_cpu_inited_once = true;
+    }
+    bochs_cpu_reset_for_launch();
+    // Note: do NOT clear g_cpu_ready here. bochs_cpu_set_eip() will set
+    // it to true when the kernel hands us an entry point. Clearing it
+    // means a relaunch that calls reset->set_esp->set_eip is fine; but
+    // a stray reset that doesn't follow up with set_eip would also be
+    // fine (the next set_eip arms it). Leaving the prior value alone
+    // is the more conservative choice.
+}
+
+// Optional explicit one-shot prewarm. kernel.cpp can call this from
+// kernel_main before any ELF launches; it does the same work as the
+// first call to bochs_cpu_init() but is named for clarity at the
+// startup site. Safe to call zero or many times.
+extern "C" void bochs_cpu_prewarm() {
+    if (!g_cpu_inited_once) {
+        BX_CPU(0)->initialize();
+        g_cpu_inited_once = true;
+    }
 }
 
 // ─── DIAGNOSTIC: panic recovery state ────────────────────────────────────────

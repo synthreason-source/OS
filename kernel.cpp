@@ -321,6 +321,7 @@ char pop_output(int slot) {
 extern "C" void bochs_set_process_memory(
     uint8_t* base, uint32_t size, uint32_t vaddr_base);
 extern "C" void bochs_cpu_init();
+extern "C" void bochs_cpu_prewarm();
 extern "C" void bochs_cpu_set_eip(uint32_t eip);
 extern "C" void bochs_cpu_set_esp(uint32_t esp);
 extern "C" int  bochs_cpu_tick(int steps);
@@ -926,6 +927,117 @@ void draw_char(char c, int x, int y, uint32_t color) {
 void draw_string(const char* str, int x, int y, uint32_t color) {
     for (int i = 0; str[i]; i++) {
         draw_char(str[i], x + i * 8, y, color);
+    }
+}
+
+// ─── Host CPU fault handler (called from boot.S isr_common) ────────────
+//
+// boot.S installs a 256-entry IDT pointing at stubs that all chain to
+// isr_common. isr_common writes a VGA-text-mode breadcrumb at row 1 ('!'
+// + hex vector) then calls THIS function with the vector number, then
+// halts forever. We render the same info onto the live framebuffer so
+// the user can see the fault tag even after graphics mode hides VGA
+// text. This is a one-shot, no-return diagnostic — we never resume from
+// a host fault.
+extern "C" void host_fault_handler(unsigned vector) {
+    if (!fb_info.ptr) return;
+
+    auto put_glyph = [](char ch, int x0, int y0, uint32_t color) {
+        if ((unsigned char)ch > 127) return;
+        if (x0 + 8 > (int)fb_info.width)  return;
+        if (y0 + 8 > (int)fb_info.height) return;
+        const uint8_t* glyph = font + (int)ch * 8;
+        for (int yy = 0; yy < 8; ++yy) {
+            uint32_t* row = &fb_info.ptr[(y0 + yy) * (fb_info.pitch / 4) + x0];
+            uint8_t bits = glyph[yy];
+            for (int xx = 0; xx < 8; ++xx) {
+                row[xx] = (bits & (0x80 >> xx)) ? color : 0xC00000u;
+            }
+        }
+    };
+
+    // Bright red bar across the top — impossible to miss.
+    int bar_h = 24;
+    if (bar_h > (int)fb_info.height) bar_h = (int)fb_info.height;
+    for (int y = 0; y < bar_h; ++y) {
+        uint32_t* row = &fb_info.ptr[y * (fb_info.pitch / 4)];
+        for (uint32_t x = 0; x < fb_info.width; ++x) row[x] = 0xC00000u;
+    }
+
+    // "HOST FAULT !XX" near top-left.
+    const char* msg = "HOST FAULT !";
+    int x = 8;
+    int y = 8;
+    for (int i = 0; msg[i]; ++i) {
+        put_glyph(msg[i], x, y, 0xFFFFFFu);
+        x += 8;
+    }
+    auto hex = [](unsigned n) -> char {
+        return (char)((n < 10) ? ('0' + n) : ('A' + (n - 10)));
+    };
+    put_glyph(hex((vector >> 4) & 0xF), x,     y, 0xFFFFFFu);
+    put_glyph(hex( vector       & 0xF), x + 8, y, 0xFFFFFFu);
+}
+
+// ─── Diagnostic overlay: mirror VGA text mode (rows 0 / 1 / 2) onto the
+// framebuffer ────────────────────────────────────────────────────────────────
+//
+// The kernel writes diagnostic breadcrumbs to VGA text memory at 0xB8000:
+//   row 0: boot trace ('B','S','Z','C'), heartbeat at col 79, panic tag
+//          at col 70 (from bx_recover), Bochs tick markers at col 72/73.
+//   row 1: host-IDT fault tag '!XX' (from boot.S isr_common).
+//   row 2: x86_tick lazy-init progress (L,M,I,S,E,B,T,t).
+//
+// Once the framebuffer is initialised these writes are invisible because
+// graphics mode hides the VGA text plane. This overlay reads the first
+// 80 cells of rows 0/1/2 every frame and draws them as a 24-pixel strip
+// across the top of the framebuffer, so any breadcrumb that gets written
+// is visible immediately.
+extern "C" void draw_vga_overlay() {
+    if (!backbuffer || !fb_info.ptr) return;
+
+    // Black backdrop bar (inline to avoid forward-decl on draw_rect_filled).
+    {
+        int bar_h = 24;     // 3 rows of 8px
+        if (bar_h > (int)fb_info.height) bar_h = (int)fb_info.height;
+        for (int y = 0; y < bar_h; ++y) {
+            uint32_t* row = &backbuffer[y * fb_info.width];
+            for (uint32_t x = 0; x < fb_info.width; ++x) row[x] = 0x000000u;
+        }
+    }
+
+    volatile const uint16_t* vga = (volatile const uint16_t*)0xB8000;
+
+    auto vga_attr_to_rgb = [](uint8_t attr) -> uint32_t {
+        uint8_t fg = attr & 0x0F;
+        static const uint32_t fg_rgb[16] = {
+            0x000000, 0x0000AA, 0x00AA00, 0x00AAAA,
+            0xAA0000, 0xAA00AA, 0xAA5500, 0xAAAAAA,
+            0x555555, 0x5555FF, 0x55FF55, 0x55FFFF,
+            0xFF5555, 0xFF55FF, 0xFFFF55, 0xFFFFFF
+        };
+        return fg_rgb[fg];
+    };
+
+    // Detect emphasised backgrounds (0x4F = white-on-red, used for host
+    // IDT and Bochs panic): promote those to bright red.
+    auto cell_color = [&](uint16_t cell) -> uint32_t {
+        uint8_t attr = (uint8_t)(cell >> 8);
+        if ((attr & 0xF0) == 0x40) return 0xFF4040u;
+        return vga_attr_to_rgb(attr);
+    };
+
+    for (int row = 0; row < 3; ++row) {
+        for (int col = 0; col < 80; ++col) {
+            uint16_t cell = vga[row * 80 + col];
+            char ch = (char)(cell & 0xFF);
+            if (ch == 0) continue;
+            int x = col * 8;
+            int y = row * 8;
+            if (x + 8 > (int)fb_info.width)  break;
+            if (y + 8 > (int)fb_info.height) break;
+            draw_char(ch, x, y, cell_color(cell));
+        }
     }
 }
 
@@ -7024,11 +7136,20 @@ void init_elf_system() {
         bochs_register_io_callbacks(s, elf_io_read, elf_io_write, elf_io_exit);
     }
     // NOTE: bochs_cpu_init() is NOT called here.
-    // Calling reset() at startup points the CPU at the BIOS reset vector
-    // (0xFFFF0) with no memory mapped, which causes a triple fault and
-    // permanently disables the Bochs virtual CPU before any ELF runs.
-    // Instead, bochs_cpu_init() is called lazily inside x86_tick on the
-    // very first process launch.
+    //
+    // We tried calling bochs_cpu_prewarm() (a guarded BX_CPU::initialize)
+    // here to surface init-time bugs early, but it triggered the VMware
+    // BAR1-unmap path documented at the top of vmware_svga_init(), causing
+    // VMware to die with "execute an invalid part of memory". The early
+    // call was unnecessary anyway: the host IDT installed in boot.S means
+    // a host fault inside BX_CPU::initialize() during lazy init now
+    // produces a visible "!XX" breadcrumb at VGA row 1 instead of a
+    // silent triple fault.
+    //
+    // Init runs lazily on the first ELF launch via x86_tick. The
+    // bochs_cpu_init() guard added in bochs_glue.cpp ensures
+    // BX_CPU::initialize() runs at most once per boot regardless of how
+    // many times the kernel calls bochs_cpu_init().
 }
 // I/O callback adapters
 static int  elf_io_read (int slot) { return pop_input(slot); }
@@ -7176,6 +7297,54 @@ static bool start_elf_process(int slot, const unsigned char* elf, unsigned int e
 }
 
 extern "C" volatile unsigned char bx_panic_breadcrumbs[64];
+// ── Diagnostic breadcrumb at VGA row 2 ────────────────────────────────────
+// Each x86_tick lazy-init step writes a tag char to row 2 columns 0..N.
+// Tags are:
+//   col 0: 'L'  — entered lazy init
+//   col 1: 'M'  — set_process_memory returned
+//   col 2: 'I'  — bochs_cpu_init returned
+//   col 3: 'S'  — set_esp returned
+//   col 4: 'E'  — set_eip returned
+//   col 5: 'B'  — set_brk returned
+//   col 6: 'T'  — about to call bochs_cpu_tick
+//   col 7: 't'  — bochs_cpu_tick returned
+// If lazy init wedges, the last tag visible tells you which call did it.
+//
+// We write to BOTH the VGA text-mode plane (forensic for pmemsave) AND
+// directly to the live framebuffer (visible to the user even if the
+// kernel never reaches swap_buffers again). Direct framebuffer writes
+// bypass the back buffer and use fb_info.ptr; that means they survive
+// a hang inside x86_tick that prevents the next paint cycle.
+static inline void x86_breadcrumb(int col, char c) {
+    if (col < 0 || col >= 80) return;
+
+    // 1. VGA text-mode plane (forensic).
+    {
+        volatile unsigned short* p =
+            (volatile unsigned short*)(0xB8000 + 2 * 80 + 2 * col);
+        *p = (unsigned short)(0x0E00u | (unsigned char)c);
+    }
+
+    // 2. Live framebuffer (visible). 8x8 yellow glyph at row 2 of overlay.
+    if (!fb_info.ptr) return;
+    if ((unsigned char)c > 127) return;
+    const uint8_t* glyph = font + (int)c * 8;
+    int x0 = col * 8;
+    int y0 = 16;          // row 2 of overlay (rows 0,1,2 each 8px tall)
+    if (x0 + 8 > (int)fb_info.width)  return;
+    if (y0 + 8 > (int)fb_info.height) return;
+
+    uint32_t color = 0xFFFF55u;   // bright yellow
+    uint32_t bg    = 0x000000u;
+    for (int yy = 0; yy < 8; ++yy) {
+        uint32_t* row = &fb_info.ptr[(y0 + yy) * (fb_info.pitch / 4) + x0];
+        uint8_t bits = glyph[yy];
+        for (int xx = 0; xx < 8; ++xx) {
+            row[xx] = (bits & (0x80 >> xx)) ? color : bg;
+        }
+    }
+}
+
 static bool x86_tick(int slot, int steps) {
     ElfProcess& proc = elf_processes[slot];
     // Tick a process that is alive: active and NOT yet completed.
@@ -7200,16 +7369,24 @@ static bool x86_tick(int slot, int steps) {
         // Re-register the slab (the glue unregisters any previous mapping
         // for the slot first, so this is idempotent). Then hardware-reset
         // the CPU, enter protected mode, and point it at the guest entry.
+        x86_breadcrumb(0, 'L');
         bochs_set_process_memory(proc.memory_base, proc.memory_size,
                                  proc.vaddr_base);
+        x86_breadcrumb(1, 'M');
         bochs_cpu_init();
+        x86_breadcrumb(2, 'I');
         bochs_cpu_set_esp(proc.esp);
+        x86_breadcrumb(3, 'S');
         bochs_cpu_set_eip(proc.entry_point);
+        x86_breadcrumb(4, 'E');
         bochs_set_brk(slot, proc.vaddr_base + proc.memory_size - ELFHEAPSIZE);
+        x86_breadcrumb(5, 'B');
         proc.cpu_initialized = true;
     }
 
+    x86_breadcrumb(6, 'T');
     bochs_cpu_tick(steps);
+    x86_breadcrumb(7, 't');
 
     unsigned int eip = bochs_cpu_get_eip();
     if (eip == 0 || eip < proc.vaddr_base ||
@@ -7778,6 +7955,14 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
         wm.cleanup_closed_windows();
 
         if (g_evt_timer && (g_timer_ticks - last_paint_tick) >= TICKS_PER_FRAME) {
+            // Tick ELF processes BEFORE the paint so any breadcrumbs they
+            // write (x86_breadcrumb at row 2, glue's tick markers at row 0
+            // col 72/73, panic tags at col 70) are reflected in the next
+            // swap_buffers. Otherwise a hang inside tick_elf_processes
+            // would leave the last painted frame without the breadcrumbs
+            // pointing at where the hang happened.
+            tick_elf_processes(100);
+
             if (g_evt_dirty || g_input_state.hasNewInput) {
                 last_paint_tick           = g_timer_ticks;
                 g_evt_dirty               = false;
@@ -7785,9 +7970,14 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
                 g_gfx.clear_screen(ColorPalette::DESKTOP_BLUE);
                 wm.update_all();
                 draw_cursor(mouse_x, mouse_y, ColorPalette::CURSOR_WHITE);
+                // Diagnostic overlay: paint VGA text-mode rows 0/1/2
+                // (boot/panic/tick breadcrumbs, host-IDT fault tags,
+                // x86_tick lazy-init progress) onto the framebuffer so
+                // they are visible in graphics mode. Drawn last so it
+                // overlays everything.
+                draw_vga_overlay();
                 swap_buffers();
             }
-						tick_elf_processes(100);
 
             g_evt_timer = false;
         }

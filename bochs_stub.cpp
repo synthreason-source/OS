@@ -1,6 +1,7 @@
 // bochs_stub.cpp — no-op stubs used when building without Bochs (BOCHS=0).
 extern "C" {
     void bochs_cpu_init()                                             {}
+    void bochs_cpu_prewarm()                                          {}
     void bochs_set_process_memory(unsigned char*, unsigned int,
                                   unsigned int /*vaddr_base*/)        {}
     void bochs_set_brk(int, unsigned int)                             {}
