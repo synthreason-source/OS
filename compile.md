@@ -7,7 +7,17 @@ sudo apt install make gcc-multilib gcc-13-multilib gcc gcc-13 binutils grub-comm
 
 sudo make clean
 
-sudo make run
+make clean && make BOCHS=1
 
+	qemu-system-i386 \
+	    -M q35 \
+	    -cdrom main.iso -boot d \
+	    -m 8000M \
+	    -vga std \
+	    -drive id=disk0,file=disk.img,format=raw,if=none \
+	    -device ahci,id=ahci \
+	    -device ide-hd,drive=disk0,bus=ahci.0
+      
 use VMware (other-64bit) with SATA drive, port 0
+
 
