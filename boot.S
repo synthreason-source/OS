@@ -86,6 +86,31 @@ _start:
     /* Setup stack */
     mov $stack_top, %esp
 
+    /* ── FPU + CR0 initialisation ────────────────────────────────────────
+       Bochs' bx_pc_system_c::initialize() does:
+           m_ips = double(ips) / 1000000.0L;
+       The 80-bit `long double` divide forces the i386 backend to emit
+       x87 FPU instructions (fldt / fdivr / fstpl). If the FPU is left
+       in whatever state the BIOS / GRUB handed us — possibly with
+       pending unmasked exceptions, or with CR0.EM=1 (no FPU emulation
+       allowed) or CR0.TS=1 (task switched) — the first FPU instruction
+       hangs the host: either the CPU stalls waiting for FERR# on the
+       legacy IRQ13 path (no NE bit), or it raises #NM/#MF into our
+       ISR 7/16 that just halts forever. Either way: the kernel appears
+       frozen at  bx_pc_system.initialize(50000000u) .
+
+       Fix: clear CR0.EM and CR0.TS, set CR0.MP (so #NM is precise) and
+       CR0.NE (so x87 errors come in via #MF, not the IRQ13 chipset
+       loop), then  fninit  to drop any pending exception state and
+       set the control word to a known masked-all configuration.    */
+
+    mov  %cr0, %eax
+    and  $0xFFFFFFFB, %eax     /* clear EM (bit 2) — FPU is real, not emulated */
+    or   $0x00000022, %eax     /* set MP (bit 1) and NE (bit 5)               */
+    and  $0xFFFFFFF7, %eax     /* clear TS (bit 3)                            */
+    mov  %eax, %cr0
+    fninit                      /* clear FPU state, mask all exceptions       */
+
     /* Build IDT */
     call build_idt
 

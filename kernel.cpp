@@ -494,12 +494,25 @@ int snprintf(char* buffer, size_t size, const char* fmt, ...) {
 
 // --- Basic Memory Allocator ---
 // Single 32MB global heap in BSS (not stack!) — enough for BusyBox + 4 ELF procs + FAT32 + backbuffer
-/* 8 MB heap — keeps total BSS under ~12 MB so GRUB can zero it reliably.
-   32 MB caused boot crashes because the ELF BSS segment exceeded what most
-   GRUB 2 builds will zero before jumping to _start. */
-static uint8_t kernel_heap[10 * 1024 * 1024];
+/* 16 MB heap — keeps total BSS under ~20 MB so GRUB can zero it reliably.
+   100 MB caused bochs init_memory to corrupt/loop because GRUB only zeroes
+   ~12–24 MB of BSS before jumping to _start; FreeListAllocator nodes beyond
+   that boundary contained garbage.  Budget: BusyBox ramdisk (~2 MB mapped
+   read-only), 4 ELF slabs × ~300 KB, backbuffer 3 MB, FAT32 sector
+   buffers, Bochs init_memory internals (~2 MB).  16 MB covers all of that
+   with room to spare and keeps total BSS well within GRUB's zeroing window. */
+static uint8_t kernel_heap[16 * 1024 * 1024];
 static size_t heap_ptr = 0;
 void* operator new(size_t, void* p) { return p; }
+
+// Pulled forward from below so oom_halt() (which lives in this file before
+// the original include site) can paint glyphs to the live framebuffer.
+#include "font.h"
+
+// Forward decl of the framebuffer descriptor so oom_halt() can paint to the
+// live framebuffer below. Real definition (with initializer) is further down.
+struct FramebufferInfo { uint32_t* ptr; uint32_t width, height, pitch; };
+extern FramebufferInfo fb_info;
 
 class FreeListAllocator {
 public:
@@ -596,8 +609,14 @@ public:
 
 static FreeListAllocator g_allocator;
 
-// Write OOM message directly to VGA text buffer (safe even before framebuffer init)
+// Write OOM message directly to VGA text buffer AND to the live framebuffer.
+// VGA text alone is invisible in graphics mode unless draw_vga_overlay() runs
+// — but oom_halt() is reached from inside an allocation site that's about to
+// halt the kernel, so the main loop never paints again. Painting straight to
+// fb_info.ptr (live, NOT backbuffer) bypasses the swap_buffers cycle so the
+// message is visible immediately even with a dead main loop.
 static void oom_halt(size_t size) {
+    // ── 1. VGA text plane (forensic, visible only if overlay paints later) ──
     volatile char* vga = (volatile char*)0xB8000;
     const char* msg = "OOM HALT";
     for (int i = 0; msg[i]; i++) { vga[i*2] = msg[i]; vga[i*2+1] = 0x4F; }
@@ -610,6 +629,40 @@ static void oom_halt(size_t size) {
     int off = 8;
     vga[off*2]=' '; vga[off*2+1]=0x4F; off++;
     for (int i = 0; i < n; i++) { vga[(off+i)*2]=buf[i]; vga[(off+i)*2+1]=0x4F; }
+
+    // ── 2. Live framebuffer (visible immediately, survives a hung main loop) ──
+    if (fb_info.ptr) {
+        // Bright red bar across rows 24..47 — distinct from host_fault_handler's
+        // bar (rows 0..23) so we can tell OOM apart from CPU faults at a glance.
+        int bar_y0 = 24;
+        int bar_h  = 24;
+        if (bar_y0 + bar_h > (int)fb_info.height) bar_h = fb_info.height - bar_y0;
+        if (bar_h > 0) {
+            for (int y = bar_y0; y < bar_y0 + bar_h; ++y) {
+                uint32_t* row = &fb_info.ptr[y * (fb_info.pitch / 4)];
+                for (uint32_t x = 0; x < fb_info.width; ++x) row[x] = 0xC00000u;
+            }
+        }
+        auto put_glyph = [](char ch, int x0, int y0, uint32_t color) {
+            if ((unsigned char)ch > 127) return;
+            if (x0 + 8 > (int)fb_info.width)  return;
+            if (y0 + 8 > (int)fb_info.height) return;
+            const uint8_t* glyph = font + (int)ch * 8;
+            for (int yy = 0; yy < 8; ++yy) {
+                uint32_t* row = &fb_info.ptr[(y0 + yy) * (fb_info.pitch / 4) + x0];
+                uint8_t bits = glyph[yy];
+                for (int xx = 0; xx < 8; ++xx) {
+                    row[xx] = (bits & (0x80 >> xx)) ? color : 0xC00000u;
+                }
+            }
+        };
+        const char* prefix = "OOM HALT ";
+        int x = 8;
+        int y = bar_y0 + 8;
+        for (int i = 0; prefix[i]; ++i) { put_glyph(prefix[i], x, y, 0xFFFFFFu); x += 8; }
+        for (int i = 0; i < n;       ++i) { put_glyph(buf[i],    x, y, 0xFFFFFFu); x += 8; }
+    }
+
     asm volatile("cli");
     for(;;) asm volatile("hlt");
 }
@@ -657,8 +710,6 @@ struct multiboot_info {
     uint8_t framebuffer_bpp, framebuffer_type, color_info[6];
 } __attribute__((packed));
 
-#include "font.h"
-
 uint8_t rtc_read(uint8_t reg) { outb(0x70, reg); return inb(0x71); }
 uint8_t bcd_to_bin(uint8_t val) { return ((val / 16) * 10) + (val & 0x0F); }
 struct RTC_Time { uint8_t second, minute, hour, day, month; uint16_t year; };
@@ -686,7 +737,9 @@ RTC_Time read_rtc() {
    doesn't consume heap space.  fb_info dimensions are checked before use. */
 static uint32_t backbuffer_storage[1024 * 768];
 static uint32_t* backbuffer = backbuffer_storage;
-struct FramebufferInfo { uint32_t* ptr; uint32_t width, height, pitch; } fb_info;
+// FramebufferInfo struct is forward-declared near the top of this file (above
+// oom_halt). Here we just define the single instance.
+FramebufferInfo fb_info;
 
 // =============================================================================
 // UNIFIED COLOR PALETTE - PREVENTS COLOR INCONSISTENCIES
@@ -977,6 +1030,40 @@ extern "C" void host_fault_handler(unsigned vector) {
     };
     put_glyph(hex((vector >> 4) & 0xF), x,     y, 0xFFFFFFu);
     put_glyph(hex( vector       & 0xF), x + 8, y, 0xFFFFFFu);
+}
+
+// ─── Live framebuffer breadcrumb ───────────────────────────────────────────
+// Paints a single 8x8 glyph DIRECTLY to the live framebuffer (skipping the
+// backbuffer / swap_buffers path) at row 0, col `slot` (each slot 8 pixels
+// wide). Designed to be visible even when the kernel main loop hangs, since
+// it bypasses the per-frame paint cycle entirely.
+//
+// Used to localise freezes inside Bochs glue: each interesting step calls
+// live_breadcrumb with a different slot+char, so the LAST char visible
+// before the hang identifies the last successful step.
+//
+// Layout convention: slots 0..15 are reserved for bochs_glue diagnostics;
+// rendered at fb x=col*8, y=0 with a black background tile.
+extern "C" void live_breadcrumb(int slot, char ch) {
+    if (!fb_info.ptr) return;
+    if (slot < 0 || slot >= 80) return;
+
+    int x0 = slot * 8;
+    int y0 = 0;
+    if (x0 + 8 > (int)fb_info.width)  return;
+    if (y0 + 8 > (int)fb_info.height) return;
+
+    if ((unsigned char)ch > 127) ch = '?';
+    const uint8_t* glyph = font + (int)ch * 8;
+
+    for (int yy = 0; yy < 8; ++yy) {
+        uint32_t* row = &fb_info.ptr[(y0 + yy) * (fb_info.pitch / 4) + x0];
+        uint8_t bits = glyph[yy];
+        for (int xx = 0; xx < 8; ++xx) {
+            row[xx] = (bits & (0x80 >> xx)) ? 0xFFFF00u   /* yellow on */
+                                            : 0x000080u;  /* dark blue bg */
+        }
+    }
 }
 
 // ─── Diagnostic overlay: mirror VGA text mode (rows 0 / 1 / 2) onto the
@@ -5983,7 +6070,11 @@ void handle_command() {
 			}
 		}
 	}
-	if (strcmp(command, "compile") == 0) {
+	// NOTE: was `if (strcmp(...))` starting a second independent chain;
+	// changed to `else if` so commands matched by the first chain (help,
+	// aesenc, select_disk, unlock) don't also fall through to the
+	// ELF-launch / "command not found" branch at the end.
+	else if (strcmp(command, "compile") == 0) {
         cmd_compile(ahci_base, selected_port, get_arg(args, 0));
     } 
 	 else if (strcmp(command, "pself") == 0) {
@@ -6423,15 +6514,82 @@ void handle_command() {
         console_print("hello started.\n");
     }
 
-    // Fall-through: try to load 'command' as an ELF file from FAT32.
+    // Fall-through: try to handle 'command' as an ELF file from FAT32.
     // The ELF runs inside the Bochs CPU emulator via x86_tick / cpu_loop.
+    //
+    // Two modes:
+    //   (a) Ordinary shell terminal: detect that 'command' refers to an
+    //       ELF on disk, and spawn a *new* TerminalWindow flagged as an
+    //       emulator window. The new window's startup-command rerun
+    //       takes us into branch (b).
+    //   (b) Emulator window (we were spawned for this very ELF): run the
+    //       ELF in-place via load_and_execute_elf; output flows to this
+    //       window's console_print via the elf_io_write callback chain.
+    //
+    // The emulator-window detour exists because the user asked for the
+    // emulator to "load up in its terminal" — i.e. each ELF gets a fresh
+    // dedicated window rather than scribbling its output across the
+    // shell that launched it.
     else {
-        // handle_command() is a TerminalWindow method, so `this` is the
-        // owning terminal — that's what we want bound to the new process
-        // so its port-0xE9 output gets routed back to this terminal.
-        {
+        if (is_emulator_window) {
+            // (b) We ARE the spawned emulator window — run in-place.
             int s = load_and_execute_elf(command, args, this);
             if (s >= 0) captured_elf_slot = s;
+        } else {
+            // (a) Ordinary shell — probe FAT32 for the file. If it
+            // exists and starts with the ELF magic, spawn a fresh
+            // emulator window seeded with the same command line.
+            // Otherwise print "command not found" so the user gets a
+            // clear signal instead of a silent disk-read error.
+            fat_dir_entry_t entry;
+            uint32_t sec = 0, off = 0;
+            bool is_elf = false;
+            if (fat32_find_entry(command, &entry, &sec, &off) == 0) {
+                // Read just enough bytes to check the ELF magic without
+                // pulling the whole binary into memory twice. The disk
+                // read is cheap; we only do it once per typed command.
+                char* probe = fat32_read_file_as_string(command);
+                if (probe) {
+                    if (entry.file_size >= 4 &&
+                        (uint8_t)probe[0] == 0x7F &&
+                        probe[1] == 'E' && probe[2] == 'L' && probe[3] == 'F') {
+                        is_elf = true;
+                    }
+                    delete[] probe;
+                }
+            }
+
+            if (is_elf) {
+                // Rebuild the original command line ("name args...") so
+                // the spawned window sees the same input the user typed.
+                char buf[256];
+                int n = 0;
+                for (const char* p = command; *p && n < 254; ++p) buf[n++] = *p;
+                if (args && *args) {
+                    if (n < 254) buf[n++] = ' ';
+                    for (const char* p = args; *p && n < 254; ++p) buf[n++] = *p;
+                }
+                buf[n] = 0;
+
+                console_print("Launching '");
+                console_print(command);
+                console_print("' in Bochs emulator window...\n");
+
+                // Spawn the emulator window. Same offset cycling as
+                // launch_terminal_with_command(), but with the
+                // emulator_mode flag set so the spawned terminal knows
+                // to run the ELF in-place when its startup-command
+                // fires on first update().
+                static int emu_win_count = 0;
+                int idx = (emu_win_count++ % 10);
+                int o = idx * 30;
+                wm.add_window(new TerminalWindow(180 + o, 110 + o,
+                                                 buf, /*emulator_mode=*/true));
+            } else {
+                // Not a known command and not an ELF on disk.
+                console_print(command);
+                console_print(": command not found\n");
+            }
         }
     }
 
@@ -6561,9 +6719,19 @@ int load_and_execute_elf(const char* filename, const char* args, TerminalWindow*
 
 
 public:
-    TerminalWindow(int x, int y, const char* startup_command = nullptr) : Window(x, y, 640, 400, "Terminal"), line_count(0), line_pos(0), in_editor(false), 
-        edit_lines(nullptr), edit_line_count(0), edit_current_line(0), edit_cursor_col(0), edit_scroll_offset(0),
-        prompt_visual_lines(0) {
+    // is_emulator_window=true marks this terminal as a window that was
+    // spawned specifically to host a Bochs-emulated ELF. Used by
+    // handle_command()'s fall-through branch to decide whether to run an
+    // unknown ELF *in-place* (we are the emulator window) or to *spawn a
+    // fresh emulator window* (we are an ordinary shell).
+    TerminalWindow(int x, int y, const char* startup_command = nullptr,
+                   bool emulator_mode = false)
+        : Window(x, y, 640, 400, emulator_mode ? "Bochs Emulator" : "Terminal"),
+          line_count(0), line_pos(0), in_editor(false),
+          edit_lines(nullptr), edit_line_count(0), edit_current_line(0),
+          edit_cursor_col(0), edit_scroll_offset(0),
+          prompt_visual_lines(0),
+          is_emulator_window(emulator_mode) {
         memset(buffer, 0, sizeof(buffer));
         current_line[0] = '\0';
         private_startup_cmd[0] = '\0';
@@ -6571,9 +6739,19 @@ public:
             strncpy(private_startup_cmd, startup_command, 255);
             private_startup_cmd[255] = '\0';
         }
-        
+
+        // Print a banner in the emulator window so it's obvious to the
+        // user that this is the Bochs CPU emulator booting their ELF, not
+        // a normal shell. The banner is queued onto the terminal buffer
+        // before the auto-startup command runs on the next update().
+        if (emulator_mode) {
+            console_print("=== Bochs i386 CPU emulator ===\n");
+            console_print("Loading ELF and entering protected mode...\n");
+        }
+
         update_prompt_display(); // Show the initial prompt
     }
+    bool is_emulator_window = false;
     int captured_elf_slot = -1;
     int get_elf_slot() const override { return captured_elf_slot; }
 
@@ -8085,7 +8263,7 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
             // swap_buffers. Otherwise a hang inside tick_elf_processes
             // would leave the last painted frame without the breadcrumbs
             // pointing at where the hang happened.
-            //tick_elf_processes(100);
+            tick_elf_processes(100);
 
             if (g_evt_dirty || g_input_state.hasNewInput) {
                 last_paint_tick           = g_timer_ticks;

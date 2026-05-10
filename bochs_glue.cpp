@@ -11,6 +11,23 @@ extern "C" jmp_buf bx_panic_jmpbuf;
 extern "C" int     bx_panic_jmpbuf_armed;
 extern "C" volatile int bx_last_panic_code;
 
+// ─── Live framebuffer breadcrumb (provided by kernel.cpp) ──────────────────
+// Writes directly to the visible framebuffer so it shows up even if the
+// kernel main loop never gets to paint another frame. Use to localise
+// freezes inside the bochs glue init path.
+//
+// Slot map (col along VGA top row):
+//   30 = entered bochs_cpu_init
+//   31 = entered bochs_cpu_initialize_guarded
+//   32 = guard-flag check passed (about to call pc_system.initialize)
+//   33 = pc_system.initialize returned
+//   34 = about to call BX_MEM(0)->init_memory
+//   35 = init_memory returned
+//   36 = guarded() returning to bochs_cpu_init
+//   37 = about to call bochs_cpu_reset_for_launch
+//   38 = reset_for_launch returned (full bochs_cpu_init done)
+extern "C" void live_breadcrumb(int slot, char ch);
+
 // __dso_handle: defined here for the C++ static destructor machinery.
 // Use weak linkage so bochs_infra.cpp's identical definition coexists.
 __attribute__((weak)) void* __dso_handle = nullptr;
@@ -325,7 +342,9 @@ static inline void glue_init_crumb(char c) {
 #endif
 
 static void bochs_cpu_initialize_guarded() {
+    live_breadcrumb(31, '1');
     if (g_cpu_inited_once || g_cpu_init_failed) return;
+    live_breadcrumb(32, '2');
 
     // ─── FIX v3: bx_pc_system.initialize(ips) ─────────────────────────────
     // Several timing helpers in pc_system.cc (time_from_ticks, time_useconds,
@@ -338,7 +357,23 @@ static void bochs_cpu_initialize_guarded() {
     // initialize() itself just zeroes a handful of fields and stores
     // m_ips = ips/1e6 — no SIM-> calls, no allocation. Safe to call.
     // 50 MIPS is the bochs default for a "modern" CPU.
+    //
+    // ─── FIX v5: FPU init in boot.S ───────────────────────────────────────
+    // The body of initialize() looks trivial but the assignment
+    //   m_ips = double(ips) / 1000000.0L;
+    // forces the i386 backend to emit 80-bit x87 (long double divide).
+    // With the FPU in an indeterminate post-GRUB state the first fldt
+    // hangs the host — symptom: kernel freezes here, no 'P' breadcrumb
+    // ever appears at VGA col 68. boot.S now does fninit and clears
+    // CR0.EM/TS before kernel_main, which prevents the hang.
+    //
+    // The lowercase 'p' below is the *entered* breadcrumb. If you see
+    // 'p' but no 'P' the call hung inside initialize() — that points
+    // back at FPU state. If you don't see 'p' at all, control never
+    // reached this point.
+    glue_init_crumb('p');                 // 'p' = about to call initialize
     bx_pc_system.initialize(50000000u);
+    live_breadcrumb(33, '3');
     glue_init_crumb('P');                 // 'P' = pc_system initialized
 
     // ─── FIX v4: BX_MEM(0)->init_memory(guest, host) ───────────────────────
@@ -354,10 +389,27 @@ static void bochs_cpu_initialize_guarded() {
     // The SIM->get_param_bool path is now safe: KernelSIM returns a dummy
     // bx_param_bool_c (value=0) instead of nullptr. See bochs_infra.cpp.
     //
-    // Sizes: 16 MiB guest, 16 MiB host. The vector itself is unused (we
-    // override addressing via registerMemoryHandlers) but Bochs still wants
-    // the bookkeeping to be consistent. Both must be a multiple of 1 MiB.
-    BX_MEM(0)->init_memory(16u * 1024u * 1024u, 16u * 1024u * 1024u);
+    // ─── FIX v6: shrink host vector from 16 MiB to 1 MiB ──────────────────
+    // The kernel heap (kernel.cpp:kernel_heap) is 10 MiB. Asking init_memory
+    // for a 16 MiB host vector blows past that and the kernel's operator
+    // new() drops into oom_halt(), which writes "OOM HALT 16777216" to VGA
+    // text mode and `cli; hlt`s. In graphics mode, VGA text is invisible
+    // unless draw_vga_overlay() mirrors it — but the main loop is wedged
+    // inside the failing tick, so the user just sees a freeze with the
+    // last live breadcrumb still showing '4' (= about-to-call-init_memory).
+    //
+    // The host vector itself is mostly bookkeeping in our setup. Real
+    // guest memory is owned by the ElfProcess slabs; we route every
+    // physical access via registerMemoryHandlers' read_handler /
+    // write_handler callbacks (mem_read_handler, mem_write_handler above)
+    // and never touch BX_MEM's vector. So the smallest legal value is
+    // fine: 1 MiB satisfies the BX_ASSERT((host & 0xfffff) == 0) check
+    // and leaves the heap with plenty of room for everything else
+    // init_memory itself wants to new[] (blocks table, memory_handlers
+    // table, rom, bogus).
+    live_breadcrumb(34, '4');
+    BX_MEM(0)->init_memory(1u * 1024u * 1024u, 1u * 1024u * 1024u);
+    live_breadcrumb(35, '5');
     glue_init_crumb('M');                 // 'M' = mem subsystem initialized
 
 #if BX_GLUE_SKIP_INITIALIZE
@@ -385,8 +437,11 @@ static void bochs_cpu_initialize_guarded() {
 }
 
 extern "C" void bochs_cpu_init() {
+    live_breadcrumb(30, '0');
     bochs_cpu_initialize_guarded();
+    live_breadcrumb(36, '6');
     bochs_cpu_reset_for_launch();
+    live_breadcrumb(38, '8');
     // Note: do NOT clear g_cpu_ready here. bochs_cpu_set_eip() will set
     // it to true when the kernel hands us an entry point. Clearing it
     // means a relaunch that calls reset->set_esp->set_eip is fine; but
