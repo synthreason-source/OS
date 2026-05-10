@@ -11,7 +11,9 @@ extern "C" jmp_buf bx_panic_jmpbuf;
 extern "C" int     bx_panic_jmpbuf_armed;
 extern "C" volatile int bx_last_panic_code;
 
-extern "C" void* __dso_handle = nullptr;
+// __dso_handle: defined here for the C++ static destructor machinery.
+// Use weak linkage so bochs_infra.cpp's identical definition coexists.
+__attribute__((weak)) void* __dso_handle = nullptr;
 extern "C" int __cxa_atexit(void (*)(void*), void*, void*) { return 0; }
 extern "C" void __cxa_finalize(void*) {}
 
@@ -324,6 +326,39 @@ static inline void glue_init_crumb(char c) {
 
 static void bochs_cpu_initialize_guarded() {
     if (g_cpu_inited_once || g_cpu_init_failed) return;
+
+    // ─── FIX v3: bx_pc_system.initialize(ips) ─────────────────────────────
+    // Several timing helpers in pc_system.cc (time_from_ticks, time_useconds,
+    // time_to_ticks) divide or multiply by m_ips. m_ips is initialised by
+    // bx_pc_system_c::initialize(Bit32u ips) which we never called before,
+    // leaving it at 0.0. Anything inside cpu_loop that touches the timer
+    // path then divides by zero and host-faults (vector 0 = #DE, caught by
+    // boot.S host IDT, paints a red HOST FAULT !00 bar).
+    //
+    // initialize() itself just zeroes a handful of fields and stores
+    // m_ips = ips/1e6 — no SIM-> calls, no allocation. Safe to call.
+    // 50 MIPS is the bochs default for a "modern" CPU.
+    bx_pc_system.initialize(50000000u);
+    glue_init_crumb('P');                 // 'P' = pc_system initialized
+
+    // ─── FIX v4: BX_MEM(0)->init_memory(guest, host) ───────────────────────
+    // BX_MEM_C::registerMemoryHandlers indexes BX_MEM_THIS memory_handlers[]
+    // which is allocated by init_memory(). Without that allocation, the
+    // index lookup deref's a null/garbage pointer and host-faults during
+    // bochs_set_process_memory().
+    //
+    // init_memory itself does:
+    //   - alloc the vector / blocks / memory_handlers / rom / bogus
+    //   - sets pci_enabled = SIM->get_param_bool(BXPN_PCI_ENABLED)->get()
+    //
+    // The SIM->get_param_bool path is now safe: KernelSIM returns a dummy
+    // bx_param_bool_c (value=0) instead of nullptr. See bochs_infra.cpp.
+    //
+    // Sizes: 16 MiB guest, 16 MiB host. The vector itself is unused (we
+    // override addressing via registerMemoryHandlers) but Bochs still wants
+    // the bookkeeping to be consistent. Both must be a multiple of 1 MiB.
+    BX_MEM(0)->init_memory(16u * 1024u * 1024u, 16u * 1024u * 1024u);
+    glue_init_crumb('M');                 // 'M' = mem subsystem initialized
 
 #if BX_GLUE_SKIP_INITIALIZE
     // Default path: skip initialize() entirely. The static ctor of

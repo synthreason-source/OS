@@ -145,10 +145,21 @@ public:
     void reset_all_param()      override {}
 
     // ── param tree ───────────────────────────────────────────────────────────
+    // ─── FIX v4: return a dummy bx_param_bool_c (value=false) instead of
+    // nullptr so callers that immediately ->get() the result don't deref
+    // null. The most important caller is BX_MEM_C::init_memory which does:
+    //     pci_enabled = SIM->get_param_bool(BXPN_PCI_ENABLED)->get();
+    // and previously crashed with #PF when get_param_bool returned nullptr.
+    //
+    // The static is constructed lazily on first call so it doesn't depend on
+    // global-ctor ordering against bx_param_c's static state.
     bx_param_c*        get_param       (const char*, bx_param_c* = nullptr) override { return nullptr; }
     bx_param_num_c*    get_param_num   (const char*, bx_param_c* = nullptr) override { return nullptr; }
     bx_param_string_c* get_param_string(const char*, bx_param_c* = nullptr) override { return nullptr; }
-    bx_param_bool_c*   get_param_bool  (const char*, bx_param_c* = nullptr) override { return nullptr; }
+    bx_param_bool_c*   get_param_bool  (const char*, bx_param_c* = nullptr) override {
+        static bx_param_bool_c dummy(nullptr, "dummy", "dummy", "dummy", 0, 0);
+        return &dummy;
+    }
     bx_param_enum_c*   get_param_enum  (const char*, bx_param_c* = nullptr) override { return nullptr; }
     unsigned           gen_param_id()  override { return 0; }
 
@@ -290,8 +301,13 @@ extern "C" {
     int  __gxx_personality_v0(...) { return 0; }
     int  __gcc_personality_v0(...) { return 0; }
     void __cxa_guard_abort(long long*) {}
-    void* __dso_handle = nullptr;
 }
+// __dso_handle: glibc declares this with C++ linkage in some headers
+// (transitively included via paramtree.h → siminterface.h → cstdlib).
+// Declaring it inside an extern "C" block above causes a conflict, so
+// define it at the top level. bochs_glue.cpp has its own extern "C"
+// definition; the linker resolves to whichever it sees first.
+__attribute__((weak)) void* __dso_handle = nullptr;
 
 void operator delete(void*, unsigned int, std::align_val_t) noexcept {}
 

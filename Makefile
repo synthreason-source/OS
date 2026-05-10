@@ -148,9 +148,9 @@ hello_blob.o: hello
 #  bochs_infra.o provides all Bochs infrastructure globals
 #  (logfunctions, SIM, bx_cpu, bx_mem, bx_devices, etc.)
 # ============================================================
-BOCHS ?= 0
 
-ifeq ($(BOCHS),1)
+
+
 BOCHS_OBJ    := bochs_glue.o bochs_infra.o bochs_paramtree.o bochs_pc_system.o bochs_cstubs.o setjmp.o
 BOCHS_LIBS   := $(BOCHS_DIR)/cpu/libcpu.a \
                 $(BOCHS_DIR)/cpu/fpu/libfpu.a \
@@ -161,14 +161,7 @@ BOCHS_IFLAGS := -I$(BOCHS_DIR) -I$(BOCHS_DIR)/cpu \
 BOCHS_DEP    := $(BOCHS_CPU_LIB)
 BOCHS_CDEF   := -DBOCHS_ENABLED=1
 LIBGCC_EH    := /usr/lib/gcc/x86_64-linux-gnu/13/32/libgcc_eh.a
-else
-BOCHS_OBJ    := bochs_stub.o
-BOCHS_LIBS   :=
-BOCHS_IFLAGS :=
-BOCHS_DEP    :=
-BOCHS_CDEF   :=
-LIBGCC_EH    :=
-endif
+
 
 # ============================================================
 #  Kernel object files

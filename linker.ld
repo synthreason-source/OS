@@ -48,11 +48,14 @@ SECTIONS
         *(.gnu.linkonce.d.*)
         *(.got)
         *(.got.plt)
-        /* C++ static initialisers — run before kernel_main if needed.
-           Currently we do not call them (no crt0), but keeping them here
-           means the objects are at least present in the binary. */
-        *(.init_array)
-        *(.init_array.*)
+        /* C++ static initialisers — run by boot.S between BSS-zero and
+           kernel_main. The __init_array_start / __init_array_end
+           bracketing symbols let assembly walk the array of function
+           pointers regardless of which TUs contributed entries. */
+        __init_array_start = .;
+        KEEP(*(.init_array))
+        KEEP(*(.init_array.*))
+        __init_array_end = .;
         *(.data.rel.ro*)
     }
 

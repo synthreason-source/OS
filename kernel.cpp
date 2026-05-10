@@ -497,7 +497,7 @@ int snprintf(char* buffer, size_t size, const char* fmt, ...) {
 /* 8 MB heap — keeps total BSS under ~12 MB so GRUB can zero it reliably.
    32 MB caused boot crashes because the ELF BSS segment exceeded what most
    GRUB 2 builds will zero before jumping to _start. */
-static uint8_t kernel_heap[8 * 1024 * 1024];
+static uint8_t kernel_heap[10 * 1024 * 1024];
 static size_t heap_ptr = 0;
 void* operator new(size_t, void* p) { return p; }
 
@@ -7805,7 +7805,12 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
     // This MUST happen before reading any framebuffer address because the
     // linear FB is not live until ENABLE=1 is written.
     SVGAResult svga = vmware_svga_init(1024, 768);
-
+    if (magic != 0x2BADB002) {
+        volatile uint16_t* vga = (volatile uint16_t*)0xB8000;
+        vga[0] = 0x4F45; // 'E'
+        for (;;)
+            asm volatile("hlt");
+    }
     // ── Step 2: determine framebuffer address ────────────────────────────────
     multiboot_info* mbi = (multiboot_info*)multiboot_addr;
 
@@ -7815,6 +7820,7 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
         // The log shows VMware briefly unmaps/remaps 0xe8000000 during SVGA init;
         // a short spin ensures the mapping is live before we write pixels.
         for (volatile uint32_t i = 0; i < 5000000u; i++);
+		
         fb_info = { (uint32_t*)svga.fb, 1024, 768, svga.pitch };
     } else {
         // Not VMware (or SVGA II failed) — use GRUB multiboot info directly.
@@ -7823,6 +7829,12 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
         uint32_t fb_phys = 0, fb_w = 1024, fb_h = 768, fb_pitch = 1024*4;
 
         if ((mbi->flags & (1u << 12)) && mbi->framebuffer_type != 2) {
+			if (fb_phys == 0) {
+				volatile uint16_t* vga = (volatile uint16_t*)0xB8000;
+				vga[1] = 0x4F46; // 'F'
+				for (;;)
+					asm volatile("hlt");
+			}
             fb_phys  = (uint32_t)(uintptr_t)mbi->framebuffer_addr;
             fb_w     = mbi->framebuffer_width  ? mbi->framebuffer_width  : 1024;
             fb_h     = mbi->framebuffer_height ? mbi->framebuffer_height : 768;
