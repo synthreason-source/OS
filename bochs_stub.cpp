@@ -19,4 +19,6 @@ extern "C" {
     unsigned int bochs_cpu_get_eax()                    { return 0;  }
     // Returns false in stub mode (no Bochs, no real blocking)
     int bochs_process_wants_input(int)                  { return 0;  }
+    // Process-exit sentinel — no-op when Bochs is not built in.
+    void bochs_guest_exit(int)                                        {}
 }

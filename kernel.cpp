@@ -7678,6 +7678,15 @@ static bool x86_tick(int slot, int steps) {
     bochs_cpu_tick(steps);
     x86_breadcrumb(7, 't');
 
+    // ─── FIX: detect clean guest-exit signal ──────────────────────────────
+    // bochs_guest_exit() (triggered by an `out %al, $0xE8` from the IDT
+    // stub on any guest fault or trap) calls our exit_cb (elf_io_exit),
+    // which flips proc.active to false. Re-check it here so the surrounding
+    // tick_elf_processes sees `running == false` and clears the terminal's
+    // captured_elf_slot, returning the user to the shell prompt instead of
+    // leaving a dead emulator window taking input.
+    if (!proc.active || proc.completed) return false;
+
     unsigned int eip = bochs_cpu_get_eip();
     if (eip == 0 || eip < proc.vaddr_base ||
         eip >= proc.vaddr_base + proc.memory_size) {

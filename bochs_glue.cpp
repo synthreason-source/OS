@@ -52,6 +52,11 @@ static SlotState g_slots[MAX_BOCHS_SLOTS];
 static int g_active_slot = -1;
 static bool g_cpu_ready = false;
 
+// Forward decl: defined further down. bochs_set_process_memory() calls this
+// eagerly to make sure BX_MEM(0)->memory_handlers has been allocated by
+// init_memory() before registerMemoryHandlers() dereferences it.
+static void bochs_cpu_initialize_guarded();
+
 static void setup_flat_segment(bx_segment_reg_t& seg, Bit16u sel, bool code) {
     seg.selector.value = sel;
     seg.selector.rpl = 0;
@@ -141,14 +146,38 @@ static bool mem_write_handler(bx_phy_address addr, unsigned len, void* data, voi
 static void inject_idt_into_slab(SlotState& s) {
     if (!s.mem_base || s.mem_size < 0x1000) return;
 
-    static const Bit8u stub[12] = {
-        0xB8, 0x01, 0x00, 0x00, 0x00,
-        0xBB, 0x00, 0x00, 0x00, 0x00,
-        0xCD, 0x80
+    // ─── FIX: IDT stub no longer re-issues int $0x80 ───────────────────────
+    // The previous stub did:
+    //     mov $1, %eax       ; SYS_EXIT
+    //     mov $0, %ebx
+    //     int $0x80
+    //     hlt
+    // The intent was for bx_instr_interrupt() in bochs_glue.cpp to detect
+    // vector 0x80 and emulate a Linux _exit(0). But libcpu.a is prebuilt
+    // with BX_INSTRUMENTATION=0, so the BX_INSTR_INTERRUPT call site is
+    // compiled out — the hook is dead. As a result, `int $0x80` walks our
+    // IDT, finds vector 0x80 also pointing at slab+0, and re-executes the
+    // same stub. Infinite loop. cpu_loop never yields because async_event
+    // is only set on port-0xE9 writes. The whole kernel appears to hang.
+    //
+    // New stub uses a dedicated I/O port (0xE8) as a "process exit"
+    // sentinel. bx_devices_c::outp in bochs_infra.cpp routes writes to
+    // 0xE8 into bochs_guest_exit() below, which calls the slot's exit_cb
+    // (-> elf_io_exit -> proc.active=false) and arms kill_bochs_request
+    // so cpu_loop yields immediately.
+    //
+    //     B0 00         mov  $0, %al
+    //     E6 E8         out  %al, $0xE8       ; sentinel: exit active slot
+    //     F4            hlt                    ; safety: never reached
+    //     EB FE         jmp  .                 ; safety: spin if hlt returns
+    static const Bit8u stub[7] = {
+        0xB0, 0x00,         /* mov $0, %al                 */
+        0xE6, 0xE8,         /* out %al, $0xE8              */
+        0xF4,               /* hlt                         */
+        0xEB, 0xFE          /* jmp .  (spin on self)       */
     };
 
     __builtin_memcpy(s.mem_base + 0x000, stub, sizeof(stub));
-    s.mem_base[sizeof(stub)] = 0xF4;
 
     // ── GDT at slab offset 0x80 ──────────────────────────────────────────
     // Three flat descriptors matching the segment selectors used by
@@ -229,6 +258,29 @@ extern "C" void bochs_guest_putc(char c) {
     BX_CPU(0)->async_event = 1;
 }
 
+// ─── FIX: clean process-exit sentinel ──────────────────────────────────────
+// Set by bochs_guest_exit() when a guest writes port 0xE8 (which our IDT
+// stub does on any fault or `int` that lands in the trap handler). Read at
+// the top of every iteration of bochs_cpu_tick()'s inner loop so we don't
+// re-enter cpu_loop on a now-defunct slot — that would step the `hlt` that
+// follows our `out` instruction, putting the CPU into BX_ACTIVITY_STATE_HLT
+// and spinning forever inside handleWaitForEvent().
+static volatile int g_exit_pending = 0;
+
+// Called from bx_devices_c::outp when the guest writes port 0xE8. AL value
+// is treated as the exit code (currently informational only). Marks the
+// active slot as exited via its kernel-supplied exit_cb, then arms the
+// cpu_loop yield path the same way bochs_guest_putc does.
+extern "C" void bochs_guest_exit(int code) {
+    if (g_active_slot < 0 || g_active_slot >= MAX_BOCHS_SLOTS) return;
+    SlotState& s = g_slots[g_active_slot];
+    if (s.exit_cb) s.exit_cb(g_active_slot, code);
+
+    g_exit_pending = 1;
+    bx_pc_system.kill_bochs_request = 1;
+    BX_CPU(0)->async_event = 1;
+}
+
 extern "C" void bochs_register_io_callbacks(
     int slot,
     int (*read_cb)(int),
@@ -244,6 +296,29 @@ extern "C" void bochs_register_io_callbacks(
 
 extern "C" void bochs_set_process_memory(Bit8u* base, Bit32u size, Bit32u vaddr_base) {
     if (g_active_slot < 0) return;
+
+    // ─── FIX: ensure Bochs internal state is initialised before BX_MEM use ─
+    // BX_MEM_C::registerMemoryHandlers (called below) dereferences
+    // BX_MEM(0)->memory_handlers[page_idx], a table that BX_MEM_C's ctor
+    // initialises to NULL and that only gets allocated by
+    // BX_MEM(0)->init_memory(). init_memory() in turn is run by
+    // bochs_cpu_initialize_guarded().
+    //
+    // The previous flow was:
+    //   handle_command "hello"
+    //     -> bochs_set_process_memory          ← reaches NULL memory_handlers
+    //     -> registerMemoryHandlers            ← reads/writes (NULL)[idx]
+    //
+    // With paging disabled the NULL deref doesn't trap; it silently
+    // corrupts low memory (the multiboot info area around 0x400) and
+    // the kernel goes off the rails — the user sees the prompt with no
+    // "hello started." message and the system locks up on the next
+    // garbage pointer dereference further along.
+    //
+    // bochs_cpu_initialize_guarded() is idempotent (guarded by
+    // g_cpu_inited_once), so calling it eagerly here is free on every
+    // call after the first.
+    bochs_cpu_initialize_guarded();
 
     SlotState& s = g_slots[g_active_slot];
 
@@ -506,10 +581,29 @@ extern "C" int bochs_cpu_tick(int n) {
     if (n < 1) n = 1;
     if (n > 4) n = 4;
 
+    // Clear any stale exit-pending flag from a prior slot's exit. The flag
+    // is only meaningful WITHIN a single bochs_cpu_tick() invocation — if
+    // we entered here, the kernel side has decided this slot should run.
+    g_exit_pending = 0;
+
     static unsigned tick_seq = 0;
     glue_breadcrumb(73, '0' + (char)((tick_seq++) % 10));
 
     for (int i = 0; i < n; ++i) {
+        // ─── FIX: stop re-entering cpu_loop after a guest-exit signal ─────
+        // bochs_guest_exit() (triggered by port-0xE8 write from the IDT
+        // stub) sets g_exit_pending. The slot's exit_cb has already
+        // flipped proc.active=false on the kernel side, so the surrounding
+        // tick_elf_processes will skip this slot next round. But within
+        // THIS bochs_cpu_tick invocation, calling cpu_loop again would
+        // step the `hlt` that follows the `out` in our stub — Bochs would
+        // enter BX_ACTIVITY_STATE_HLT and spin inside handleWaitForEvent
+        // (no external interrupts ever arrive). Bail out cleanly instead.
+        if (g_exit_pending) {
+            g_exit_pending = 0;
+            return 0;
+        }
+
         // Arm panic recovery: any BX_PANIC/BX_FATAL/_Unwind_Resume inside
         // cpu_loop will longjmp back here instead of halting the host.
         bx_panic_jmpbuf_armed = 1;

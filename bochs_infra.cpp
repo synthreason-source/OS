@@ -82,6 +82,68 @@ Bit8u           bx_cpu_count = 1;
 Bit32u          apic_id_mask = 0;
 extern int      simulate_xapic;
 
+// ─── FIX: minimal BX_MEM_C::init_memory / register_state overrides ─────────
+// The stock BX_MEM_C::init_memory in libmemory.a does several things that
+// either hang or crash in our freestanding environment:
+//
+//   1. alloc_vector_aligned(host + BIOSROMSZ + EXROMSIZE + 4096, …)
+//      With BIOSROMSZ=2MB that's a ≈3.13MB host buffer we never use,
+//      since every guest memory access is routed through our
+//      registerMemoryHandlers callbacks (mem_read_handler / mem_write_handler
+//      in bochs_glue.cpp).
+//
+//   2. register_state()
+//      Walks SIM->get_bochs_root() and builds a save/restore param tree.
+//      KernelSIM returns nullptr for get_bochs_root(); the chain of
+//      bx_list_c / bx_param_num_c / bx_shadow_bool_c constructors that
+//      register_state runs against a nullptr-rooted tree is where the
+//      kernel hangs after typing `hello`. Breadcrumbs at VGA row 0
+//      show '1','2','3','4' (entered guarded, past bx_pc_system.initialize,
+//      about-to init_memory) but never '5' (init_memory returned).
+//
+//   3. blocks / rom / bogus / memory_type bookkeeping
+//      Used by the stock get_vector / readPhysicalPage path. We never
+//      call those — registerMemoryHandlers shortcuts the whole thing.
+//
+// The ONE thing init_memory does that we actually depend on is allocate
+// memory_handlers[] (1M entries on BX_PHY_ADDRESS_WIDTH=40), so
+// registerMemoryHandlers' indexing has somewhere to write. We supply a
+// minimal version that allocates just that table, leaves every other
+// field at its ctor-default, and skips register_state entirely.
+//
+// Replacement works because the Makefile links our objects before
+// libmemory.a and uses -Wl,--allow-multiple-definition, so this
+// definition wins over the prebuilt library's copy. Member-function
+// definitions in a .cpp that included memory-bochs.h have full access
+// to BX_MEM_C's private members.
+
+void BX_MEM_C::init_memory(Bit64u guest, Bit64u host)
+{
+    // misc_mem.cc keeps this macro file-local; redefine it here.
+    // One entry per megabyte of physical address space; 1M entries on
+    // BX_PHY_ADDRESS_WIDTH=40.
+    #ifndef BX_MEM_HANDLERS
+    #define BX_MEM_HANDLERS ((BX_CONST64(1) << BX_PHY_ADDRESS_WIDTH) >> 20)
+    #endif
+
+    BX_MEM_THIS len = guest;
+    BX_MEM_THIS allocated = host;
+    BX_MEM_THIS memory_handlers =
+        new struct memory_handler_struct *[BX_MEM_HANDLERS];
+    for (Bit32u idx = 0; idx < BX_MEM_HANDLERS; idx++) {
+        BX_MEM_THIS memory_handlers[idx] = nullptr;
+    }
+    // Everything else (vector, blocks, rom, bogus, pci_enabled,
+    // bios_*, smram_*, memory_type, rom_present) stays at the values
+    // the BX_MEM_C constructor set, which are NULL / 0 / false — the
+    // safe defaults for code paths we don't exercise.
+}
+
+// Stub register_state. The stock body builds a savestate param tree
+// rooted at SIM->get_bochs_root() (= nullptr in this kernel). We never
+// save or restore state, so a no-op is correct.
+void BX_MEM_C::register_state() {}
+
 // ═══ bx_devices_c ════════════════════════════════════════════════════════════
 
 bx_devices_c    bx_devices;
@@ -100,10 +162,16 @@ bx_devices_c::~bx_devices_c() {}
 void bx_devices_c::init_stubs() {}
 
 extern "C" void bochs_guest_putc(char c);
+extern "C" void bochs_guest_exit(int code);
 
 Bit32u bx_devices_c::inp (Bit16u, unsigned) { return 0xFFFF; }
 void   bx_devices_c::outp(Bit16u port, Bit32u val, unsigned) {
-    if (port == 0xE9) bochs_guest_putc((char)(val & 0xFF));
+    if      (port == 0xE9) bochs_guest_putc((char)(val & 0xFF));
+    // ─── FIX: process-exit sentinel ───────────────────────────────────────
+    // The IDT stub injected by bochs_glue.cpp:inject_idt_into_slab() writes
+    // AL to port 0xE8 on any guest fault or trap. Treat that as a clean
+    // exit signal for the active slot. See bochs_guest_exit() for details.
+    else if (port == 0xE8) bochs_guest_exit((int)(val & 0xFF));
 }
 void bx_devices_c::reset(unsigned) {}
 void bx_devices_c::exit()          {}
