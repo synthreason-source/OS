@@ -1259,10 +1259,11 @@ public:
 
     virtual void update() = 0;
     virtual void console_print(const char* s) {}
+    virtual int  get_elf_slot() const { return -1; }  // overridden by TerminalWindow
 
     bool is_in_titlebar(int mx, int my) { return mx > x && mx < x + w && my > y && my < y + 25; }
     bool is_in_close_button(int mx, int my) { int btn_x = x + w - 22, btn_y = y + 4; return mx >= btn_x && mx < btn_x + 18 && my >= btn_y && my < btn_y + 18; }
-    void close() { is_closed = true; }
+    virtual void close() { is_closed = true; }
 };
 
 class WindowManager {
@@ -1394,22 +1395,72 @@ void load_desktop_items() {
         }
     }
 
+    // Helper: draw a single 3D-style taskbar button
+    void draw_taskbar_button(int bx, int by, int bw, int bh,
+                             const char* label, bool active) {
+        using namespace ColorPalette;
+        uint32_t face  = active ? 0x6080C0u : BUTTON_FACE;
+        uint32_t tcolor = active ? TEXT_WHITE : TEXT_BLACK;
+        draw_rect_filled(bx, by, bw, 1,  BUTTON_HIGHLIGHT);
+        draw_rect_filled(bx, by, 1,  bh, BUTTON_HIGHLIGHT);
+        draw_rect_filled(bx + 1, by + bh - 1, bw - 1, 1, BUTTON_SHADOW);
+        draw_rect_filled(bx + bw - 1, by + 1,  1, bh - 1, BUTTON_SHADOW);
+        draw_rect_filled(bx + 1, by + 1, bw - 2, bh - 2, face);
+        // Truncate label to fit
+        char tmp[16];
+        int maxc = (bw - 8) / 8;
+        if (maxc < 1) maxc = 1;
+        if (maxc > 15) maxc = 15;
+        int li = 0;
+        for (; li < maxc && label[li]; li++) tmp[li] = label[li];
+        tmp[li] = 0;
+        draw_string(tmp, bx + 4, by + bh/2 - 4, tcolor);
+    }
+
     void draw_desktop() {
         using namespace ColorPalette;
         
         // Taskbar base
         draw_rect_filled(0, fb_info.height - 40, fb_info.width, 40, TASKBAR_GRAY);
+        draw_rect_filled(0, fb_info.height - 40, fb_info.width, 1, BUTTON_HIGHLIGHT);
         
-        // Terminal button with 3D effect
-        int btn_x = 4, btn_y = fb_info.height - 36;
-        int btn_w = 77, btn_h = 32;
-        
-        draw_rect_filled(btn_x, btn_y, btn_w, 1, BUTTON_HIGHLIGHT);
-        draw_rect_filled(btn_x, btn_y, 1, btn_h, BUTTON_HIGHLIGHT);
-        draw_rect_filled(btn_x + 1, btn_y + btn_h - 1, btn_w - 1, 1, BUTTON_SHADOW);
-        draw_rect_filled(btn_x + btn_w - 1, btn_y + 1, 1, btn_h - 1, BUTTON_SHADOW);
-        draw_rect_filled(btn_x + 1, btn_y + 1, btn_w - 2, btn_h - 2, BUTTON_FACE);
-        draw_string("Terminal", btn_x + 10, btn_y + 12, TEXT_BLACK);
+        // ── "Terminal" launcher button (always present, left-most) ──────────
+        int btn_y  = fb_info.height - 36;
+        int btn_h  = 32;
+        int btn_x  = 4;
+        int btn_w  = 80;
+        draw_taskbar_button(btn_x, btn_y, btn_w, btn_h, "Terminal", false);
+        btn_x += btn_w + 4;
+
+        // ── Per-slot ELF process buttons ─────────────────────────────────────
+        // Each active ELF slot gets its own button. Clicking it raises and
+        // focuses the terminal window that owns the slot. The active (focused)
+        // slot button is drawn highlighted in blue.
+        for (int s = 0; s < MAX_ELF_PROCESSES; ++s) {
+            if (!elf_processes[s].active) continue;  // skip idle and completed slots
+            // Build a label: "Slot N: <first few chars of cmdline>"
+            char label[20];
+            label[0] = 'S'; label[1] = '0' + (char)s; label[2] = ':'; label[3] = ' ';
+            // Append the first few chars of cmdline (or "elf" if empty)
+            const char* cmd = elf_processes[s].cmdline;
+            int ci = 4;
+            if (cmd[0]) {
+                for (int k = 0; cmd[k] && ci < 15; k++, ci++) label[ci] = cmd[k];
+            } else {
+                label[ci++] = 'e'; label[ci++] = 'l'; label[ci++] = 'f';
+            }
+            label[ci] = 0;
+
+            // Is this slot's terminal the focused window?
+            bool is_focused = false;
+            if (focused_idx >= 0 && focused_idx < num_windows) {
+                if (windows[focused_idx]->get_elf_slot() == s) is_focused = true;
+            }
+
+            draw_taskbar_button(btn_x, btn_y, btn_w, btn_h, label, is_focused);
+            btn_x += btn_w + 4;
+            if (btn_x + btn_w >= (int)fb_info.width - 100) break; // guard overflow
+        }
 
         // Draw desktop icons
         for (int i = 0; i < num_desktop_items; ++i) {
@@ -6378,7 +6429,10 @@ void handle_command() {
         // handle_command() is a TerminalWindow method, so `this` is the
         // owning terminal — that's what we want bound to the new process
         // so its port-0xE9 output gets routed back to this terminal.
-        load_and_execute_elf(command, args, this);
+        {
+            int s = load_and_execute_elf(command, args, this);
+            if (s >= 0) captured_elf_slot = s;
+        }
     }
 
     if(!in_editor) print_prompt();
@@ -6521,6 +6575,19 @@ public:
         update_prompt_display(); // Show the initial prompt
     }
     int captured_elf_slot = -1;
+    int get_elf_slot() const override { return captured_elf_slot; }
+
+    void close() override {
+        // Kill the attached ELF process so it disappears from the taskbar
+        if (captured_elf_slot >= 0 && captured_elf_slot < MAX_ELF_PROCESSES) {
+            ElfProcess& proc = elf_processes[captured_elf_slot];
+            proc.active    = false;
+            proc.completed = true;
+            proc.terminal  = nullptr;
+        }
+        captured_elf_slot = -1;
+        is_closed = true;
+    }
 
     ~TerminalWindow() { 
         if(edit_lines) {
@@ -6536,7 +6603,19 @@ public:
         
         uint32_t titlebar_color = has_focus ? TITLEBAR_ACTIVE : TITLEBAR_INACTIVE;
         draw_rect_filled(x, y, w, 25, titlebar_color);
-        draw_string(title, x + 5, y + 8, TEXT_WHITE);
+        // Show slot info in titlebar when running an ELF
+        if (captured_elf_slot >= 0) {
+            char ttl[48];
+            ttl[0]='T'; ttl[1]='e'; ttl[2]='r'; ttl[3]='m'; ttl[4]=' ';
+            ttl[5]='['; ttl[6]='S'; ttl[7]='0'+(char)captured_elf_slot; ttl[8]=':'; ttl[9]=' ';
+            const char* cmd = elf_processes[captured_elf_slot].cmdline;
+            int ci = 10;
+            for (int k = 0; cmd[k] && ci < 42; k++, ci++) ttl[ci] = cmd[k];
+            ttl[ci++] = ']'; ttl[ci] = 0;
+            draw_string(ttl, x + 5, y + 8, TEXT_WHITE);
+        } else {
+            draw_string(title, x + 5, y + 8, TEXT_WHITE);
+        }
 
         draw_rect_filled(x + w - 22, y + 4, 18, 18, BUTTON_CLOSE);
         draw_string("X", x + w - 17, y + 8, TEXT_WHITE);
@@ -7008,10 +7087,43 @@ void WindowManager::handle_input(char key, int mx, int my, bool left_down, bool 
             }
         }
 
-        // Check taskbar button clicks
-        if (mx >= 5 && mx <= 80 && my >= (int)fb_info.height - 35 && my <= (int)fb_info.height - 5) {
-            launch_new_terminal();
-            return;
+        // Check taskbar button clicks — layout mirrors draw_desktop()
+        if (my >= (int)fb_info.height - 36 && my <= (int)fb_info.height - 4) {
+            int btn_w = 80;
+            int bx = 4;
+            // "Terminal" launcher
+            if (mx >= bx && mx < bx + btn_w) {
+                launch_new_terminal();
+                return;
+            }
+            bx += btn_w + 4;
+            // Per-slot ELF buttons
+            for (int s = 0; s < MAX_ELF_PROCESSES; ++s) {
+                if (!elf_processes[s].active) continue;  // skip idle and completed slots
+                if (mx >= bx && mx < bx + btn_w) {
+                    // Find the terminal window that owns this slot and bring it to front
+                    bool found = false;
+                    for (int wi = 0; wi < num_windows; ++wi) {
+                        if (windows[wi]->get_elf_slot() == s) {
+                            set_focus(wi);
+                            found = true;
+                            break;
+                        }
+                    }
+                    // Terminal was closed but ELF still active — open a new one attached to slot
+                    if (!found && elf_processes[s].active) {
+                        static int _tw_ctr = 0;
+                        int off = (_tw_ctr++ % 10) * 30;
+                        TerminalWindow* tw2 = new TerminalWindow(100 + off, 50 + off);
+                        tw2->captured_elf_slot = s;
+                        elf_processes[s].terminal = tw2;
+                        wm.add_window(tw2);
+                    }
+                    return;
+                }
+                bx += btn_w + 4;
+                if (bx + btn_w >= (int)fb_info.width - 100) break;
+            }
         }
 
         // If nothing was clicked, reset double-click tracking
@@ -7973,7 +8085,7 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
             // swap_buffers. Otherwise a hang inside tick_elf_processes
             // would leave the last painted frame without the breadcrumbs
             // pointing at where the hang happened.
-            tick_elf_processes(100);
+            //tick_elf_processes(100);
 
             if (g_evt_dirty || g_input_state.hasNewInput) {
                 last_paint_tick           = g_timer_ticks;
