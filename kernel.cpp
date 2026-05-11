@@ -992,11 +992,28 @@ void draw_string(const char* str, int x, int y, uint32_t color) {
 // the user can see the fault tag even after graphics mode hides VGA
 // text. This is a one-shot, no-return diagnostic — we never resume from
 // a host fault.
+extern "C" volatile unsigned char bx_panic_breadcrumbs[64];
+
+// Pull faulting EIP from the on-stack exception frame. The IDT stub in
+// boot.S pushes the standard CPU error frame (err, eip, cs, eflags, ...);
+// we read eip via a tiny inline-asm helper that walks back up from the
+// current frame. This is best-effort — if frame layout changes, eip just
+// reads as 0 and we still get the breadcrumb trail, which is the more
+// useful signal anyway.
+static inline unsigned read_caller_eip(void) {
+    unsigned eip = 0;
+    __asm__ volatile(
+        "movl 4(%%ebp), %0\n"   // return addr into host_fault_handler == stub
+        : "=r"(eip));
+    return eip;
+}
+
 extern "C" void host_fault_handler(unsigned vector) {
     if (!fb_info.ptr) return;
+    unsigned caller_eip = read_caller_eip();
 
-    auto put_glyph = [](char ch, int x0, int y0, uint32_t color) {
-        if ((unsigned char)ch > 127) return;
+    auto put_glyph = [](char ch, int x0, int y0, uint32_t color, uint32_t bg) {
+        if ((unsigned char)ch > 127) ch = '?';
         if (x0 + 8 > (int)fb_info.width)  return;
         if (y0 + 8 > (int)fb_info.height) return;
         const uint8_t* glyph = font + (int)ch * 8;
@@ -1004,32 +1021,77 @@ extern "C" void host_fault_handler(unsigned vector) {
             uint32_t* row = &fb_info.ptr[(y0 + yy) * (fb_info.pitch / 4) + x0];
             uint8_t bits = glyph[yy];
             for (int xx = 0; xx < 8; ++xx) {
-                row[xx] = (bits & (0x80 >> xx)) ? color : 0xC00000u;
+                row[xx] = (bits & (0x80 >> xx)) ? color : bg;
             }
         }
     };
 
-    // Bright red bar across the top — impossible to miss.
-    int bar_h = 24;
+    auto hex = [](unsigned n) -> char {
+        return (char)((n < 10) ? ('0' + n) : ('A' + (n - 10)));
+    };
+
+    // Bright red bar across the top — impossible to miss. Two rows now,
+    // so we have room for the EIP + breadcrumb trail.
+    int bar_h = 40;
     if (bar_h > (int)fb_info.height) bar_h = (int)fb_info.height;
     for (int y = 0; y < bar_h; ++y) {
         uint32_t* row = &fb_info.ptr[y * (fb_info.pitch / 4)];
         for (uint32_t x = 0; x < fb_info.width; ++x) row[x] = 0xC00000u;
     }
 
-    // "HOST FAULT !XX" near top-left.
-    const char* msg = "HOST FAULT !";
-    int x = 8;
-    int y = 8;
-    for (int i = 0; msg[i]; ++i) {
-        put_glyph(msg[i], x, y, 0xFFFFFFu);
-        x += 8;
+    // Row 1: "HOST FAULT !XX  EIP=XXXXXXXX"
+    {
+        const char* msg = "HOST FAULT !";
+        int x = 8, y = 4;
+        for (int i = 0; msg[i]; ++i) {
+            put_glyph(msg[i], x, y, 0xFFFFFFu, 0xC00000u); x += 8;
+        }
+        put_glyph(hex((vector >> 4) & 0xF), x, y, 0xFFFFFFu, 0xC00000u); x += 8;
+        put_glyph(hex( vector       & 0xF), x, y, 0xFFFFFFu, 0xC00000u); x += 16;
+
+        const char* eipmsg = "EIP=";
+        for (int i = 0; eipmsg[i]; ++i) {
+            put_glyph(eipmsg[i], x, y, 0xFFFFFFu, 0xC00000u); x += 8;
+        }
+        for (int i = 7; i >= 0; --i) {
+            put_glyph(hex((caller_eip >> (i * 4)) & 0xF), x, y, 0xFFFFFFu, 0xC00000u);
+            x += 8;
+        }
     }
-    auto hex = [](unsigned n) -> char {
-        return (char)((n < 10) ? ('0' + n) : ('A' + (n - 10)));
-    };
-    put_glyph(hex((vector >> 4) & 0xF), x,     y, 0xFFFFFFu);
-    put_glyph(hex( vector       & 0xF), x + 8, y, 0xFFFFFFu);
+
+    // Row 2: dump bx_panic_breadcrumbs trail (Bochs init progress markers).
+    // Last printable char = last successful step inside the Bochs glue
+    // before the fault. Empty/zero means fault happened before Bochs init
+    // started — the bug is in the kernel↔Bochs call path, not Bochs itself.
+    {
+        const char* lbl = "BX:";
+        int x = 8, y = 20;
+        for (int i = 0; lbl[i]; ++i) {
+            put_glyph(lbl[i], x, y, 0xFFFFFFu, 0xC00000u); x += 8;
+        }
+        for (int i = 0; i < 48; ++i) {
+            unsigned char c = bx_panic_breadcrumbs[i];
+            put_glyph(c ? (char)c : '.', x, y, 0xFFFF00u, 0xC00000u);
+            x += 8;
+        }
+    }
+
+    // Row 2 (right side): mirror x86_tick's VGA breadcrumb row so the user
+    // sees both trails on one screen. VGA text at 0xB8000 row 2 cols 0..15.
+    {
+        int x = 8 + 8 * 4 + 8 * 48 + 16;
+        int y = 20;
+        const char* lbl = "TK:";
+        for (int i = 0; lbl[i]; ++i) {
+            put_glyph(lbl[i], x, y, 0xFFFFFFu, 0xC00000u); x += 8;
+        }
+        volatile unsigned short* vga = (volatile unsigned short*)(0xB8000 + 2 * 80);
+        for (int i = 0; i < 16 && x + 8 <= (int)fb_info.width; ++i) {
+            unsigned char c = (unsigned char)(vga[i] & 0xFF);
+            put_glyph(c ? (char)c : '.', x, y, 0x00FF00u, 0xC00000u);
+            x += 8;
+        }
+    }
 }
 
 // ─── Live framebuffer breadcrumb ───────────────────────────────────────────

@@ -1,11 +1,7 @@
 /* =========================================================
    boot.S
-   Working Multiboot + IDT + ISR Bootloader
+   Multiboot + IDT + ISR Bootloader  (fixed: GDT selector + PIC remap)
    GAS / GNU AS syntax
-   ========================================================= */
-
-/* =========================================================
-   MULTIBOOT
    ========================================================= */
 
 .set ALIGN,      1<<0
@@ -14,13 +10,20 @@
 .set MAGIC,      0x1BADB002
 .set CHECKSUM,   -(MAGIC + FLAGS)
 
+/* ───── Kernel code selector in the kernel's *own* GDT.
+   The triple-fault chain in the QEMU log proved that by the time IRQs
+   are serviced, CS=0x10 / SS=0x18 (see "IP=0010:... SP=0018:..." in the
+   -d int trace).  IDT entries built with the old GRUB selector 0x08
+   triggered #GP on every exception/IRQ delivery → #DF → triple fault.
+   Keep this in sync with whatever the kernel reloads into CS.        */
+.set KCS_SEL,    0x10
+
 /* =========================================================
    MULTIBOOT HEADER
    ========================================================= */
 
 .section .multiboot
 .align 4
-
 .long MAGIC
 .long FLAGS
 .long CHECKSUM
@@ -34,14 +37,11 @@
 
 stack_bottom:
 .skip 16384
-
 stack_top:
 
 .align 16
-
 idt_start:
 .skip 256 * 8
-
 idt_end:
 
 /* =========================================================
@@ -50,11 +50,8 @@ idt_end:
 
 .section .data
 
-mb_saved_magic:
-.long 0
-
-mb_saved_mbi:
-.long 0
+mb_saved_magic: .long 0
+mb_saved_mbi:   .long 0
 
 idt_ptr:
 .word idt_end - idt_start - 1
@@ -68,114 +65,86 @@ idt_ptr:
 .code32
 
 .global _start
-
 .extern kernel_main
 .extern host_fault_handler
-
-/* =========================================================
-   BOOT ENTRY
-   ========================================================= */
 
 _start:
     cli
 
-    /* Save multiboot registers */
+    /* Save multiboot registers before we clobber eax/ebx */
     mov %eax, mb_saved_magic
     mov %ebx, mb_saved_mbi
 
-    /* Setup stack */
+    /* Stack */
     mov $stack_top, %esp
 
-    /* ── FPU + CR0 initialisation ────────────────────────────────────────
-       Bochs' bx_pc_system_c::initialize() does:
-           m_ips = double(ips) / 1000000.0L;
-       The 80-bit `long double` divide forces the i386 backend to emit
-       x87 FPU instructions (fldt / fdivr / fstpl). If the FPU is left
-       in whatever state the BIOS / GRUB handed us — possibly with
-       pending unmasked exceptions, or with CR0.EM=1 (no FPU emulation
-       allowed) or CR0.TS=1 (task switched) — the first FPU instruction
-       hangs the host: either the CPU stalls waiting for FERR# on the
-       legacy IRQ13 path (no NE bit), or it raises #NM/#MF into our
-       ISR 7/16 that just halts forever. Either way: the kernel appears
-       frozen at  bx_pc_system.initialize(50000000u) .
-
-       Fix: clear CR0.EM and CR0.TS, set CR0.MP (so #NM is precise) and
-       CR0.NE (so x87 errors come in via #MF, not the IRQ13 chipset
-       loop), then  fninit  to drop any pending exception state and
-       set the control word to a known masked-all configuration.    */
-
+    /* ── FPU + CR0 init (unchanged from prior version) ────────────── */
     mov  %cr0, %eax
-    and  $0xFFFFFFFB, %eax     /* clear EM (bit 2) — FPU is real, not emulated */
-    or   $0x00000022, %eax     /* set MP (bit 1) and NE (bit 5)               */
-    and  $0xFFFFFFF7, %eax     /* clear TS (bit 3)                            */
+    and  $0xFFFFFFFB, %eax     /* clear EM */
+    or   $0x00000022, %eax     /* set MP, NE */
+    and  $0xFFFFFFF7, %eax     /* clear TS */
     mov  %eax, %cr0
-    fninit                      /* clear FPU state, mask all exceptions       */
+    fninit
 
-    /* Build IDT */
+    /* ── FIX B: Remap 8259 PIC ─────────────────────────────────────────
+       Default BIOS PIC mapping puts IRQ 0 (timer) at vector 8 — exactly
+       the #DF slot.  Every timer tick was therefore taking the #DF
+       path through isr_8.  Remap master → 0x20..0x27, slave → 0x28..0x2F,
+       then mask everything so no IRQ fires until the kernel chooses to
+       unmask.                                                         */
+    movb $0x11, %al
+    outb %al, $0x20           /* master ICW1 */
+    outb %al, $0xA0           /* slave  ICW1 */
+    movb $0x20, %al
+    outb %al, $0x21           /* master ICW2: vector base 0x20 */
+    movb $0x28, %al
+    outb %al, $0xA1           /* slave  ICW2: vector base 0x28 */
+    movb $0x04, %al
+    outb %al, $0x21           /* master ICW3: slave on IRQ2 */
+    movb $0x02, %al
+    outb %al, $0xA1           /* slave  ICW3: cascade id 2 */
+    movb $0x01, %al
+    outb %al, $0x21           /* master ICW4: 8086 mode */
+    outb %al, $0xA1           /* slave  ICW4 */
+    movb $0xFF, %al
+    outb %al, $0x21           /* mask all master IRQs */
+    outb %al, $0xA1           /* mask all slave  IRQs */
+
+    /* Build & load IDT */
     call build_idt
-
-    /* Load IDT */
     lidt idt_ptr
 
-    /* Restore registers */
+    /* Restore multiboot regs and jump into C */
     mov mb_saved_magic, %eax
-    mov mb_saved_mbi, %ebx
-
-    /* Push kernel args */
+    mov mb_saved_mbi,   %ebx
     push %ebx
     push %eax
-
-    /* Enter kernel */
     call kernel_main
-
-/* =========================================================
-   HALT
-   ========================================================= */
 
 halt:
     cli
-
-1:
-    hlt
+1:  hlt
     jmp 1b
 
 /* =========================================================
    SET IDT ENTRY MACRO
+   ── FIX A: selector now KCS_SEL (0x10), matching the kernel's GDT.
    ========================================================= */
 
 .macro SET_IDT num, handler
-
-    lea \handler, %eax
-
-    mov $idt_start + (\num * 8), %edi
-
-    /* offset low */
-    movw %ax, (%edi)
-
-    /* selector */
-    movw $0x08, 2(%edi)
-
-    /* zero */
-    movb $0, 4(%edi)
-
-    /* interrupt gate */
-    movb $0x8E, 5(%edi)
-
-    /* offset high */
-    mov %eax, %edx
-    shr $16, %edx
-
-    movw %dx, 6(%edi)
-
+    lea  \handler, %eax
+    mov  $idt_start + (\num * 8), %edi
+    movw %ax, (%edi)                /* offset 0-15 */
+    movw $KCS_SEL, 2(%edi)          /* selector (was 0x08) */
+    movb $0, 4(%edi)                /* zero / IST */
+    movb $0x8E, 5(%edi)             /* P=1 DPL=0 32-bit interrupt gate */
+    mov  %eax, %edx
+    shr  $16, %edx
+    movw %dx, 6(%edi)               /* offset 16-31 */
 .endm
-
-/* =========================================================
-   BUILD IDT
-   ========================================================= */
 
 build_idt:
     pusha
-
     SET_IDT 0,  isr_0
     SET_IDT 1,  isr_1
     SET_IDT 2,  isr_2
@@ -208,7 +177,6 @@ build_idt:
     SET_IDT 29, isr_29
     SET_IDT 30, isr_30
     SET_IDT 31, isr_31
-
     popa
     ret
 
@@ -217,25 +185,14 @@ build_idt:
    ========================================================= */
 
 .macro ISR num
-
 .global isr_\num
-
 isr_\num:
     cli
-
     pushl $\num
-
     call host_fault_handler
-
-1:
-    hlt
+1:  hlt
     jmp 1b
-
 .endm
-
-/* =========================================================
-   ISR DEFINITIONS
-   ========================================================= */
 
 ISR 0
 ISR 1
