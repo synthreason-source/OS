@@ -82,66 +82,123 @@ Bit8u           bx_cpu_count = 1;
 Bit32u          apic_id_mask = 0;
 extern int      simulate_xapic;
 
-// ─── FIX: minimal BX_MEM_C::init_memory / register_state overrides ─────────
-// The stock BX_MEM_C::init_memory in libmemory.a does several things that
-// either hang or crash in our freestanding environment:
+// ─── FIX: diagnostic BX_MEM_C::init_memory override ───────────────────────
+// The stock init_memory in libmemory.a hangs (or eventually resets QEMU)
+// somewhere between live_breadcrumb '4' (just before the call) and '5'
+// (just after the call returns). Earlier versions of this patch tried
+// register_state-only and full-replace overrides; neither worked because
+// either the linker took libmemory.a's copy (so the override never ran)
+// or the override visibly paints to VGA text only — invisible if the
+// main paint loop is hung, which is exactly when we want diagnostics.
 //
-//   1. alloc_vector_aligned(host + BIOSROMSZ + EXROMSIZE + 4096, …)
-//      With BIOSROMSZ=2MB that's a ≈3.13MB host buffer we never use,
-//      since every guest memory access is routed through our
-//      registerMemoryHandlers callbacks (mem_read_handler / mem_write_handler
-//      in bochs_glue.cpp).
+// This override does the SAME work as stock, step by step, but writes
+// breadcrumbs via the kernel's live_breadcrumb() helper which paints
+// directly to the framebuffer (visible even when the main loop is
+// hung). Glyphs go to row 0, columns 36..43:
 //
-//   2. register_state()
-//      Walks SIM->get_bochs_root() and builds a save/restore param tree.
-//      KernelSIM returns nullptr for get_bochs_root(); the chain of
-//      bx_list_c / bx_param_num_c / bx_shadow_bool_c constructors that
-//      register_state runs against a nullptr-rooted tree is where the
-//      kernel hangs after typing `hello`. Breadcrumbs at VGA row 0
-//      show '1','2','3','4' (entered guarded, past bx_pc_system.initialize,
-//      about-to init_memory) but never '5' (init_memory returned).
+//   col 36 = 'a' before alloc_vector_aligned, 'A' after
+//   col 37 = 'm' before memset rom, 'M' after
+//   col 38 = 'b' before new Bit8u*[num_blocks], 'B' after
+//   col 39 = 'h' before new memory_handlers[BX_MEM_HANDLERS], 'H' after
+//   col 40 = 'i' before init loop, 'I' after
+//   col 41 = 'p' before SIM->get_param_bool, 'P' after
+//   col 42 = 'f' before field assignments, 'F' after
+//   col 43 = '!' = init_memory entered, '$' = init_memory returned
 //
-//   3. blocks / rom / bogus / memory_type bookkeeping
-//      Used by the stock get_vector / readPhysicalPage path. We never
-//      call those — registerMemoryHandlers shortcuts the whole thing.
+// Replacement works because the Makefile links bochs_infra.o before
+// libmemory.a and uses -Wl,--allow-multiple-definition. Confirmed via
+// `ld --trace-symbol` that bochs_infra.o's definition wins.
 //
-// The ONE thing init_memory does that we actually depend on is allocate
-// memory_handlers[] (1M entries on BX_PHY_ADDRESS_WIDTH=40), so
-// registerMemoryHandlers' indexing has somewhere to write. We supply a
-// minimal version that allocates just that table, leaves every other
-// field at its ctor-default, and skips register_state entirely.
-//
-// Replacement works because the Makefile links our objects before
-// libmemory.a and uses -Wl,--allow-multiple-definition, so this
-// definition wins over the prebuilt library's copy. Member-function
-// definitions in a .cpp that included memory-bochs.h have full access
-// to BX_MEM_C's private members.
+// Also replaces register_state() with a no-op: stock register_state
+// builds a savestate param tree rooted at SIM->get_bochs_root() (=
+// nullptr) which we know is unsafe in this kernel and we never save
+// or restore state.
+
+extern "C" void live_breadcrumb(int slot, char ch);  // defined in kernel.cpp
 
 void BX_MEM_C::init_memory(Bit64u guest, Bit64u host)
 {
-    // misc_mem.cc keeps this macro file-local; redefine it here.
-    // One entry per megabyte of physical address space; 1M entries on
-    // BX_PHY_ADDRESS_WIDTH=40.
     #ifndef BX_MEM_HANDLERS
     #define BX_MEM_HANDLERS ((BX_CONST64(1) << BX_PHY_ADDRESS_WIDTH) >> 20)
     #endif
+    #ifndef BX_MEM_VECTOR_ALIGN
+    #define BX_MEM_VECTOR_ALIGN 4096
+    #endif
 
+    live_breadcrumb(43, '!');
+
+    // Step 1: allocate vector
+    live_breadcrumb(36, 'a');
+    BX_MEM_THIS vector = alloc_vector_aligned(
+        host + BIOSROMSZ + EXROMSIZE + 4096, BX_MEM_VECTOR_ALIGN);
+    live_breadcrumb(36, 'A');
+
+    // Step 2: set up rom/bogus pointers and zero the rom region
     BX_MEM_THIS len = guest;
     BX_MEM_THIS allocated = host;
+    BX_MEM_THIS rom   = &BX_MEM_THIS vector[host];
+    BX_MEM_THIS bogus = &BX_MEM_THIS vector[host + BIOSROMSZ + EXROMSIZE];
+    live_breadcrumb(37, 'm');
+    memset(BX_MEM_THIS rom, 0xff, BIOSROMSZ + EXROMSIZE + 4096);
+    live_breadcrumb(37, 'M');
+
+    // Step 3: blocks table (8 entries for 1 MB guest)
+    Bit32u num_blocks = (Bit32u)(BX_MEM_THIS len / BX_MEM_BLOCK_LEN);
+    live_breadcrumb(38, 'b');
+    BX_MEM_THIS blocks = new Bit8u*[num_blocks];
+    for (Bit32u i = 0; i < num_blocks; i++) BX_MEM_THIS blocks[i] = nullptr;
+    BX_MEM_THIS used_blocks = 0;
+    live_breadcrumb(38, 'B');
+
+    // Step 4: memory_handlers table (1M entries = 4 MB)
+    live_breadcrumb(39, 'h');
     BX_MEM_THIS memory_handlers =
         new struct memory_handler_struct *[BX_MEM_HANDLERS];
+    live_breadcrumb(39, 'H');
+
+    // Step 5: init memory_handlers to NULL
+    live_breadcrumb(40, 'i');
     for (Bit32u idx = 0; idx < BX_MEM_HANDLERS; idx++) {
         BX_MEM_THIS memory_handlers[idx] = nullptr;
     }
-    // Everything else (vector, blocks, rom, bogus, pci_enabled,
-    // bios_*, smram_*, memory_type, rom_present) stays at the values
-    // the BX_MEM_C constructor set, which are NULL / 0 / false — the
-    // safe defaults for code paths we don't exercise.
+    live_breadcrumb(40, 'I');
+
+    // Step 6: pci_enabled.
+    // Stock init_memory does:
+    //   BX_MEM_THIS pci_enabled = SIM->get_param_bool(BXPN_PCI_ENABLED)->get();
+    // which is where v5/v5b hung — the FIRST call constructs a static-local
+    // bx_param_bool_c dummy whose ctor chain wedges in this freestanding
+    // environment (most likely an allocator/recursion issue we haven't
+    // pinpointed). We don't simulate PCI; just hard-code false.
+    live_breadcrumb(41, 'p');
+    BX_MEM_THIS pci_enabled = false;
+    live_breadcrumb(41, 'P');
+
+    // Step 7: field assignments
+    live_breadcrumb(42, 'f');
+    BX_MEM_THIS bios_write_enabled = 0;
+    BX_MEM_THIS bios_rom_addr      = 0xffff0000;   // matters for is_bios checks
+    BX_MEM_THIS flash_type         = 0;
+    BX_MEM_THIS flash_status       = 0x80;
+    BX_MEM_THIS smram_available    = 0;
+    BX_MEM_THIS smram_enable       = 0;
+    BX_MEM_THIS smram_restricted   = 0;
+    for (int i = 0; i < 65; i++) BX_MEM_THIS rom_present[i] = 0;
+    for (int i = 0; i <= BX_MEM_AREA_F0000; i++) {
+        BX_MEM_THIS memory_type[i][0] = 0;
+        BX_MEM_THIS memory_type[i][1] = 0;
+    }
+    live_breadcrumb(42, 'F');
+
+    // Step 8: skip register_state — never used, hangs in nullptr-rooted
+    // param tree descent.
+
+    live_breadcrumb(43, '$');
 }
 
-// Stub register_state. The stock body builds a savestate param tree
-// rooted at SIM->get_bochs_root() (= nullptr in this kernel). We never
-// save or restore state, so a no-op is correct.
+// Required by the link even though our init_memory never calls it.
+// Stock would build a savestate tree rooted at SIM->get_bochs_root() which
+// is nullptr in this kernel.
 void BX_MEM_C::register_state() {}
 
 // ═══ bx_devices_c ════════════════════════════════════════════════════════════
@@ -213,22 +270,27 @@ public:
     void reset_all_param()      override {}
 
     // ── param tree ───────────────────────────────────────────────────────────
-    // ─── FIX v4: return a dummy bx_param_bool_c (value=false) instead of
-    // nullptr so callers that immediately ->get() the result don't deref
-    // null. The most important caller is BX_MEM_C::init_memory which does:
-    //     pci_enabled = SIM->get_param_bool(BXPN_PCI_ENABLED)->get();
-    // and previously crashed with #PF when get_param_bool returned nullptr.
+    // ─── FIX v6: hard-code pci_enabled in init_memory ─────────────────────
+    // Our v5b override of BX_MEM_C::init_memory used to call
+    //   pci_enabled = SIM->get_param_bool(BXPN_PCI_ENABLED)->get();
+    // which hung in the first call's static-local bx_param_bool_c dummy
+    // ctor. v6 hard-codes pci_enabled = false instead. But other code in
+    // libcpu.a (especially generic_cpuid.cc:get_cpuid_leaf, called from
+    // BX_CPU::reset and from CPUID instruction emulation) still calls
+    // SIM->get_param_string and SIM->get_param_bool. Returning nullptr
+    // makes the immediate `->getptr()` / `->get()` host-fault and triple
+    // -fault QEMU.
     //
-    // The static is constructed lazily on first call so it doesn't depend on
-    // global-ctor ordering against bx_param_c's static state.
-    bx_param_c*        get_param       (const char*, bx_param_c* = nullptr) override { return nullptr; }
-    bx_param_num_c*    get_param_num   (const char*, bx_param_c* = nullptr) override { return nullptr; }
-    bx_param_string_c* get_param_string(const char*, bx_param_c* = nullptr) override { return nullptr; }
-    bx_param_bool_c*   get_param_bool  (const char*, bx_param_c* = nullptr) override {
-        static bx_param_bool_c dummy(nullptr, "dummy", "dummy", "dummy", 0, 0);
-        return &dummy;
-    }
-    bx_param_enum_c*   get_param_enum  (const char*, bx_param_c* = nullptr) override { return nullptr; }
+    // ─── FIX v7: pre-constructed dummy params (file-scope statics) ────────
+    // File-scope statics (defined just below the class) are constructed
+    // during the __init_array pass at boot, BEFORE init_memory is ever
+    // entered. So they're already-initialised on first use; no lazy
+    // first-call ctor to wedge.
+    bx_param_c*        get_param       (const char*, bx_param_c* = nullptr) override;
+    bx_param_num_c*    get_param_num   (const char*, bx_param_c* = nullptr) override;
+    bx_param_string_c* get_param_string(const char*, bx_param_c* = nullptr) override;
+    bx_param_bool_c*   get_param_bool  (const char*, bx_param_c* = nullptr) override;
+    bx_param_enum_c*   get_param_enum  (const char*, bx_param_c* = nullptr) override;
     unsigned           gen_param_id()  override { return 0; }
 
     // ── logging ──────────────────────────────────────────────────────────────
@@ -343,6 +405,32 @@ public:
 
 static KernelSIM s_sim;
 bx_simulator_interface_c* SIM = &s_sim;
+
+// ─── FIX v7: pre-constructed dummy param objects ───────────────────────────
+// libcpu.a's generic_cpuid.cc and other call sites do things like
+//   static const char* brand_string =
+//       (const char*)SIM->get_param_string(BXPN_BRAND_STRING)->getptr();
+// where a nullptr return triple-faults the host. We can't return nullptr
+// and can't lazily construct on first call (the static-local guard +
+// ctor chain hung in v5b). So construct dummies at file scope here —
+// they're initialised by the __init_array global-ctor pass before any
+// SIM->get_param_* call happens at runtime.
+//
+// All dummies have safe defaults (value 0 / empty string). Callers that
+// branch on the returned value will see "feature disabled" / "no brand"
+// behaviour, which is what we want for a freestanding kernel anyway.
+
+static bx_param_bool_c   s_dummy_bool  (nullptr, "dummy", "dummy", "dummy", 0, 0);
+static bx_param_num_c    s_dummy_num   (nullptr, "dummy", "dummy", "dummy", 0, 0, 0, 0);
+// bx_param_string_c needs a backing buffer. The ctor signature is
+//   bx_param_string_c(parent, name, label, description, initial_val, maxsize)
+static bx_param_string_c s_dummy_string(nullptr, "dummy", "dummy", "dummy", "", 1);
+
+bx_param_c*        KernelSIM::get_param       (const char*, bx_param_c*) { return &s_dummy_num;    }
+bx_param_num_c*    KernelSIM::get_param_num   (const char*, bx_param_c*) { return &s_dummy_num;    }
+bx_param_string_c* KernelSIM::get_param_string(const char*, bx_param_c*) { return &s_dummy_string; }
+bx_param_bool_c*   KernelSIM::get_param_bool  (const char*, bx_param_c*) { return &s_dummy_bool;   }
+bx_param_enum_c*   KernelSIM::get_param_enum  (const char*, bx_param_c*) { return nullptr;         }
 
 // ═══ bx_user_quit ════════════════════════════════════════════════════════════
 bool bx_user_quit = false;

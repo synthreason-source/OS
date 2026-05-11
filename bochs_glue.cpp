@@ -143,6 +143,31 @@ static bool mem_write_handler(bx_phy_address addr, unsigned len, void* data, voi
     return true;
 }
 
+// ─── FIX: direct-access handler for CPU prefetch path ─────────────────────
+// Bochs's cpu_loop calls BX_CPU_C::prefetch() for every instruction fetch.
+// prefetch() asks getHostMemAddr() for a direct host pointer to the page
+// containing the current EIP, and BX_PANICs if it gets NULL (see
+// cpu/cpu.cc:644-655: "prefetch: getHostMemAddr vetoed direct read").
+//
+// With da_handler==NULL (the 5-arg registerMemoryHandlers overload),
+// getHostMemAddr returns NULL for our slot's address range and every
+// guest instruction fetch panics — the slot gets killed on its very
+// first tick and the user sees nothing run.
+//
+// Returning a pointer directly into our slab lets the CPU read
+// instruction bytes (and TLB cache the page mapping) without a
+// per-fetch callback. Writes still go through mem_write_handler.
+static Bit8u* mem_da_handler(bx_phy_address addr, unsigned /*rw*/, void*) {
+    if (g_active_slot < 0) return nullptr;
+    SlotState& s = g_slots[g_active_slot];
+    if (!s.mem_base) return nullptr;
+    Bit32u off = (Bit32u)addr;
+    if (off < s.vaddr_base) return nullptr;
+    off -= s.vaddr_base;
+    if (off >= s.mem_size) return nullptr;
+    return s.mem_base + off;
+}
+
 static void inject_idt_into_slab(SlotState& s) {
     if (!s.mem_base || s.mem_size < 0x1000) return;
 
@@ -335,7 +360,7 @@ extern "C" void bochs_set_process_memory(Bit8u* base, Bit32u size, Bit32u vaddr_
     if (base && size) {
         BX_MEM(0)->registerMemoryHandlers(
             nullptr,
-            mem_read_handler, mem_write_handler,
+            mem_read_handler, mem_write_handler, mem_da_handler,
             (bx_phy_address)vaddr_base,
             (bx_phy_address)(vaddr_base + size - 1));
 

@@ -501,7 +501,7 @@ int snprintf(char* buffer, size_t size, const char* fmt, ...) {
    read-only), 4 ELF slabs × ~300 KB, backbuffer 3 MB, FAT32 sector
    buffers, Bochs init_memory internals (~2 MB).  16 MB covers all of that
    with room to spare and keeps total BSS well within GRUB's zeroing window. */
-static uint8_t kernel_heap[16 * 1024 * 1024];
+static uint8_t kernel_heap[64 * 1024 * 1024];
 static size_t heap_ptr = 0;
 void* operator new(size_t, void* p) { return p; }
 
