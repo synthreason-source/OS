@@ -24,7 +24,11 @@ extern "C" volatile int bx_last_panic_code;
 //   34 = about to call BX_MEM(0)->init_memory
 //   35 = init_memory returned
 //   36 = guarded() returning to bochs_cpu_init
-//   37 = about to call bochs_cpu_reset_for_launch
+//   37 = inside bochs_cpu_reset_for_launch:
+//          'c' = checking CPUID XSAVE
+//          'X' = XSAVE present, calling reset()  'D' = reset done
+//          'N' = No XSAVE, using manual init     'n' = manual done
+//          'L' = lightweight re-launch           'l' = lightweight done
 //   38 = reset_for_launch returned (full bochs_cpu_init done)
 extern "C" void live_breadcrumb(int slot, char ch);
 
@@ -398,11 +402,67 @@ extern "C" void bochs_activate_slot(int slot) {
 static bool g_cpu_inited_once = false;
 static bool g_cpu_init_failed  = false;   // set if BX_CPU::initialize() panicked
 
-static void bochs_cpu_reset_for_launch() {
-    BX_CPU(0)->reset(BX_RESET_HARDWARE);
-    bochs_cpu_enter_protected_mode();
+// ─── FIX: QEMU host-fault inside BX_CPU::reset() ─────────────────────────
+// BX_CPU::reset(HARDWARE) may execute host XSAVE/XRSTOR instructions if
+// libcpu.a was compiled with AVX support. On QEMU's default CPU (qemu32
+// without explicit -cpu flags) XSAVE raises #UD (vector 6) because CR4.OSXSAVE
+// is clear. This paints the red HOST FAULT !06 bar.
+//
+// Additionally, calling reset() a second time on an already-used CPU triggers
+// internal Bochs assertions (BX_ASSERT → ud2) in at least some builds.
+//
+// Strategy:
+//   - Check host CPUID leaf 1 ECX[26] (XSAVE bit) before the first reset().
+//     If XSAVE is missing, skip reset() and manually zero GPRs/EFLAGS instead.
+//   - On subsequent launches always use the manual (lightweight) path to
+//     avoid the re-entry assertion, regardless of XSAVE support.
+static bool g_cpu_reset_done = false;
+
+// Returns true if the host CPU reports XSAVE support (CPUID.1:ECX[26]).
+static bool host_has_xsave() {
+    unsigned ecx = 0;
+    asm volatile("cpuid" : "=c"(ecx) : "a"(1) : "ebx", "edx");
+    return (ecx >> 26) & 1;
 }
 
+// Manually bring the emulated CPU to a clean state without calling reset().
+// Resets GPRs, EFLAGS, CR0 (PE will be re-set by enter_protected_mode).
+static void manual_cpu_reset_regs(BX_CPU_C* cpu) {
+    for (int i = 0; i < BX_GENERAL_REGISTERS; i++)
+        cpu->gen_reg[i].dword.erx = 0;
+    cpu->eflags  = 0x00000002u;  // reserved bit 1 always 1
+    cpu->prev_rip = 0;
+    cpu->cr0.val32 = 0x00000010u; // ET=1; PE set later by enter_protected_mode
+    cpu->invalidate_prefetch_q();
+}
+
+static void bochs_cpu_reset_for_launch() {
+    if (!g_cpu_reset_done) {
+        live_breadcrumb(37, 'c');       // 'c' = checking CPUID XSAVE
+        bool xsave_ok = host_has_xsave();
+        if (xsave_ok) {
+            // Host has XSAVE — safe to call reset(). Clean FPU first.
+            live_breadcrumb(37, 'X');   // 'X' = XSAVE present, calling reset
+            asm volatile("fninit" ::: "memory");
+            asm volatile("emms"   ::: "memory");
+            BX_CPU(0)->reset(BX_RESET_HARDWARE);
+            live_breadcrumb(37, 'D');   // 'D' = reset done
+        } else {
+            // No XSAVE — reset() would #UD on this host. Manual init.
+            live_breadcrumb(37, 'N');   // 'N' = No XSAVE, manual reset
+            manual_cpu_reset_regs(BX_CPU(0));
+            live_breadcrumb(37, 'n');   // 'n' = manual done
+        }
+        g_cpu_reset_done = true;
+    } else {
+        // Re-launch: lightweight path — skip reset() entirely.
+        live_breadcrumb(37, 'L');       // 'L' = lightweight re-launch
+        manual_cpu_reset_regs(BX_CPU(0));
+        live_breadcrumb(37, 'l');       // 'l' = lightweight done
+    }
+    bochs_cpu_enter_protected_mode();
+    live_breadcrumb(38, '8');           // '8' = reset_for_launch done
+}
 // VGA breadcrumb at row 0, col 68 — distinct from the cpu_loop tags at
 // columns 70/72/73. 'i' = entered initialize(), 'I' = returned cleanly,
 // '!' = panicked through setjmp during initialize().
@@ -541,7 +601,7 @@ extern "C" void bochs_cpu_init() {
     bochs_cpu_initialize_guarded();
     live_breadcrumb(36, '6');
     bochs_cpu_reset_for_launch();
-    live_breadcrumb(38, '8');
+    // breadcrumb 38 is now written inside bochs_cpu_reset_for_launch()
     // Note: do NOT clear g_cpu_ready here. bochs_cpu_set_eip() will set
     // it to true when the kernel hands us an entry point. Clearing it
     // means a relaunch that calls reset->set_esp->set_eip is fine; but
