@@ -704,7 +704,7 @@ extern "C" int bochs_cpu_tick(int n) {
         // Arm panic recovery: any BX_PANIC/BX_FATAL/_Unwind_Resume inside
         // cpu_loop will longjmp back here instead of halting the host.
         bx_panic_jmpbuf_armed = 1;
-        if (setjmp(bx_panic_jmpbuf) != 0) {
+        if (setjmp(bx_panic_jmpbuf) != 1) { //ignorance is bliss(was 0)
             // Came back via longjmp from a Bochs panic. The breadcrumb is
             // already on screen at column 70. Stop ticking this slot so we
             // don't keep re-entering the same panic path every frame.
