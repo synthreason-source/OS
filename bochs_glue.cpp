@@ -711,6 +711,7 @@ extern "C" int bochs_cpu_tick(int n) {
             bx_panic_jmpbuf_armed = 0;
             if (g_active_slot >= 0 && g_active_slot < MAX_BOCHS_SLOTS) {
                 SlotState& s = g_slots[g_active_slot];
+				if (s.write_cb) s.write_cb(g_active_slot, 'E'); //elf tester
                 if (s.exit_cb) s.exit_cb(g_active_slot, -1);
             }
             return 0;
