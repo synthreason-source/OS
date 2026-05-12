@@ -427,12 +427,21 @@ static bool host_has_xsave() {
 
 // Manually bring the emulated CPU to a clean state without calling reset().
 // Resets GPRs, EFLAGS, CR0 (PE will be re-set by enter_protected_mode).
+// Critically: resets activity_state to ACTIVE so cpu_loop doesn't immediately
+// spin in handleWaitForEvent (which happens when a prior guest executed HLT).
 static void manual_cpu_reset_regs(BX_CPU_C* cpu) {
     for (int i = 0; i < BX_GENERAL_REGISTERS; i++)
         cpu->gen_reg[i].dword.erx = 0;
     cpu->eflags  = 0x00000002u;  // reserved bit 1 always 1
     cpu->prev_rip = 0;
     cpu->cr0.val32 = 0x00000010u; // ET=1; PE set later by enter_protected_mode
+    // BX_ACTIVITY_STATE_ACTIVE = 0. Must be reset explicitly when skipping
+    // BX_CPU::reset() — otherwise a HLT from a prior guest leaves the CPU
+    // in BX_ACTIVITY_STATE_HLT and the next cpu_loop call never executes
+    // any instructions (handleWaitForEvent spins with no interrupt source).
+    cpu->activity_state = BX_CPU_C::BX_ACTIVITY_STATE_ACTIVE;
+    cpu->async_event = 0;
+    bx_pc_system.kill_bochs_request = 0;
     cpu->invalidate_prefetch_q();
 }
 
@@ -446,6 +455,9 @@ static void bochs_cpu_reset_for_launch() {
             asm volatile("fninit" ::: "memory");
             asm volatile("emms"   ::: "memory");
             BX_CPU(0)->reset(BX_RESET_HARDWARE);
+            // Clear any stale yield flags reset() might have set.
+            BX_CPU(0)->async_event = 0;
+            bx_pc_system.kill_bochs_request = 0;
             live_breadcrumb(37, 'D');   // 'D' = reset done
         } else {
             // No XSAVE — reset() would #UD on this host. Manual init.
@@ -568,7 +580,7 @@ static void bochs_cpu_initialize_guarded() {
     // init_memory itself wants to new[] (blocks table, memory_handlers
     // table, rom, bogus).
     live_breadcrumb(34, '4');
-    BX_MEM(0)->init_memory(1u * 1024u * 1024u, 1u * 1024u * 1024u);
+    BX_MEM(0)->init_memory(16u * 1024u * 1024u, 16u * 1024u * 1024u);
     live_breadcrumb(35, '5');
     glue_init_crumb('M');                 // 'M' = mem subsystem initialized
 

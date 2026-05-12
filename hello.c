@@ -24,7 +24,6 @@ void _start(void) {
        to a stub that re-faults, which triple-faults Bochs. The host
        catches the panic via setjmp and kills the slot cleanly. The
        kernel keeps running. */
-    //__asm__ volatile("ud2");
-    //for (;;) {}
-	return;
+    __asm__ volatile("ud2");
+    for (;;) {}
 }
