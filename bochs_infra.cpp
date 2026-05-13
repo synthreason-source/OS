@@ -37,14 +37,22 @@ static void vga_breadcrumb(char c) {
     *p = (unsigned short)(0x4F00 | (unsigned char)c);
 }
 
+// Forward decl — defined in bochs_glue.cpp.
+// Sets kill_bochs_request + async_event so cpu_loop returns cleanly
+// through handleAsyncEvent, identical to a guest port-0xE8 write.
+extern "C" void bochs_guest_exit(int code);
+
 static void bx_recover(char tag, int code) {
     vga_breadcrumb(tag);
     bx_last_panic_code = code;
     if (bx_panic_jmpbuf_armed) {
+        // Init path: longjmp back to bochs_cpu_initialize_guarded.
         bx_panic_jmpbuf_armed = 0;
         longjmp(bx_panic_jmpbuf, 1);
     }
-    asm volatile("cli; hlt"); __builtin_unreachable();
+    // Tick path: bad guest instruction hit Bochs's internal panic handler.
+    // Yield cpu_loop through the normal exit path — no cli;hlt.
+    bochs_guest_exit(code);
 }
 
 void logfunctions::panic (const char*, ...) { bx_recover('P', 1); }
@@ -114,8 +122,6 @@ extern int      simulate_xapic;
 // nullptr) which we know is unsafe in this kernel and we never save
 // or restore state.
 
-extern "C" void live_breadcrumb(int slot, char ch);  // defined in kernel.cpp
-
 void BX_MEM_C::init_memory(Bit64u guest, Bit64u host)
 {
     #ifndef BX_MEM_HANDLERS
@@ -125,43 +131,32 @@ void BX_MEM_C::init_memory(Bit64u guest, Bit64u host)
     #define BX_MEM_VECTOR_ALIGN 4096
     #endif
 
-    live_breadcrumb(43, '!');
 
     // Step 1: allocate vector
-    live_breadcrumb(36, 'a');
     BX_MEM_THIS vector = alloc_vector_aligned(
         host + BIOSROMSZ + EXROMSIZE + 4096, BX_MEM_VECTOR_ALIGN);
-    live_breadcrumb(36, 'A');
 
     // Step 2: set up rom/bogus pointers and zero the rom region
     BX_MEM_THIS len = guest;
     BX_MEM_THIS allocated = host;
     BX_MEM_THIS rom   = &BX_MEM_THIS vector[host];
     BX_MEM_THIS bogus = &BX_MEM_THIS vector[host + BIOSROMSZ + EXROMSIZE];
-    live_breadcrumb(37, 'm');
     memset(BX_MEM_THIS rom, 0xff, BIOSROMSZ + EXROMSIZE + 4096);
-    live_breadcrumb(37, 'M');
 
     // Step 3: blocks table (8 entries for 1 MB guest)
     Bit32u num_blocks = (Bit32u)(BX_MEM_THIS len / BX_MEM_BLOCK_LEN);
-    live_breadcrumb(38, 'b');
     BX_MEM_THIS blocks = new Bit8u*[num_blocks];
     for (Bit32u i = 0; i < num_blocks; i++) BX_MEM_THIS blocks[i] = nullptr;
     BX_MEM_THIS used_blocks = 0;
-    live_breadcrumb(38, 'B');
 
     // Step 4: memory_handlers table (1M entries = 4 MB)
-    live_breadcrumb(39, 'h');
     BX_MEM_THIS memory_handlers =
         new struct memory_handler_struct *[BX_MEM_HANDLERS];
-    live_breadcrumb(39, 'H');
 
     // Step 5: init memory_handlers to NULL
-    live_breadcrumb(40, 'i');
     for (Bit32u idx = 0; idx < BX_MEM_HANDLERS; idx++) {
         BX_MEM_THIS memory_handlers[idx] = nullptr;
     }
-    live_breadcrumb(40, 'I');
 
     // Step 6: pci_enabled.
     // Stock init_memory does:
@@ -170,12 +165,9 @@ void BX_MEM_C::init_memory(Bit64u guest, Bit64u host)
     // bx_param_bool_c dummy whose ctor chain wedges in this freestanding
     // environment (most likely an allocator/recursion issue we haven't
     // pinpointed). We don't simulate PCI; just hard-code false.
-    live_breadcrumb(41, 'p');
     BX_MEM_THIS pci_enabled = false;
-    live_breadcrumb(41, 'P');
 
     // Step 7: field assignments
-    live_breadcrumb(42, 'f');
     BX_MEM_THIS bios_write_enabled = 0;
     BX_MEM_THIS bios_rom_addr      = 0xffff0000;   // matters for is_bios checks
     BX_MEM_THIS flash_type         = 0;
@@ -188,12 +180,10 @@ void BX_MEM_C::init_memory(Bit64u guest, Bit64u host)
         BX_MEM_THIS memory_type[i][0] = 0;
         BX_MEM_THIS memory_type[i][1] = 0;
     }
-    live_breadcrumb(42, 'F');
 
     // Step 8: skip register_state — never used, hangs in nullptr-rooted
     // param tree descent.
 
-    live_breadcrumb(43, '$');
 }
 
 // Required by the link even though our init_memory never calls it.
@@ -237,7 +227,6 @@ void bx_devices_c::exit()          {}
 
 bx_pc_system_c  bx_pc_system;
 
-void bx_pc_system_c::invlpg(Bit32u) {}
 void bx_pc_system_c::countdownEvent() {}
 int  bx_pc_system_c::Reset(unsigned) { return 0; }
 void bx_pc_system_c::deactivate_timer(unsigned) {}

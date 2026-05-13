@@ -43,7 +43,6 @@ $(DISK_IMG):
 
 iso: $(MULTIBOOT)
 	mkdir -p iso/boot/grub
-	cp $(MULTIBOOT) iso/boot/main.elf
 	printf '%s\n'                              \
 	    'set timeout=0'                         \
 	    'set default=0'                         \
@@ -84,6 +83,7 @@ $(BOCHS_CPU_LIB): $(BOCHS_DIR)/.extracted
 	    --enable-fpu                         \
 	    --with-nogui                         \
 	    --host=i686-linux-gnu               \
+		--enable-x86-64						\
 	    CXXFLAGS="-O2 -m32 -fno-stack-protector -fno-pie" \
 	    CFLAGS="-O2 -m32 -fno-stack-protector -fno-pie"
 	$(MAKE) -C $(BOCHS_DIR)/cpu
