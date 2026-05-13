@@ -108,8 +108,18 @@ class StorageOS:
         self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
         return "break"
 
+    def safe_color(self, val):
+        """Safe color generation - prevents invalid hex."""
+        alpha = int(np.clip(128 + val * 127, 0, 255))
+        g = int(alpha * 0.5)
+        try:
+            return f"#{0:02x}{alpha:02x}{g:02x}"
+        except:
+            return "#00a852"  # Fallback green
+
     def render_labeller(self):
         """Renders editable ASCII grid from numpy buffer."""
+        # Clear existing widgets
         for widget in self.scrollable_frame.winfo_children():
             widget.destroy()
 
@@ -121,74 +131,89 @@ class StorageOS:
             row_frame.pack(fill="x", pady=1)
             
             for c in range(cols):
-                val = self.storage_buffer[r, c]
+                val = float(self.storage_buffer[r, c])  # Ensure float
+                val = np.clip(val, 0.0, 1.0)  # Clamp to [0,1]
+                
                 g_idx = int(np.clip(val * (len(self.glyphs) - 1), 0, len(self.glyphs) - 1))
                 glyph = self.glyphs[g_idx]
                 
                 cell = tk.Entry(
                     row_frame, width=cell_width, justify="center", 
-                    font=("Consolas", 16, "bold"), bg="#000", fg=self.get_color(val), 
+                    font=("Consolas", 16, "bold"), bg="#000", fg=self.safe_color(val), 
                     relief="flat", bd=1, highlightthickness=1, highlightcolor="#00e87a"
                 )
                 cell.insert(0, glyph)
                 cell.pack(side="left", padx=1)
                 
-                cell.bind("<KeyRelease>", lambda e, row=r, col=c, w=cell: self.sync_cell(row, col, w))
-                cell.bind("<FocusOut>", lambda e, row=r, col=c, w=cell: self.sync_cell(row, col, w))
+                # Bind lambda with proper capture
+                cell.bind("<KeyRelease>", lambda e=None, row=r, col=c, w=cell: self.sync_cell(row, col, w))
+                cell.bind("<FocusOut>", lambda e=None, row=r, col=c, w=cell: self.sync_cell(row, col, w))
 
         self.status_var.set(f"{rows}×{cols} | min:{self.storage_buffer.min():.2f} max:{self.storage_buffer.max():.2f} mean:{self.storage_buffer.mean():.2f}")
-        self.scrollable_frame.update_idletasks()
+        self.root.update_idletasks()  # Force update
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-
-    def get_color(self, val):
-        alpha = int(128 + val * 127)
-        return f"#{0:02x}{alpha:02x}{int(alpha * 0.5):02x}"
 
     def sync_cell(self, r, c, widget):
         text = widget.get().strip()
         if text and text in self.glyphs:
             val = self.glyphs.index(text) / (len(self.glyphs) - 1)
             self.storage_buffer[r, c] = val
-            widget.config(fg=self.get_color(val))
-            self.render_labeller()  # Refresh status
+            widget.config(fg=self.safe_color(val))
+            # Debounced refresh
+            self.root.after(100, self.render_labeller)
 
     # === MATRIX OPERATIONS ===
     def gemm_demo(self):
         """C=A·B GEMM demo (simplified 4×4 blocked)."""
-        rows, cols = 4, 4
-        A = np.random.rand(rows, rows)
-        B = np.random.rand(rows, cols)
-        C = np.dot(A, B)
-        
-        self.storage_buffer[:rows, :cols] = C
-        self.render_labeller()
-        self.write_terminal(f"\nGEMM Demo: C=A·B (4×4 blocked)\nA.shape={A.shape} → C={C.shape}\nGFLOPS: ~{2*rows**3/1e9:.1f}\n")
+        try:
+            rows, cols = 4, 4
+            A = np.random.rand(rows, rows)
+            B = np.random.rand(rows, cols)
+            C = np.dot(A, B)
+            
+            # Ensure buffer can hold result
+            if self.storage_buffer.shape[0] >= rows and self.storage_buffer.shape[1] >= cols:
+                self.storage_buffer[:rows, :cols] = C
+            else:
+                self.storage_buffer = np.pad(self.storage_buffer, ((0, rows-10), (0, cols-12)), 'constant')
+                self.storage_buffer[:rows, :cols] = C
+            
+            self.render_labeller()
+            self.write_terminal(f"\nGEMM Demo: C=A·B (4×4 blocked)\nA.shape={A.shape} → C={C.shape}\nGFLOPS: ~{2*rows**3/1e9:.1f}\n")
+        except Exception as e:
+            self.write_terminal(f"\nGEMM Error: {str(e)}\n")
 
     def transpose_matrix(self):
         """In-place transpose."""
+        old_shape = self.storage_buffer.shape
         self.storage_buffer = self.storage_buffer.T
         self.render_labeller()
-        self.write_terminal(f"\nTRANSPOSE: {self.storage_buffer.shape} → {self.storage_buffer.T.shape}\n")
+        self.write_terminal(f"\nTRANSPOSE: {old_shape} → {self.storage_buffer.shape}\n")
 
     def reshape_matrix(self):
         """Dynamic reshape 10×12 ↔ 12×10 ↔ 6×20."""
         current = self.storage_buffer.shape
+        total = self.storage_buffer.size
+        
         if current == (10, 12):
             new_shape = (12, 10)
         elif current == (12, 10):
             new_shape = (6, 20)
+        elif current == (6, 20):
+            new_shape = (10, 12)
         else:
             new_shape = (10, 12)
             
-        total = self.storage_buffer.size
-        self.storage_buffer = self.storage_buffer.flatten().reshape(new_shape)
+        flat = self.storage_buffer.flatten()
+        self.storage_buffer = flat.reshape(new_shape)
         self.render_labeller()
         self.write_terminal(f"\nRESHAPE: {current} → {new_shape} ({total} elements)\n")
 
     def normalize_matrix(self):
         """Min-max normalization to [0,1]."""
         old_min, old_max = self.storage_buffer.min(), self.storage_buffer.max()
-        self.storage_buffer = (self.storage_buffer - old_min) / (old_max - old_min + 1e-8)
+        if old_max > old_min:
+            self.storage_buffer = (self.storage_buffer - old_min) / (old_max - old_min)
         self.render_labeller()
         self.write_terminal(f"\nNORMALIZE: [{old_min:.3f},{old_max:.3f}] → [0.0,1.0]\n")
 
@@ -209,7 +234,6 @@ class StorageOS:
         cmd = parts[0] if parts else ""
         response = ""
 
-        # Existing commands...
         if cmd == "help":
             response = """MATRIX COMMANDS:
   gemm          — 4×4 GEMM demo (C=A·B)
@@ -226,38 +250,47 @@ class StorageOS:
   exit          — Quit"""
             
         elif cmd in ["gemm", "transpose", "reshape", "normalize"]:
-            getattr(self, cmd + "_matrix")() if cmd != "gemm" else self.gemm_demo()
-            return
-            
+            # Safe method dispatch
+            methods = {
+                "gemm": self.gemm_demo,
+                "transpose": self.transpose_matrix,
+                "reshape": self.reshape_matrix,
+                "normalize": self.normalize_matrix
+            }
+            try:
+                methods[cmd]()
+                return
+            except Exception as e:
+                response = f"Error: {str(e)}"
+                
         elif cmd == "add" and len(parts) > 1:
             try:
                 v = float(parts[1])
-                if 0 <= v <= 1:
-                    flat = self.storage_buffer.flatten()
-                    flat = np.roll(flat, -1)
-                    flat[-1] = v
-                    self.storage_buffer = flat.reshape(self.storage_buffer.shape)
-                    self.render_labeller()
-                    response = f"✓ Added {v:.3f}"
-                else:
-                    response = "Error: 0.0-1.0"
+                v = np.clip(v, 0, 1)
+                flat = self.storage_buffer.flatten()
+                flat = np.roll(flat, -1)
+                flat[-1] = v
+                self.storage_buffer = flat.reshape(self.storage_buffer.shape)
+                self.render_labeller()
+                response = f"✓ Added {v:.3f}"
             except:
                 response = "Error: 'add 0.8'"
                 
         elif cmd == "fill" and len(parts) > 1:
             try:
-                v = float(parts[1])
-                self.storage_buffer.fill(np.clip(v, 0, 1))
+                v = np.clip(float(parts[1]), 0, 1)
+                self.storage_buffer.fill(v)
                 self.render_labeller()
                 response = f"✓ Filled {v:.3f}"
             except:
                 response = "Error: 'fill 0.5'"
                 
         elif cmd == "dump":
-            response = f"STORAGE:\n{self.storage_buffer}\n"
+            response = f"STORAGE:\n{np.array2string(self.storage_buffer, precision=3, suppress_small=True)}\n"
             
         elif cmd == "stats":
-            response = f"SHAPE: {self.storage_buffer.shape}\nMIN:{self.storage_buffer.min():.3f} MAX:{self.storage_buffer.max():.3f} MEAN:{self.storage_buffer.mean():.3f}"
+            s = self.storage_buffer
+            response = f"SHAPE: {s.shape}\nMIN:{s.min():.3f} MAX:{s.max():.3f} MEAN:{s.mean():.3f} STD:{s.std():.3f}"
             
         elif cmd == "labeler" and len(parts) > 1:
             subcmd = parts[1]
