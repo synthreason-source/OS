@@ -1,6 +1,3 @@
-Simple PC: Titanium Dioxide memristor lattice cake, cyclic switches, wire. To create memory data buses... Wire up to a keyboard and store an ASCII table with a input/output data bay with display menu OS and security with a transceiver. Est 512+? bytes. Setup a I2C driver...
-
-
 Storage only OS with matrix multiplier, numpy style array functionality, R/W/RX/TX patterns, with ASCII translator/display/keyboard, custom dot cursor patterns within programmed windows...
 
 
