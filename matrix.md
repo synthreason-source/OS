@@ -1,5 +1,3 @@
-
-Title
 Storage-only OS with NumPy-style Arrays, Matrix Multiplier, and Programmable ASCII Windowing
 
 Abstract
