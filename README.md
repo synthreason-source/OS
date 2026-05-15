@@ -6,4 +6,4 @@ TODO: more GUI features, install busybox and test.elf.
 
 uses sata port 0
 
-TODO: fix bochs execution and its memory usage, register keyboard and display to bochs emulation.
+TODO: intergrate bochs and upload elf, boot. register keyboard and display to bochs emulation.(test execution available)
