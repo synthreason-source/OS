@@ -496,13 +496,63 @@ static void slot_prime_cpu(SlotState& s) {
 
 // Called whenever the active mapping has changed OR a slot switch has
 // occurred. Drops Bochs's cached translations so any previously-issued
-// direct-access host pointer is no longer reachable. Both calls are
-// safe regardless of CPU state.
+// direct-access host pointer is no longer reachable, AND resynchronises
+// every piece of CPU-internal derived state with the architectural
+// registers we just poked.
+//
+// The earlier version only did TLB_flush() + invalidate_prefetch_q().
+// That was insufficient: after slot_restore_cpu writes cr0/sregs/eflags
+// straight into BX_CPU(0), the CPU's *derived* state — cpu_mode,
+// fetchModeMask, the lazy-eflags shadow, the stack cache, the SSE/AVX
+// mode flags, the interrupt-mask shadow — is all stale. In particular
+// cpu_mode stayed BX_MODE_IA32_REAL even though we set CR0.PE=1, so
+// cpu_loop kept interpreting CS as a real-mode selector (base =
+// sel<<4) and fetched from the wrong linear address — an instant
+// silent infinite loop with no fault and no port output.
+//
+// handleCpuContextChange() is Bochs's canonical "architectural state
+// was changed out from under you, resync everything" entry point. It
+// does TLB_flush + invalidate_prefetch_q + invalidate_stack_cache +
+// handleInterruptMaskChange + handleAlignmentCheck + handleCpuModeChange
+// (+ SSE/AVX mode on cpu-level>=6). This is exactly what a slot switch
+// needs.
 static void flush_after_switch() {
     BX_CPU_C* cpu = BX_CPU(0);
-    cpu->TLB_flush();
-    cpu->invalidate_prefetch_q();
-    // Clear sticky async-yield flags from the previous run.
+
+    // (a) Flush the instruction cache. THIS IS ESSENTIAL.
+    //
+    // The iCache stores *decoded* instructions keyed by guest physical
+    // address (+ a fetchModeMask). A slot switch replaces the physical
+    // memory contents under the CPU — slot 0's program and slot 1's
+    // program can sit at the very same guest physical addresses. The
+    // iCache cannot tell them apart, so without a flush, getICacheEntry()
+    // returns a STALE decoded entry from a previous slot (or from the
+    // post-reset / prewarm state) and never calls serveICacheMiss to
+    // re-decode. The symptom is a cpu_loop that spins forever:
+    // getICacheEntry hands back a bogus zero-length entry, RIP advances
+    // by ilen()==0, the no-op "instruction" executes, repeat — guest EIP
+    // frozen, no fault, no port output.
+    //
+    // flushICaches() does iCache.flushICacheEntries(), sets the
+    // STOP_TRACE async bit, and resets pageWriteStampTable — the full,
+    // correct "physical memory changed behind your back" reset.
+    flushICaches();
+
+    // (b) Recompute cpu_mode / fetchModeMask / lazy-eflags / stack cache
+    // / interrupt-mask shadow from the architectural registers that
+    // slot_restore_cpu poked directly. Without this cpu_mode stays
+    // BX_MODE_IA32_REAL even though we set CR0.PE=1.
+    cpu->handleCpuContextChange();
+
+    // (c) updateFetchModeMask depends on CS.cache.d_b and cpu_mode;
+    // ensure the fetch decoder picks the 32-bit tables.
+    cpu->updateFetchModeMask();
+
+    // (d) Clear sticky async-yield flags from the previous run. Do this
+    // AFTER flushICaches() — flushICaches sets BX_ASYNC_EVENT_STOP_TRACE
+    // in async_event, and we don't want a spurious yield on the first
+    // tick. The STOP_TRACE bit only matters for handler-chaining traces,
+    // which we don't use.
     cpu->async_event = 0;
     bx_pc_system.kill_bochs_request = 0;
 }
@@ -539,6 +589,23 @@ static void bochs_global_init() {
 
     // (1) pc_system: only stores ips and zeros a few timer fields.
     bx_pc_system.initialize(50000000u);
+
+    // (1a) Enable the A20 line. CRITICAL.
+    //
+    // bx_pc_system is a BSS global, so its a20_mask field is zero-
+    // initialised. The A20ADDR(x) macro — used by BX_MEM_C::getHostMemAddr
+    // AND by BX_CPU_C::translate_linear on EVERY instruction fetch and
+    // data access — computes `x & bx_pc_system.a20_mask`. With a20_mask
+    // left at 0, every guest physical address collapses to 0, so the CPU
+    // fetched from physical page 0 (zeroed Bochs vector[]) instead of the
+    // slab, decoded 0x00 0x00 as ADD forever, and EIP-advanced but never
+    // did real work. a20_mask is only ever set by set_enable_a20(); on a
+    // real Bochs run the chipset/BIOS path calls it. We have no chipset,
+    // so we must call it ourselves. true => a20_mask = 0xffffffff
+    // (386+, or all-ones on a BX_PHY_ADDRESS_LONG build) i.e. A20 on,
+    // no address wrapping — the correct state for flat 32-bit guests.
+    bx_pc_system.set_enable_a20(true);
+
     live_breadcrumb(31, '1');
 
     // (2) memory subsystem. Our overridden init_memory in
@@ -681,6 +748,12 @@ extern "C" void bochs_cpu_set_eip(Bit32u eip) {
     cpu->gen_reg[BX_32BIT_REG_EIP].dword.erx = eip;
     cpu->prev_rip = eip;
     cpu->invalidate_prefetch_q();
+    // The kernel typically writes the guest program into the slab and
+    // THEN calls this. Any iCache entry covering the new EIP's physical
+    // page may predate that write, so flush. Cheap, and only happens
+    // once per process launch.
+    flushICaches();
+    cpu->async_event = 0;
 
     if (g_active_slot >= 0 && g_active_slot < MAX_BOCHS_SLOTS) {
         SlotState& s = g_slots[g_active_slot];

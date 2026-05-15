@@ -156,30 +156,196 @@ static void run_init_array() {
 }
 
 // ─── Test main ──────────────────────────────────────────────────────────
+//
+// Two-phase verification:
+//   Phase 1: bochs_cpu_init() runs to completion (breadcrumbs 30..36).
+//            Confirms BX_CPU(0)->initialize() and reset() work.
+//   Phase 2: load a tiny guest program (4 bytes of port-IO + exit) into
+//            slot 0 via bochs_set_process_memory / bochs_cpu_set_eip,
+//            then call bochs_cpu_tick(). Confirms the live BX_CPU can
+//            actually execute guest instructions and that port-0xE9 +
+//            port-0xE8 sentinels reach our callbacks.
+
+// ─── I/O callback adapters that the glue invokes from inside the
+// emulated CPU. Tagged so we can see them in the e9 trace.
+static volatile int g_guest_output_count = 0;
+static volatile int g_guest_exit_seen    = 0;
+static volatile int g_guest_exit_code    = 0;
+static char g_guest_output[64];
+
+static int  test_io_read(int /*slot*/) { return 0; }
+static void test_io_write(int slot, char c) {
+    if (g_guest_output_count < (int)sizeof(g_guest_output) - 1) {
+        g_guest_output[g_guest_output_count++] = c;
+    }
+    e9_puts("  [guest port-0xE9 slot=");
+    e9_putc((char)('0' + slot));
+    e9_puts(" wrote ");
+    if (c >= 32 && c < 127) {
+        e9_putc('\'');
+        e9_putc(c);
+        e9_putc('\'');
+    } else {
+        e9_hex((uint32_t)(uint8_t)c);
+    }
+    e9_puts("]\n");
+}
+static void test_io_exit(int slot, int code) {
+    g_guest_exit_seen = 1;
+    g_guest_exit_code = code;
+    e9_puts("  [guest exit slot=");
+    e9_putc((char)('0' + slot));
+    e9_puts(" code=");
+    e9_hex((uint32_t)code);
+    e9_puts("]\n");
+}
+
+// ─── The guest program ─────────────────────────────────────────────────
+// At slot offset 0x200 (= vaddr_base + 0x200), past the GDT (0x80) and
+// IDT (0x100..0x900). The bytes below were assembled by hand; verified
+// by `objdump -D -m i386 -b binary` on the same byte sequence.
+//
+//     B0 48        mov  $0x48, %al        ; 'H'
+//     E6 E9        out  %al, $0xE9
+//     B0 49        mov  $0x49, %al        ; 'I'
+//     E6 E9        out  %al, $0xE9
+//     B0 0A        mov  $0x0A, %al        ; '\n'
+//     E6 E9        out  %al, $0xE9
+//     B0 00        mov  $0x00, %al
+//     E6 E8        out  %al, $0xE8        ; exit sentinel → bochs_guest_exit
+//     F4           hlt                    ; safety: never reached
+//     EB FE        jmp  .                 ; safety: spin if it is
+static const uint8_t guest_program[] = {
+    0xB0, 0x48,  0xE6, 0xE9,        // out 'H'
+    0xB0, 0x49,  0xE6, 0xE9,        // out 'I'
+    0xB0, 0x0A,  0xE6, 0xE9,        // out '\n'
+    0xB0, 0x00,  0xE6, 0xE8,        // out 0 to 0xE8 → exit
+    0xF4,                            // hlt
+    0xEB, 0xFE                       // jmp .
+};
+
+// Slot backing slab. 1 MiB, page-aligned, kept in BSS so we don't
+// allocate from the bump pool (which is now committed to Bochs).
+// vaddr_base is arbitrary but must be slab-aligned; we pick 0x08000000
+// to mirror what real ELFs use (-Ttext=0x08048000).
+// CRITICAL — guest entry offset: inject_slab_tables (bochs_glue.cpp)
+// writes the exit-trap stub at slab offset 0x000, the GDT at 0x080, and
+// the IDT at 0x100..0x900 (256 gates x 8 bytes). The guest program MUST
+// sit clear of all of that. 0x1000 (one page in) is the first clean
+// page-aligned offset. An earlier version used 0x200 — inside the IDT
+// region — so inject_slab_tables overwrote the guest code with IDT
+// gate descriptors and the CPU executed gate bytes instead of `out`s.
+#define SLAB_VADDR_BASE  0x08000000u
+#define SLAB_SIZE        (1u * 1024u * 1024u)
+#define GUEST_ENTRY_OFF  0x1000u
+static uint8_t slab[SLAB_SIZE] __attribute__((aligned(4096))) = {0};
+
 extern "C" void kernel_main(uint32_t /*magic*/, uint32_t /*mbi*/) {
-    // Clear VGA row 0 first 80 cells so old breadcrumbs from a previous
-    // boot (eg if memory wasn't fully zeroed) don't fool us.
-    for (int i = 0; i < 80; ++i) VGA[i] = 0x0F00u | ' ';
+    // Clear VGA rows 0/1 so stale data from a prior boot doesn't fool us.
+    for (int i = 0; i < 80; ++i) VGA[i]      = 0x0F00u | ' ';
     for (int i = 0; i < 80; ++i) VGA[80 + i] = 0x0F00u | ' ';
 
-    e9_puts("\n=== test_main: BX_CPU(0)->initialize() verification ===\n");
+    e9_puts("\n=== test_main: BX_CPU(0)->initialize() + cpu_tick verification ===\n");
 
     run_init_array();
 
-    e9_puts("[calling bochs_cpu_init()]\n");
+    // ─── Phase 1: global Bochs init ──────────────────────────────────
+    e9_puts("\n[Phase 1] calling bochs_cpu_init()...\n");
     bochs_cpu_init();
-    e9_puts("[bochs_cpu_init() RETURNED]\n");
-
-    // Mark "all four breadcrumbs visible" with bright green '*' at column 50
+    e9_puts("[Phase 1] bochs_cpu_init() RETURNED — initialize() worked.\n");
     VGA[50] = (uint16_t)(0x2F00u | (uint8_t)'*');
 
-    e9_puts("=== TEST PASSED ===\n");
+    // ─── Phase 2: load a tiny guest and tick it ──────────────────────
+    e9_puts("\n[Phase 2] loading guest program into slot 0...\n");
 
-    // Tell QEMU to exit successfully. The isa-debug-exit device on port
-    // 0x501 with -device isa-debug-exit causes QEMU to exit with code
-    // (val << 1) | 1. So writing 0x21 → exit code 0x43 (not zero, but
-    // distinct from a triple-fault exit).
-    //__asm__ volatile ("outb %0, %1" : : "a"((uint8_t)0x21), "Nd"((uint16_t)0x501));
+    // Register the IO callbacks for slot 0 BEFORE activate_slot so the
+    // slot's write/exit callbacks are wired when first ticked.
+    bochs_register_io_callbacks(0, test_io_read, test_io_write, test_io_exit);
 
-    //for (;;) { __asm__ volatile ("cli; hlt"); }
+    // Make slot 0 active, then bind its backing memory. bochs_set_process_
+    // memory calls mapping_register, slot_prime_cpu, inject_slab_tables
+    // (which writes the GDT/IDT/stub into the slab), slot_restore_cpu,
+    // and flush_after_switch.
+    bochs_activate_slot(0);
+    bochs_set_process_memory(slab, SLAB_SIZE, SLAB_VADDR_BASE);
+
+    // Place the guest program AFTER set_process_memory so that the
+    // table injection (stub/GDT/IDT, all below offset 0x900) cannot
+    // overwrite it. GUEST_ENTRY_OFF (0x1000) is clear of the tables
+    // anyway, but writing afterwards is belt-and-suspenders.
+    for (unsigned i = 0; i < sizeof(guest_program); ++i) {
+        slab[GUEST_ENTRY_OFF + i] = guest_program[i];
+    }
+    e9_puts("  slab host pa = ");
+    e9_hex((uint32_t)(uintptr_t)slab);
+    e9_puts(", guest entry vaddr = ");
+    e9_hex(SLAB_VADDR_BASE + GUEST_ENTRY_OFF);
+    e9_puts("\n  first guest bytes: ");
+    for (unsigned i = 0; i < 8; ++i) {
+        e9_hex((uint32_t)slab[GUEST_ENTRY_OFF + i]);
+        e9_putc(' ');
+    }
+    e9_puts("\n");
+
+    // Point the CPU at the guest entry and give it a stack near the top
+    // of the slab. bochs_cpu_set_eip also flushes the iCache, so any
+    // entry covering the just-written code page is dropped.
+    bochs_cpu_set_eip(SLAB_VADDR_BASE + GUEST_ENTRY_OFF);
+    bochs_cpu_set_esp(SLAB_VADDR_BASE + SLAB_SIZE - 16);
+
+    e9_puts("  EIP set to ");
+    e9_hex(bochs_cpu_get_eip());
+    e9_puts(", ticking...\n");
+
+    // Tick. bochs_cpu_tick(n) runs cpu_loop up to n times, returning when
+    // cpu_loop yields (via kill_bochs_request set by our port-0xE9 /
+    // port-0xE8 handlers in bochs_infra.cpp::bx_devices_c::outp).
+    // Loop a few times to drain all three port-0xE9 writes plus the
+    // port-0xE8 exit.
+    int total_ticks = 0;
+    for (int iter = 0; iter < 32 && !g_guest_exit_seen; ++iter) {
+        e9_puts("  tick iter ");
+        e9_hex((uint32_t)iter);
+        e9_puts(" eip-before=");
+        e9_hex(bochs_cpu_get_eip());
+        e9_puts("\n");
+        bochs_cpu_tick(1);
+        total_ticks++;
+        if (g_guest_exit_seen) break;
+    }
+
+    e9_puts("\n[Phase 2] results:\n");
+    e9_puts("  total tick iterations: ");
+    e9_hex((uint32_t)total_ticks);
+    e9_puts("\n  guest output (");
+    e9_hex((uint32_t)g_guest_output_count);
+    e9_puts(" chars): \"");
+    for (int i = 0; i < g_guest_output_count; ++i) {
+        char c = g_guest_output[i];
+        if (c >= 32 && c < 127) e9_putc(c);
+        else { e9_putc('\\'); e9_hex((uint32_t)(uint8_t)c); }
+    }
+    e9_puts("\"\n  guest exit seen: ");
+    e9_hex((uint32_t)g_guest_exit_seen);
+    e9_puts("\n");
+
+    bool phase2_ok = (g_guest_output_count == 3) &&
+                     (g_guest_output[0] == 'H') &&
+                     (g_guest_output[1] == 'I') &&
+                     (g_guest_output[2] == '\n') &&
+                     (g_guest_exit_seen != 0);
+
+    if (phase2_ok) {
+        e9_puts("\n=== TEST PASSED (init + tick) ===\n");
+        VGA[60] = (uint16_t)(0x2F00u | (uint8_t)'#');   // double green
+        __asm__ volatile ("outb %0, %1" : :
+                          "a"((uint8_t)0x21), "Nd"((uint16_t)0x501));
+    } else {
+        e9_puts("\n=== TEST FAILED (init ok, tick broken) ===\n");
+        VGA[60] = (uint16_t)(0x4F00u | (uint8_t)'!');
+        __asm__ volatile ("outb %0, %1" : :
+                          "a"((uint8_t)0x10), "Nd"((uint16_t)0x501));
+    }
+
+    for (;;) { __asm__ volatile ("cli; hlt"); }
 }
