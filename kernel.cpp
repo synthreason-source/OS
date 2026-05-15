@@ -7507,7 +7507,7 @@ void init_elf_system() {
 static int  elf_io_read (int slot) { return pop_input(slot); }
 static void elf_io_write(int slot, char c) { push_output(slot, c); }
 static void elf_io_exit (int slot, int code) {
-    if (slot >= 0 && slot < MAXelf_processes) {
+    if (slot >= 0 && slot < MAX_ELF_PROCESSES) {
         // Print the cause to the terminal before tearing down.
         ElfProcess& p = elf_processes[slot];
         if (p.terminal) {
@@ -7628,22 +7628,30 @@ static bool start_elf_process(int slot, const unsigned char* elf, unsigned int e
     ElfProcess& proc = elf_processes[slot];
     unsigned int entry = 0;
 
+    // load_elf_image_to_slab calls bochs_activate_slot + bochs_set_process_memory
+    // and populates proc.memory_base / proc.memory_size / proc.vaddr_base.
     if (!load_elf_image_to_slab(slot, elf, elf_size, entry)) return false;
 
     proc.active = true;
     proc.completed = false;
-    proc.cpu_initialized = true;
     proc.entry_point = entry;
-    proc.vaddr_base = align_down(entry, 0x1000);
 
-    unsigned int stack_top = proc.vaddr_base + (proc.memory_size ? proc.memory_size : 0) + ELF_STACK_SIZE;
+    // vaddr_base was set by load_elf_image_to_slab; don't clobber it with a
+    // page-aligned guess derived from the entry point (those can differ for
+    // PIE or non-zero-based binaries).
+    unsigned int stack_top = proc.vaddr_base + proc.memory_size;
     proc.esp = stack_top - 16;
     proc.brk_addr = proc.vaddr_base + proc.memory_size - ELF_HEAP_SIZE;
 
+    // Finish CPU wiring: init once, then point at entry.
     bochs_cpu_init();
     bochs_cpu_set_esp(proc.esp);
     bochs_cpu_set_eip(proc.entry_point);
     bochs_set_brk(slot, proc.brk_addr);
+
+    // Mark cpu_initialized so x86_tick skips the lazy-init path and goes
+    // straight to bochs_cpu_tick (we've done the full setup just above).
+    proc.cpu_initialized = true;
 
     return true;
 }

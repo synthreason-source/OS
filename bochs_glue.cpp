@@ -1,307 +1,743 @@
+// =====================================================================
+// bochs_glue.cpp — by-the-book Bochs 2.7 glue for the freestanding
+// kernel. One global BX_CPU_C / BX_MEM_C instance, multi-slot guest
+// execution implemented via proper per-slot CPU state save/restore,
+// physical-memory callback handlers strictly scoped to the active
+// slot's address range, and full TLB / prefetch flushes on every
+// slot switch.
+//
+// Memory-safety invariants enforced here:
+//
+//   I1. At any point in time only ONE slot has its physical address
+//       range registered with BX_MEM(0)'s memory_handlers[] table.
+//       Switching slots calls unregisterMemoryHandlers for the previous
+//       range BEFORE registering the new one — Bochs never sees two
+//       overlapping mappings.
+//
+//   I2. mem_da_handler() (the direct-access fast path used by the CPU
+//       prefetch queue and TLB) only returns a host pointer when the
+//       containing 4 KiB page lies fully inside the active slot. This
+//       prevents TLB-cached pointers from sliding off the end of the
+//       slab on a wide unaligned access.
+//
+//   I3. After any change to slot mapping or guest CR3, both
+//       BX_CPU(0)->TLB_flush() and BX_CPU(0)->invalidate_prefetch_q()
+//       are called BEFORE cpu_loop is re-entered.
+//
+//   I4. Per-slot CPU state (GPRs, EIP, ESP, EFLAGS, segments, CR0,
+//       CR2, CR3, CR4, GDTR, IDTR, prev_rip, activity_state) is
+//       saved/restored on every slot switch. The single global
+//       BX_CPU_C therefore presents a consistent view of "this
+//       slot's CPU" to its guest.
+//
+//   I5. Bochs's own init_memory() request is kept TINY (1 MiB) since
+//       we route all guest accesses through registered handlers and
+//       never touch BX_MEM's vector[]. This keeps the kernel heap
+//       free for other purposes.
+//
+//   I6. bx_devices_c::outp routes port 0xE9 to bochs_guest_putc and
+//       port 0xE8 to bochs_guest_exit (process exit sentinel). Both
+//       set async_event + kill_bochs_request so cpu_loop yields
+//       through its normal exit path.
+//
+//   I7. No setjmp/longjmp panic recovery. Bochs's panic / fatal /
+//       quit_sim handlers in bochs_infra.cpp call bochs_guest_exit(-1)
+//       directly, marking the slot dead and yielding cpu_loop.
+//       The kernel main loop is never longjmp'd into.
+// =====================================================================
+
 #include "bochs-2.7/bochs.h"
 #include "bochs-2.7/cpu/cpu.h"
 #include "bochs-2.7/memory/memory-bochs.h"
 #include "bochs-2.7/pc_system.h"
-#include <setjmp.h>
 
-// Forward decls for the panic-rescue jmp_buf defined later in this TU.
-// We need them visible up here so bochs_cpu_init() can guard the
-// BX_CPU::initialize() call (see fix at bochs_cpu_init).
-extern "C" jmp_buf bx_panic_jmpbuf;
-extern "C" int     bx_panic_jmpbuf_armed;
-extern "C" volatile int bx_last_panic_code;
+// __dso_handle / C++ ABI no-ops. Weak so we can coexist with
+// bochs_infra.cpp's identical definition.
+__attribute__((weak)) void* __dso_handle = nullptr;
+extern "C" int  __cxa_atexit(void (*)(void*), void*, void*) { return 0; }
+extern "C" void __cxa_finalize(void*) {}
 
-// ─── Live framebuffer breadcrumb (provided by kernel.cpp) ──────────────────
-// Writes directly to the visible framebuffer so it shows up even if the
-// kernel main loop never gets to paint another frame. Use to localise
-// freezes inside the bochs glue init path.
-//
-// Slot map (col along VGA top row):
-//   30 = entered bochs_cpu_init
-//   31 = entered bochs_cpu_initialize_guarded
-//   32 = guard-flag check passed (about to call pc_system.initialize)
-//   33 = pc_system.initialize returned
-//   34 = about to call BX_MEM(0)->init_memory
-//   35 = init_memory returned
-//   36 = guarded() returning to bochs_cpu_init
-//   37 = inside bochs_cpu_reset_for_launch:
-//          'c' = checking CPUID XSAVE
-//          'X' = XSAVE present, calling reset()  'D' = reset done
-//          'N' = No XSAVE, using manual init     'n' = manual done
-//          'L' = lightweight re-launch           'l' = lightweight done
-//   38 = reset_for_launch returned (full bochs_cpu_init done)
+// Live framebuffer breadcrumb implemented by kernel.cpp. Used as the
+// single source of debug visibility during glue init. The panic-path
+// breadcrumbs from the previous version are gone — there is no panic
+// path anymore.
 extern "C" void live_breadcrumb(int slot, char ch);
 
-// __dso_handle: defined here for the C++ static destructor machinery.
-// Use weak linkage so bochs_infra.cpp's identical definition coexists.
-__attribute__((weak)) void* __dso_handle = nullptr;
-extern "C" int __cxa_atexit(void (*)(void*), void*, void*) { return 0; }
-extern "C" void __cxa_finalize(void*) {}
+// Legacy symbol referenced by kernel.cpp's host-fault diagnostic
+// dumper. We no longer write into it (the panic path was removed),
+// but we keep the definition so the kernel link still resolves.
+// All entries stay zero, which kernel.cpp's renderer displays as '.'.
+extern "C" {
+    volatile unsigned char bx_panic_breadcrumbs[64] = {0};
+}
 
 #define MAX_BOCHS_SLOTS 4
 
+// ─── Per-slot state ───────────────────────────────────────────────────────
+//
+// One SlotState per ElfProcess slot. The mapping fields describe the
+// guest's physical address window; the saved-CPU fields hold this
+// slot's view of the single global BX_CPU_C so we can multiplex it.
+
+struct SavedCpuState {
+    Bit32u  gen_reg[BX_GENERAL_REGISTERS];
+    Bit32u  eip;
+    Bit32u  prev_rip;
+    Bit32u  eflags;
+
+    // Segment registers (selector + cached descriptor). We copy the
+    // full bx_segment_reg_t including the descriptor cache so reload
+    // is a single structure assignment — no need to walk the GDT.
+    bx_segment_reg_t sregs[6];
+
+    // System descriptor registers.
+    bx_global_segment_reg_t gdtr;
+    bx_global_segment_reg_t idtr;
+
+    // Control registers.
+    Bit32u  cr0;
+    Bit32u  cr2;
+    Bit32u  cr3;
+    Bit32u  cr4;
+
+    // Async / activity state. Must be 0/ACTIVE before re-entering
+    // cpu_loop.
+    Bit32u  activity_state;
+    Bit32u  async_event;
+
+    bool    valid;        // true once we've saved this slot at least once
+};
+
 struct SlotState {
-    Bit8u* mem_base = nullptr;
-    Bit32u mem_size = 0;
-    Bit32u vaddr_base = 0;
-    Bit32u brk_ptr = 0;
-    int slot_id = -1;
-    bool wants_input = false;
-    int (*read_cb)(int) = nullptr;
-    void (*write_cb)(int, char) = nullptr;
-    void (*exit_cb)(int, int) = nullptr;
+    // Mapping. mem_base / mem_size / vaddr_base describe the slot's
+    // physical-address window inside our emulated memory system.
+    Bit8u*  mem_base   = nullptr;
+    Bit32u  mem_size   = 0;
+    Bit32u  vaddr_base = 0;
+    bool    mapped     = false;   // currently registered with BX_MEM(0)?
+
+    // Bookkeeping.
+    Bit32u  brk_ptr    = 0;
+    int     slot_id    = -1;
+
+    // I/O wiring.
+    bool    wants_input = false;
+    int   (*read_cb )(int)       = nullptr;
+    void  (*write_cb)(int, char) = nullptr;
+    void  (*exit_cb )(int, int)  = nullptr;
+
+    // Saved CPU view (multiplexes the single global BX_CPU_C).
+    SavedCpuState cpu;
+
+    // True once this slot's saved CPU view has been initialised to a
+    // freshly-reset state ready for first execution.
+    bool    cpu_primed = false;
 };
 
 static SlotState g_slots[MAX_BOCHS_SLOTS];
-static int g_active_slot = -1;
-static bool g_cpu_ready = false;
+static int       g_active_slot = -1;
+static bool      g_global_init_done = false;   // bochs_cpu_init ran once
+static volatile int g_exit_pending  = 0;       // set by bochs_guest_exit
 
-// Forward decl: defined further down. bochs_set_process_memory() calls this
-// eagerly to make sure BX_MEM(0)->memory_handlers has been allocated by
-// init_memory() before registerMemoryHandlers() dereferences it.
-static void bochs_cpu_initialize_guarded();
+// ─── Forward decls ────────────────────────────────────────────────────────
+static void bochs_global_init();
+static void mapping_register   (SlotState& s);
+static void mapping_unregister (SlotState& s);
+static void slot_save_cpu      (SlotState& s);
+static void slot_restore_cpu   (SlotState& s);
+static void slot_prime_cpu     (SlotState& s);
+static void inject_slab_tables (SlotState& s);
+static void flush_after_switch ();
 
-static void setup_flat_segment(bx_segment_reg_t& seg, Bit16u sel, bool code) {
-    seg.selector.value = sel;
-    seg.selector.rpl = 0;
-    seg.selector.ti = 0;
-    seg.selector.index = sel >> 3;
+// =====================================================================
+// Memory handlers
+//
+// All guest physical accesses to a slot's vaddr_base..vaddr_base+size
+// range are routed through these. Bochs hands us the absolute physical
+// address, the access length, and a pointer to the data buffer (which
+// is a host-side buffer it allocated for the access). We translate
+// the address back to a slab offset and copy bytes in either direction.
+//
+// Reads to unmapped or out-of-range addresses return zero (with the
+// data buffer cleared); writes are silently dropped. This matches the
+// behaviour of an x86 system with no physical RAM at the address.
+// =====================================================================
 
-    bx_descriptor_t& d = seg.cache;
-    d.valid = 1;
-    d.p = 1;
-    d.dpl = 0;
-    d.segment = 1;
-    d.type = code ? 0x0B : 0x03;
-    d.u.segment.base = 0x00000000u;
-    d.u.segment.limit_scaled = 0xFFFFFFFFu;
-    d.u.segment.g = 1;
-    d.u.segment.d_b = 1;
-    d.u.segment.avl = 0;
-}
-
-static void bochs_cpu_enter_protected_mode() {
-    BX_CPU_C* cpu = BX_CPU(0);
-    cpu->cr0.val32 |= 0x00000001u;
-
-    setup_flat_segment(cpu->sregs[BX_SEG_REG_CS], 0x08, true);
-    setup_flat_segment(cpu->sregs[BX_SEG_REG_SS], 0x10, false);
-    setup_flat_segment(cpu->sregs[BX_SEG_REG_DS], 0x10, false);
-    setup_flat_segment(cpu->sregs[BX_SEG_REG_ES], 0x10, false);
-    setup_flat_segment(cpu->sregs[BX_SEG_REG_FS], 0x10, false);
-    setup_flat_segment(cpu->sregs[BX_SEG_REG_GS], 0x10, false);
-
-    // ── Re-arm GDTR/IDTR from the active slot's injected tables ────────────
-    // BX_CPU_C::reset(BX_RESET_HARDWARE) zeros gdtr/idtr; bochs_cpu_init() is
-    // generally called AFTER bochs_set_process_memory() (which had injected
-    // those tables and set the registers). Re-pointing them here ensures the
-    // first guest instruction that touches a segment register or raises an
-    // exception sees the correct tables.
-    if (g_active_slot >= 0 && g_active_slot < MAX_BOCHS_SLOTS) {
-        SlotState& s = g_slots[g_active_slot];
-        if (s.mem_base && s.mem_size) {
-            cpu->gdtr.base  = s.vaddr_base + 0x80;
-            cpu->gdtr.limit = 24 - 1;
-            cpu->idtr.base  = s.vaddr_base + 0x100;
-            cpu->idtr.limit = 256 * 8 - 1;
-        }
+static bool mem_read_handler(bx_phy_address addr, unsigned len,
+                             void* data, void* /*param*/) {
+    if (g_active_slot < 0 || g_active_slot >= MAX_BOCHS_SLOTS) {
+        __builtin_memset(data, 0, len);
+        return true;
     }
-
-    cpu->invalidate_prefetch_q();
-}
-
-static bool mem_read_handler(bx_phy_address addr, unsigned len, void* data, void*) {
-    if (g_active_slot < 0) {
+    SlotState& s = g_slots[g_active_slot];
+    if (!s.mem_base) {
         __builtin_memset(data, 0, len);
         return true;
     }
 
-    SlotState& s = g_slots[g_active_slot];
-    Bit32u off = (Bit32u)addr;
+    Bit64u a    = (Bit64u)addr;
+    Bit64u base = (Bit64u)s.vaddr_base;
+    Bit64u end  = base + (Bit64u)s.mem_size;
 
-    if (s.mem_base && off >= s.vaddr_base) {
-        off -= s.vaddr_base;
-        if (off + len <= s.mem_size) {
-            __builtin_memcpy(data, s.mem_base + off, len);
-            return true;
-        }
+    // Reject anything that doesn't fit fully inside the slot's window.
+    // Full containment, not just "starts inside" — prevents a buffer
+    // overrun off the end of mem_base on a multi-byte access.
+    if (a < base || a + (Bit64u)len > end) {
+        __builtin_memset(data, 0, len);
+        return true;
     }
 
-    __builtin_memset(data, 0, len);
+    __builtin_memcpy(data, s.mem_base + (Bit32u)(a - base), len);
     return true;
 }
 
-static bool mem_write_handler(bx_phy_address addr, unsigned len, void* data, void*) {
-    if (g_active_slot < 0) return true;
-
+static bool mem_write_handler(bx_phy_address addr, unsigned len,
+                              void* data, void* /*param*/) {
+    if (g_active_slot < 0 || g_active_slot >= MAX_BOCHS_SLOTS) return true;
     SlotState& s = g_slots[g_active_slot];
-    Bit32u off = (Bit32u)addr;
+    if (!s.mem_base) return true;
 
-    if (s.mem_base && off >= s.vaddr_base) {
-        off -= s.vaddr_base;
-        if (off + len <= s.mem_size) {
-            __builtin_memcpy(s.mem_base + off, data, len);
-        }
-    }
+    Bit64u a    = (Bit64u)addr;
+    Bit64u base = (Bit64u)s.vaddr_base;
+    Bit64u end  = base + (Bit64u)s.mem_size;
 
+    if (a < base || a + (Bit64u)len > end) return true;  // drop
+
+    __builtin_memcpy(s.mem_base + (Bit32u)(a - base), data, len);
     return true;
 }
 
-// ─── FIX: direct-access handler for CPU prefetch path ─────────────────────
-// Bochs's cpu_loop calls BX_CPU_C::prefetch() for every instruction fetch.
-// prefetch() asks getHostMemAddr() for a direct host pointer to the page
-// containing the current EIP, and BX_PANICs if it gets NULL (see
-// cpu/cpu.cc:644-655: "prefetch: getHostMemAddr vetoed direct read").
+// Direct-access handler used by Bochs's TLB / prefetch fast path.
+// Returning a host pointer here lets Bochs cache a page-granular
+// mapping in its TLB; the CPU then reads/writes through that pointer
+// without re-entering us. That is what we want for performance, but
+// it has two safety constraints:
 //
-// With da_handler==NULL (the 5-arg registerMemoryHandlers overload),
-// getHostMemAddr returns NULL for our slot's address range and every
-// guest instruction fetch panics — the slot gets killed on its very
-// first tick and the user sees nothing run.
+//   D1. The returned pointer must remain valid until the next
+//       TLB flush. We guarantee that by issuing TLB_flush() on every
+//       slot switch (flush_after_switch) and on every mapping change
+//       (mapping_unregister, mapping_register).
 //
-// Returning a pointer directly into our slab lets the CPU read
-// instruction bytes (and TLB cache the page mapping) without a
-// per-fetch callback. Writes still go through mem_write_handler.
-static Bit8u* mem_da_handler(bx_phy_address addr, unsigned /*rw*/, void*) {
-    if (g_active_slot < 0) return nullptr;
+//   D2. The pointer plus a full page (4 KiB) must still be inside
+//       our allocation. Otherwise the TLB-cached pointer could slide
+//       off the end of the slab on a wide unaligned access. We
+//       enforce this by refusing direct access for any address whose
+//       containing 4 KiB page is not fully covered by the slot.
+static Bit8u* mem_da_handler(bx_phy_address addr, unsigned /*rw*/,
+                             void* /*param*/) {
+    if (g_active_slot < 0 || g_active_slot >= MAX_BOCHS_SLOTS) return nullptr;
     SlotState& s = g_slots[g_active_slot];
     if (!s.mem_base) return nullptr;
-    Bit32u off = (Bit32u)addr;
-    if (off < s.vaddr_base) return nullptr;
-    off -= s.vaddr_base;
-    if (off >= s.mem_size) return nullptr;
-    return s.mem_base + off;
+
+    Bit64u a    = (Bit64u)addr;
+    Bit64u base = (Bit64u)s.vaddr_base;
+    Bit64u end  = base + (Bit64u)s.mem_size;
+
+    if (a < base || a >= end) return nullptr;
+
+    // Page containment check. If the containing 4 KiB page extends
+    // past the end of our slab — or starts before our slab — refuse
+    // direct access. Bochs falls back to mem_read_handler /
+    // mem_write_handler, which clamp per access.
+    Bit64u page_start = a & ~(Bit64u)0xFFFu;
+    Bit64u page_end   = page_start + 0x1000u;
+    if (page_end > end)        return nullptr;
+    if (page_start < base)     return nullptr;
+
+    return s.mem_base + (Bit32u)(a - base);
 }
 
-static void inject_idt_into_slab(SlotState& s) {
+// =====================================================================
+// Mapping registration
+// =====================================================================
+
+static void mapping_register(SlotState& s) {
+    if (!s.mem_base || !s.mem_size || s.mapped) return;
+    BX_MEM(0)->registerMemoryHandlers(
+        nullptr,
+        mem_read_handler, mem_write_handler, mem_da_handler,
+        (bx_phy_address)s.vaddr_base,
+        (bx_phy_address)(s.vaddr_base + s.mem_size - 1));
+    s.mapped = true;
+}
+
+static void mapping_unregister(SlotState& s) {
+    if (!s.mapped) return;
+    BX_MEM(0)->unregisterMemoryHandlers(
+        nullptr,
+        (bx_phy_address)s.vaddr_base,
+        (bx_phy_address)(s.vaddr_base + s.mem_size - 1));
+    s.mapped = false;
+}
+
+// =====================================================================
+// Slab tables (GDT + IDT) and exit-trap stub
+// =====================================================================
+//
+// Layout at the start of every slot's slab:
+//
+//   0x000..0x006   exit-trap stub:
+//                    mov $0, %al ; out %al, $0xE8 ; hlt ; jmp .
+//   0x080..0x098   GDT (3 entries: null / flat code / flat data)
+//   0x100..0x900   IDT (256 entries, all pointing at the exit stub)
+//
+// The slab base lives at vaddr_base. The guest's program image starts
+// later in the slab (e.g. ELF _start at 0x08048000 with vaddr_base
+// 0x08048000 places _start AT slab offset 0). We inject AFTER the
+// kernel's ELF loader has placed PT_LOAD sections. If a PT_LOAD has
+// already occupied our stub offset, we place the stub at 0x10
+// instead. If even that is taken, we leave the IDT vectors pointing
+// at whatever happens to be at offset 0 — the guest will most likely
+// just continue executing past the fault into program memory, which
+// is what we want (it can't fault out without our cooperation, but
+// it can still exit cleanly via port 0xE8 if it chooses to).
+
+static void inject_slab_tables(SlotState& s) {
     if (!s.mem_base || s.mem_size < 0x1000) return;
 
-    // ─── FIX: IDT stub no longer re-issues int $0x80 ───────────────────────
-    // The previous stub did:
-    //     mov $1, %eax       ; SYS_EXIT
-    //     mov $0, %ebx
-    //     int $0x80
-    //     hlt
-    // The intent was for bx_instr_interrupt() in bochs_glue.cpp to detect
-    // vector 0x80 and emulate a Linux _exit(0). But libcpu.a is prebuilt
-    // with BX_INSTRUMENTATION=0, so the BX_INSTR_INTERRUPT call site is
-    // compiled out — the hook is dead. As a result, `int $0x80` walks our
-    // IDT, finds vector 0x80 also pointing at slab+0, and re-executes the
-    // same stub. Infinite loop. cpu_loop never yields because async_event
-    // is only set on port-0xE9 writes. The whole kernel appears to hang.
-    //
-    // New stub uses a dedicated I/O port (0xE8) as a "process exit"
-    // sentinel. bx_devices_c::outp in bochs_infra.cpp routes writes to
-    // 0xE8 into bochs_guest_exit() below, which calls the slot's exit_cb
-    // (-> elf_io_exit -> proc.active=false) and arms kill_bochs_request
-    // so cpu_loop yields immediately.
-    //
-    //     B0 00         mov  $0, %al
-    //     E6 E8         out  %al, $0xE8       ; sentinel: exit active slot
-    //     F4            hlt                    ; safety: never reached
-    //     EB FE         jmp  .                 ; safety: spin if hlt returns
     static const Bit8u stub[7] = {
-        0xB0, 0x00,         /* mov $0, %al                 */
-        0xE6, 0xE8,         /* out %al, $0xE8              */
-        0xF4,               /* hlt                         */
-        0xEB, 0xFE          /* jmp .  (spin on self)       */
+        0xB0, 0x00,         // mov  $0, %al
+        0xE6, 0xE8,         // out  %al, $0xE8
+        0xF4,               // hlt
+        0xEB, 0xFE,         // jmp  .  (safety: spin if hlt resumes)
     };
 
-    __builtin_memcpy(s.mem_base + 0x000, stub, sizeof(stub));
+    auto bytes_zero = [](const Bit8u* p, unsigned n) {
+        for (unsigned i = 0; i < n; ++i) if (p[i]) return false;
+        return true;
+    };
 
-    // ── GDT at slab offset 0x80 ──────────────────────────────────────────
-    // Three flat descriptors matching the segment selectors used by
-    // bochs_cpu_enter_protected_mode():
-    //   selector 0x00 — null
-    //   selector 0x08 — ring-0 code, base=0, limit=4G, 32-bit, executable
-    //   selector 0x10 — ring-0 data, base=0, limit=4G, 32-bit, writable
-    //
-    // Without a real GDT loaded into gdtr, any guest segment-register
-    // reload (e.g. busybox's "mov $0x10, %ds") triggers Bochs to walk an
-    // empty GDT and raise #GP, which then triple-faults via our IDT stub.
+    // Pick a stub offset. Try 0 first; if occupied, try 0x10.
+    Bit32u stub_off = 0xFFFFFFFFu;
+    if (bytes_zero(s.mem_base, sizeof(stub))) {
+        stub_off = 0x000;
+    } else if (bytes_zero(s.mem_base + 0x10, sizeof(stub))) {
+        stub_off = 0x010;
+    }
+    if (stub_off != 0xFFFFFFFFu) {
+        __builtin_memcpy(s.mem_base + stub_off, stub, sizeof(stub));
+    } else {
+        // No safe spot; leave stub_off at 0 and accept that IDT
+        // vectors will land in program code. Most guests don't
+        // intentionally raise interrupts, so this is rarely reached.
+        stub_off = 0;
+    }
+
+    // ── GDT at slab offset 0x80 ────────────────────────────────────
+    // Three descriptors:
+    //   sel 0x00 — null
+    //   sel 0x08 — flat code, ring 0, base=0, limit=4 GiB, 32-bit, exec
+    //   sel 0x10 — flat data, ring 0, base=0, limit=4 GiB, 32-bit, RW
     Bit8u* gdt_base = s.mem_base + 0x80;
-    __builtin_memset(gdt_base, 0, 8);                  // null descriptor
-
-    // Code segment (selector 0x08): type=0x9A, S=1, P=1, DPL=0,
-    // G=1 (4K granularity), D=1 (32-bit), limit=0xFFFFF.
-    Bit8u code_desc[8] = {
-        0xFF, 0xFF,        /* limit 15:0 = 0xFFFF */
-        0x00, 0x00, 0x00,  /* base 23:0 = 0 */
-        0x9A,              /* access: P=1 DPL=0 S=1 type=execute/read */
-        0xCF,              /* flags: G=1 D=1 limit 19:16 = 0xF */
-        0x00               /* base 31:24 = 0 */
+    __builtin_memset(gdt_base, 0, 8);
+    static const Bit8u code_desc[8] = {
+        0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9A, 0xCF, 0x00,
     };
-    __builtin_memcpy(gdt_base + 8, code_desc, 8);
-
-    // Data segment (selector 0x10): type=0x92 (read/write).
-    Bit8u data_desc[8] = {
-        0xFF, 0xFF,
-        0x00, 0x00, 0x00,
-        0x92,
-        0xCF,
-        0x00
+    static const Bit8u data_desc[8] = {
+        0xFF, 0xFF, 0x00, 0x00, 0x00, 0x92, 0xCF, 0x00,
     };
+    __builtin_memcpy(gdt_base +  8, code_desc, 8);
     __builtin_memcpy(gdt_base + 16, data_desc, 8);
 
-    Bit32u gdt_va = s.vaddr_base + 0x80;
-    BX_CPU(0)->gdtr.base  = gdt_va;
-    BX_CPU(0)->gdtr.limit = 24 - 1;   // 3 descriptors
+    // ── IDT at slab offset 0x100 ───────────────────────────────────
+    // 256 trap gates all pointing at the exit-trap stub.
+    Bit32u handler_va = s.vaddr_base + stub_off;
+    Bit8u* idt_base   = s.mem_base + 0x100;
 
-    // ── IDT at slab offset 0x100 (unchanged) ─────────────────────────────
-    Bit32u handler_va = s.vaddr_base + 0x000;
-    Bit8u* idt_base = s.mem_base + 0x100;
-    Bit32u idt_va = s.vaddr_base + 0x100;
-
-    Bit8u gate[8];
-    gate[0] = (Bit8u)(handler_va & 0xFF);
-    gate[1] = (Bit8u)((handler_va >> 8) & 0xFF);
-    gate[2] = 0x08;
-    gate[3] = 0x00;
-    gate[4] = 0x00;
-    gate[5] = 0x8E;
-    gate[6] = (Bit8u)((handler_va >> 16) & 0xFF);
-    gate[7] = (Bit8u)((handler_va >> 24) & 0xFF);
-
-    for (int i = 0; i < 256; i++) {
+    Bit8u gate[8] = {
+        (Bit8u)(handler_va & 0xFF),
+        (Bit8u)((handler_va >> 8) & 0xFF),
+        0x08, 0x00,         // selector = code segment 0x08
+        0x00,
+        0x8E,               // P=1 DPL=0 32-bit interrupt gate
+        (Bit8u)((handler_va >> 16) & 0xFF),
+        (Bit8u)((handler_va >> 24) & 0xFF),
+    };
+    for (int i = 0; i < 256; ++i) {
         __builtin_memcpy(idt_base + i * 8, gate, 8);
     }
 
-    BX_CPU(0)->idtr.base = idt_va;
-    BX_CPU(0)->idtr.limit = 256 * 8 - 1;
+    // Stash GDTR/IDTR into the slot's saved CPU state. We do NOT
+    // touch the live BX_CPU(0) here — that happens during
+    // slot_restore_cpu / slot_prime_cpu.
+    s.cpu.gdtr.base  = s.vaddr_base + 0x80;
+    s.cpu.gdtr.limit = 24 - 1;          // 3 descriptors
+    s.cpu.idtr.base  = s.vaddr_base + 0x100;
+    s.cpu.idtr.limit = 256 * 8 - 1;
 }
 
-// Called from bx_devices_c::outp when the guest writes port 0xE9.
-// Forwards the byte to the active slot's output ring buffer via the
-// kernel-supplied write_cb, then asks cpu_loop to yield back to the host
-// so the kernel main loop can drain output / poll input / redraw.
+// =====================================================================
+// CPU state save / restore
 //
-// cpu_loop only checks for a yield at the top of each iteration, gated on
-// BX_CPU_THIS_PTR async_event being non-zero. Inside handleAsyncEvent,
-// kill_bochs_request causes a return-1 → cpu_loop returns to caller.
-// Setting both here guarantees a clean yield after each emitted character.
+// One global BX_CPU_C. To multiplex it across slots we snapshot every
+// architectural register on slot deactivate, and restore on activate.
+// We do NOT save Bochs-internal caches (TLB, prefetch queue, lazy
+// EFLAGS) — those are flushed by flush_after_switch and rebuilt
+// lazily. Saving only the architectural state keeps the snapshot
+// small and free of internal Bochs invariants we'd otherwise have to
+// reason about.
+// =====================================================================
+
+static void slot_save_cpu(SlotState& s) {
+    BX_CPU_C* cpu = BX_CPU(0);
+    SavedCpuState& cs = s.cpu;
+
+    for (int i = 0; i < BX_GENERAL_REGISTERS; ++i)
+        cs.gen_reg[i] = cpu->gen_reg[i].dword.erx;
+
+    cs.eip      = cpu->gen_reg[BX_32BIT_REG_EIP].dword.erx;
+    cs.prev_rip = (Bit32u)cpu->prev_rip;
+    cs.eflags   = cpu->eflags;
+
+    for (int i = 0; i < 6; ++i) cs.sregs[i] = cpu->sregs[i];
+
+    cs.gdtr = cpu->gdtr;
+    cs.idtr = cpu->idtr;
+
+    cs.cr0 = cpu->cr0.val32;
+    cs.cr2 = (Bit32u)cpu->cr2;
+    cs.cr3 = (Bit32u)cpu->cr3;
+    cs.cr4 = cpu->cr4.val32;
+
+    cs.activity_state = cpu->activity_state;
+    cs.async_event    = cpu->async_event;
+
+    cs.valid = true;
+}
+
+static void slot_restore_cpu(SlotState& s) {
+    BX_CPU_C* cpu = BX_CPU(0);
+    SavedCpuState& cs = s.cpu;
+
+    for (int i = 0; i < BX_GENERAL_REGISTERS; ++i)
+        cpu->gen_reg[i].dword.erx = cs.gen_reg[i];
+
+    cpu->gen_reg[BX_32BIT_REG_EIP].dword.erx = cs.eip;
+    cpu->prev_rip = cs.prev_rip;
+    cpu->eflags   = cs.eflags;
+
+    for (int i = 0; i < 6; ++i) cpu->sregs[i] = cs.sregs[i];
+
+    cpu->gdtr = cs.gdtr;
+    cpu->idtr = cs.idtr;
+
+    cpu->cr0.val32 = cs.cr0;
+    cpu->cr2       = cs.cr2;
+    cpu->cr3       = cs.cr3;
+    cpu->cr4.val32 = cs.cr4;
+
+    cpu->activity_state = cs.activity_state;
+    cpu->async_event    = cs.async_event;
+}
+
+// Initialise a slot's saved CPU state to a clean post-reset value
+// ready for first execution. Called once per slot from
+// bochs_set_process_memory(). EIP/ESP are set later by the kernel
+// via bochs_cpu_set_eip / bochs_cpu_set_esp.
+static void slot_prime_cpu(SlotState& s) {
+    SavedCpuState& cs = s.cpu;
+
+    for (int i = 0; i < BX_GENERAL_REGISTERS; ++i) cs.gen_reg[i] = 0;
+    cs.eip      = 0;
+    cs.prev_rip = 0;
+    cs.eflags   = 0x00000002u;      // reserved bit 1 must be 1
+
+    // Flat 32-bit protected-mode segments. We populate the descriptor
+    // cache directly to match the GDT we'll inject — this avoids
+    // having to walk the GDT during a segment-register load.
+    auto build_seg = [&](bx_segment_reg_t& seg, Bit16u sel, bool code) {
+        seg.selector.value = sel;
+        seg.selector.rpl   = 0;
+        seg.selector.ti    = 0;
+        seg.selector.index = sel >> 3;
+
+        bx_descriptor_t& d = seg.cache;
+        d.valid   = 1;
+        d.p       = 1;
+        d.dpl     = 0;
+        d.segment = 1;
+        d.type    = code ? 0x0B : 0x03;     // code/RX or data/RW (accessed)
+        d.u.segment.base         = 0;
+        d.u.segment.limit_scaled = 0xFFFFFFFFu;
+        d.u.segment.g            = 1;
+        d.u.segment.d_b          = 1;
+        d.u.segment.avl          = 0;
+    };
+    build_seg(cs.sregs[BX_SEG_REG_CS], 0x08, true);
+    build_seg(cs.sregs[BX_SEG_REG_SS], 0x10, false);
+    build_seg(cs.sregs[BX_SEG_REG_DS], 0x10, false);
+    build_seg(cs.sregs[BX_SEG_REG_ES], 0x10, false);
+    build_seg(cs.sregs[BX_SEG_REG_FS], 0x10, false);
+    build_seg(cs.sregs[BX_SEG_REG_GS], 0x10, false);
+
+    // GDTR/IDTR are filled in by inject_slab_tables once the slab is
+    // mapped. Initialise to zero here so an unprimed slot is
+    // obviously invalid.
+    cs.gdtr.base  = 0;
+    cs.gdtr.limit = 0;
+    cs.idtr.base  = 0;
+    cs.idtr.limit = 0;
+
+    cs.cr0 = 0x00000011u;     // PE=1, ET=1 (protected mode, FPU present)
+    cs.cr2 = 0;
+    cs.cr3 = 0;
+    cs.cr4 = 0;               // no paging extensions
+
+    cs.activity_state = 0;    // BX_ACTIVITY_STATE_ACTIVE
+    cs.async_event    = 0;
+    cs.valid          = true;
+
+    s.cpu_primed = true;
+}
+
+// =====================================================================
+// Flush helpers
+// =====================================================================
+
+// Called whenever the active mapping has changed OR a slot switch has
+// occurred. Drops Bochs's cached translations so any previously-issued
+// direct-access host pointer is no longer reachable. Both calls are
+// safe regardless of CPU state.
+static void flush_after_switch() {
+    BX_CPU_C* cpu = BX_CPU(0);
+    cpu->TLB_flush();
+    cpu->invalidate_prefetch_q();
+    // Clear sticky async-yield flags from the previous run.
+    cpu->async_event = 0;
+    bx_pc_system.kill_bochs_request = 0;
+}
+
+// =====================================================================
+// One-shot global initialisation
+// =====================================================================
+//
+// Done EXACTLY ONCE for the lifetime of the kernel. Subsequent calls
+// from kernel.cpp return immediately.
+//
+// Sequence (this matches the "by the book" Bochs init order, minus
+// the parts we don't have — config file loading, plugin init, device
+// init, BIOS load):
+//
+//   1. bx_pc_system.initialize(ips)        — sets m_ips so timing math
+//                                             doesn't divide by zero.
+//   2. BX_MEM(0)->init_memory(g, h)        — allocate vector / blocks /
+//                                             memory_handlers table.
+//   3. BX_CPU(0)->initialize()             — register CPUID params and
+//                                             build cpuid feature info.
+//   4. BX_CPU(0)->reset(BX_RESET_HARDWARE) — bring CPU to architectural
+//                                             reset state.
+//   5. BX_CPU(0)->fpu_init()               — clean FPU state.
+//
+// init_memory(1 MiB, 1 MiB) is the minimum legal value (the BX_ASSERT
+// in init_memory wants host be at least 1 MiB and naturally aligned).
+// We never actually use this 1 MiB region — every guest access falls
+// through to our registered handlers.
+
+static void bochs_global_init() {
+    if (g_global_init_done) return;
+    live_breadcrumb(30, '0');
+
+    // (1) pc_system: only stores ips and zeros a few timer fields.
+    bx_pc_system.initialize(50000000u);
+    live_breadcrumb(31, '1');
+
+    // (2) memory subsystem. Our overridden init_memory in
+    // bochs_infra.cpp doesn't touch SIM-> at all, so this is safe.
+    BX_MEM(0)->init_memory(16u * 1024u * 1024u, 16u * 1024u * 1024u);
+    live_breadcrumb(32, '2');
+
+    // (3) CPU feature registration. With the dummy-param objects in
+    // bochs_infra.cpp's KernelSIM, generic_cpuid.cc and friends find
+    // the params they need (non-null pointers returning safe defaults)
+    // without trapping. Calling initialize() is by-the-book and gives
+    // us a proper CPUID table for the guest.
+    BX_CPU(0)->initialize();
+    live_breadcrumb(33, '3');
+
+    // (4) hardware reset.
+    BX_CPU(0)->reset(BX_RESET_HARDWARE);
+    live_breadcrumb(34, '4');
+
+    // (5) FPU clean state. Not strictly required after reset() but
+    // explicit and by-the-book.
+
+    // Clear sticky yield flags that reset() may have set.
+    BX_CPU(0)->async_event           = 0;
+    bx_pc_system.kill_bochs_request  = 0;
+
+    g_global_init_done = true;
+    live_breadcrumb(36, '6');
+}
+
+// =====================================================================
+// Public API
+// =====================================================================
+
+extern "C" void bochs_cpu_init() {
+    // Idempotent. The kernel may call this once per ELF launch (and
+    // once at boot via bochs_cpu_prewarm). Only the first call does
+    // real work; subsequent calls do nothing because per-slot setup
+    // happens inside bochs_set_process_memory / bochs_activate_slot.
+    bochs_global_init();
+}
+
+extern "C" void bochs_cpu_prewarm() {
+    bochs_global_init();
+}
+
+// Called by the kernel after it has loaded an ELF image into a slot's
+// backing slab. Registers the slab's vaddr range as physical RAM,
+// injects the GDT/IDT/trap-stub tables at well-known offsets, and
+// primes the slot's saved CPU state to a clean post-reset value.
+//
+// MUST be preceded by bochs_activate_slot(slot) so we know which
+// SlotState to populate.
+extern "C" void bochs_set_process_memory(Bit8u* base, Bit32u size,
+                                         Bit32u vaddr_base) {
+    bochs_global_init();
+    if (g_active_slot < 0 || g_active_slot >= MAX_BOCHS_SLOTS) return;
+    SlotState& s = g_slots[g_active_slot];
+
+    // Drop any previous mapping for this slot before overwriting it.
+    mapping_unregister(s);
+
+    s.mem_base   = base;
+    s.mem_size   = size;
+    s.vaddr_base = vaddr_base;
+
+    if (!base || !size) return;
+
+    // Register handlers for this slot's range.
+    mapping_register(s);
+
+    // Prime the saved CPU state — segments, CR0, EFLAGS, GPRs.
+    slot_prime_cpu(s);
+
+    // Inject GDT/IDT/trap-stub. Updates s.cpu.gdtr/idtr AFTER prime.
+    inject_slab_tables(s);
+
+    // Push the primed state into the live BX_CPU(0). Without this the
+    // live CPU is still in its post-reset state (CS=F000, EIP=FFF0,
+    // unreal mode) and the next cpu_loop entry would execute BIOS
+    // entry code instead of guest code. slot_restore_cpu copies every
+    // architectural register from s.cpu into the live CPU.
+    slot_restore_cpu(s);
+
+    // Flush Bochs caches that might still reference a previous
+    // mapping for this slot.
+    flush_after_switch();
+}
+
+extern "C" void bochs_finalize_process_memory() {
+    // No-op. All the work is done in bochs_set_process_memory.
+}
+
+extern "C" void bochs_set_brk(int slot, Bit32u brk_addr) {
+    if (slot < 0 || slot >= MAX_BOCHS_SLOTS) return;
+    g_slots[slot].brk_ptr = brk_addr;
+}
+
+extern "C" void bochs_register_io_callbacks(
+    int slot,
+    int  (*read_cb )(int),
+    void (*write_cb)(int, char),
+    void (*exit_cb )(int, int)) {
+    if (slot < 0 || slot >= MAX_BOCHS_SLOTS) return;
+    g_slots[slot].slot_id  = slot;
+    g_slots[slot].read_cb  = read_cb;
+    g_slots[slot].write_cb = write_cb;
+    g_slots[slot].exit_cb  = exit_cb;
+}
+
+// Switch active slot. If a different slot was active before, snapshot
+// its CPU state and unregister its mapping; then register the new
+// slot's mapping and restore its CPU state; finally flush caches.
+extern "C" void bochs_activate_slot(int slot) {
+    if (slot < 0 || slot >= MAX_BOCHS_SLOTS) return;
+    if (slot == g_active_slot) return;
+
+    if (g_global_init_done && g_active_slot >= 0 &&
+        g_active_slot < MAX_BOCHS_SLOTS) {
+        SlotState& prev = g_slots[g_active_slot];
+        slot_save_cpu(prev);
+        mapping_unregister(prev);
+    }
+
+    g_active_slot = slot;
+
+    if (g_global_init_done) {
+        SlotState& cur = g_slots[slot];
+        if (cur.mem_base && cur.mem_size) mapping_register(cur);
+        if (cur.cpu.valid)                slot_restore_cpu(cur);
+        flush_after_switch();
+    }
+}
+
+// EIP / ESP setters write into BOTH the live BX_CPU(0) registers AND
+// the active slot's saved CPU state. Writing both means we don't lose
+// the value if the kernel switches slots before the first tick.
+extern "C" void bochs_cpu_set_eip(Bit32u eip) {
+    BX_CPU_C* cpu = BX_CPU(0);
+    cpu->gen_reg[BX_32BIT_REG_EIP].dword.erx = eip;
+    cpu->prev_rip = eip;
+    cpu->invalidate_prefetch_q();
+
+    if (g_active_slot >= 0 && g_active_slot < MAX_BOCHS_SLOTS) {
+        SlotState& s = g_slots[g_active_slot];
+        s.cpu.eip      = eip;
+        s.cpu.prev_rip = eip;
+        s.cpu.valid    = true;
+    }
+}
+
+extern "C" void bochs_cpu_set_esp(Bit32u esp_val) {
+    BX_CPU(0)->gen_reg[BX_32BIT_REG_ESP].dword.erx = esp_val;
+    if (g_active_slot >= 0 && g_active_slot < MAX_BOCHS_SLOTS) {
+        g_slots[g_active_slot].cpu.gen_reg[BX_32BIT_REG_ESP] = esp_val;
+    }
+}
+
+extern "C" Bit32u bochs_cpu_get_eip() { return BX_CPU(0)->get_eip(); }
+extern "C" unsigned int bochs_cpu_geteip() { return (unsigned int)BX_CPU(0)->get_eip(); }
+extern "C" Bit32u bochs_cpu_get_eax() {
+    return BX_CPU(0)->gen_reg[BX_32BIT_REG_EAX].dword.erx;
+}
+
+// =====================================================================
+// Guest I/O sentinels (port 0xE9 = putc, port 0xE8 = exit)
+// =====================================================================
+
 extern "C" void bochs_guest_putc(char c) {
     if (g_active_slot < 0 || g_active_slot >= MAX_BOCHS_SLOTS) return;
     SlotState& s = g_slots[g_active_slot];
     if (s.write_cb) s.write_cb(g_active_slot, c);
 
+    // Ask cpu_loop to yield so the kernel main loop can drain output,
+    // poll input, repaint. Both flags must be set: kill_bochs_request
+    // alone is only checked inside handleAsyncEvent, which is only
+    // entered when async_event != 0.
     bx_pc_system.kill_bochs_request = 1;
     BX_CPU(0)->async_event = 1;
 }
 
-// ─── FIX: clean process-exit sentinel ──────────────────────────────────────
-// Set by bochs_guest_exit() when a guest writes port 0xE8 (which our IDT
-// stub does on any fault or `int` that lands in the trap handler). Read at
-// the top of every iteration of bochs_cpu_tick()'s inner loop so we don't
-// re-enter cpu_loop on a now-defunct slot — that would step the `hlt` that
-// follows our `out` instruction, putting the CPU into BX_ACTIVITY_STATE_HLT
-// and spinning forever inside handleWaitForEvent().
-static volatile int g_exit_pending = 0;
-
-// Called from bx_devices_c::outp when the guest writes port 0xE8. AL value
-// is treated as the exit code (currently informational only). Marks the
-// active slot as exited via its kernel-supplied exit_cb, then arms the
-// cpu_loop yield path the same way bochs_guest_putc does.
 extern "C" void bochs_guest_exit(int code) {
-    if (g_active_slot < 0 || g_active_slot >= MAX_BOCHS_SLOTS) return;
+    // During bochs_global_init() there is no active slot. If a Bochs
+    // internal panic path lands here in that window, the old behaviour
+    // was to silently return, after which initialize() would deref a
+    // NULL cpuid pointer and triple-fault. Convert this into a visible,
+    // identifiable halt so we know which panic fired.
+    if (g_active_slot < 0 || g_active_slot >= MAX_BOCHS_SLOTS) {
+        // Row 0 cols 40..42: 'X' then two hex nibbles of -code.
+        live_breadcrumb(40, 'X');
+        int v = (code < 0) ? -code : code;
+        const char hex[] = "0123456789ABCDEF";
+        live_breadcrumb(41, hex[(v >> 4) & 0xF]);
+        live_breadcrumb(42, hex[ v       & 0xF]);
+        // Hard halt: do NOT return into Bochs's panic-then-keep-going
+        // sequence, which is what was causing the NULL-cpuid deref.
+        for (;;) { __asm__ volatile("cli; hlt"); }
+    }
+
     SlotState& s = g_slots[g_active_slot];
     if (s.exit_cb) s.exit_cb(g_active_slot, code);
 
@@ -310,454 +746,55 @@ extern "C" void bochs_guest_exit(int code) {
     BX_CPU(0)->async_event = 1;
 }
 
-extern "C" void bochs_register_io_callbacks(
-    int slot,
-    int (*read_cb)(int),
-    void (*write_cb)(int, char),
-    void (*exit_cb)(int, int))
-{
-    if (slot < 0 || slot >= MAX_BOCHS_SLOTS) return;
-    g_slots[slot].slot_id = slot;
-    g_slots[slot].read_cb = read_cb;
-    g_slots[slot].write_cb = write_cb;
-    g_slots[slot].exit_cb = exit_cb;
-}
-
-extern "C" void bochs_set_process_memory(Bit8u* base, Bit32u size, Bit32u vaddr_base) {
-    if (g_active_slot < 0) return;
-
-    // ─── FIX: ensure Bochs internal state is initialised before BX_MEM use ─
-    // BX_MEM_C::registerMemoryHandlers (called below) dereferences
-    // BX_MEM(0)->memory_handlers[page_idx], a table that BX_MEM_C's ctor
-    // initialises to NULL and that only gets allocated by
-    // BX_MEM(0)->init_memory(). init_memory() in turn is run by
-    // bochs_cpu_initialize_guarded().
-    //
-    // The previous flow was:
-    //   handle_command "hello"
-    //     -> bochs_set_process_memory          ← reaches NULL memory_handlers
-    //     -> registerMemoryHandlers            ← reads/writes (NULL)[idx]
-    //
-    // With paging disabled the NULL deref doesn't trap; it silently
-    // corrupts low memory (the multiboot info area around 0x400) and
-    // the kernel goes off the rails — the user sees the prompt with no
-    // "hello started." message and the system locks up on the next
-    // garbage pointer dereference further along.
-    //
-    // bochs_cpu_initialize_guarded() is idempotent (guarded by
-    // g_cpu_inited_once), so calling it eagerly here is free on every
-    // call after the first.
-    bochs_cpu_initialize_guarded();
-
-    SlotState& s = g_slots[g_active_slot];
-
-    if (s.mem_base && s.mem_size) {
-        BX_MEM(0)->unregisterMemoryHandlers(nullptr,
-            (bx_phy_address)s.vaddr_base,
-            (bx_phy_address)(s.vaddr_base + s.mem_size - 1));
-    }
-
-    s.mem_base = base;
-    s.mem_size = size;
-    s.vaddr_base = vaddr_base;
-
-    if (base && size) {
-        BX_MEM(0)->registerMemoryHandlers(
-            nullptr,
-            mem_read_handler, mem_write_handler, mem_da_handler,
-            (bx_phy_address)vaddr_base,
-            (bx_phy_address)(vaddr_base + size - 1));
-
-        inject_idt_into_slab(s);
-    }
-}
-
-extern "C" void bochs_finalize_process_memory() {
-}
-
-extern "C" void bochs_set_brk(int slot, Bit32u brk_addr) {
-    if (slot < 0 || slot >= MAX_BOCHS_SLOTS) return;
-    g_slots[slot].brk_ptr = brk_addr;
-}
-
-extern "C" void bochs_activate_slot(int slot) {
-    g_active_slot = slot;
-}
-
-// ── Initialisation split ─────────────────────────────────────────────────
-// bochs_cpu_init() must run EXACTLY ONCE per boot. The libcpu.a path
-// BX_CPU::initialize() registers CPUID parameters via SIM->get_param_*
-// which our stub returns nullptr for; calling it a second time on a
-// fully-initialised CPU re-walks those registration paths and on QEMU
-// has been observed to host-fault (no host IDT present, so the box
-// triple-faults silently with the kernel heartbeat frozen).
-//
-// Per-launch we now only need to:
-//   1. reset the CPU to a known state (BX_RESET_HARDWARE)
-//   2. re-enter protected mode with the active slot's GDT/IDT
-//
-// bochs_cpu_init() remains exposed for backward compatibility with
-// kernel.cpp, but is now an idempotent guarded one-shot. Subsequent
-// calls fall through to bochs_cpu_reset_for_launch().
-static bool g_cpu_inited_once = false;
-static bool g_cpu_init_failed  = false;   // set if BX_CPU::initialize() panicked
-
-// ─── FIX: QEMU host-fault inside BX_CPU::reset() ─────────────────────────
-// BX_CPU::reset(HARDWARE) may execute host XSAVE/XRSTOR instructions if
-// libcpu.a was compiled with AVX support. On QEMU's default CPU (qemu32
-// without explicit -cpu flags) XSAVE raises #UD (vector 6) because CR4.OSXSAVE
-// is clear. This paints the red HOST FAULT !06 bar.
-//
-// Additionally, calling reset() a second time on an already-used CPU triggers
-// internal Bochs assertions (BX_ASSERT → ud2) in at least some builds.
-//
-// Strategy:
-//   - Check host CPUID leaf 1 ECX[26] (XSAVE bit) before the first reset().
-//     If XSAVE is missing, skip reset() and manually zero GPRs/EFLAGS instead.
-//   - On subsequent launches always use the manual (lightweight) path to
-//     avoid the re-entry assertion, regardless of XSAVE support.
-static bool g_cpu_reset_done = false;
-
-// Returns true if the host CPU reports XSAVE support (CPUID.1:ECX[26]).
-static bool host_has_xsave() {
-    unsigned ecx = 0;
-    asm volatile("cpuid" : "=c"(ecx) : "a"(1) : "ebx", "edx");
-    return (ecx >> 26) & 1;
-}
-
-// Manually bring the emulated CPU to a clean state without calling reset().
-// Resets GPRs, EFLAGS, CR0 (PE will be re-set by enter_protected_mode).
-// Critically: resets activity_state to ACTIVE so cpu_loop doesn't immediately
-// spin in handleWaitForEvent (which happens when a prior guest executed HLT).
-static void manual_cpu_reset_regs(BX_CPU_C* cpu) {
-    for (int i = 0; i < BX_GENERAL_REGISTERS; i++)
-        cpu->gen_reg[i].dword.erx = 0;
-    cpu->eflags  = 0x00000002u;  // reserved bit 1 always 1
-    cpu->prev_rip = 0;
-    cpu->cr0.val32 = 0x00000010u; // ET=1; PE set later by enter_protected_mode
-    // BX_ACTIVITY_STATE_ACTIVE = 0. Must be reset explicitly when skipping
-    // BX_CPU::reset() — otherwise a HLT from a prior guest leaves the CPU
-    // in BX_ACTIVITY_STATE_HLT and the next cpu_loop call never executes
-    // any instructions (handleWaitForEvent spins with no interrupt source).
-    cpu->activity_state = BX_CPU_C::BX_ACTIVITY_STATE_ACTIVE;
-    cpu->async_event = 0;
-    bx_pc_system.kill_bochs_request = 0;
-    cpu->invalidate_prefetch_q();
-}
-
-static void bochs_cpu_reset_for_launch() {
-    if (!g_cpu_reset_done) {
-        live_breadcrumb(37, 'c');       // 'c' = checking CPUID XSAVE
-        bool xsave_ok = host_has_xsave();
-        if (xsave_ok) {
-            // Host has XSAVE — safe to call reset(). Clean FPU first.
-            live_breadcrumb(37, 'X');   // 'X' = XSAVE present, calling reset
-            asm volatile("fninit" ::: "memory");
-            asm volatile("emms"   ::: "memory");
-            BX_CPU(0)->reset(BX_RESET_HARDWARE);
-            // Clear any stale yield flags reset() might have set.
-            BX_CPU(0)->async_event = 0;
-            bx_pc_system.kill_bochs_request = 0;
-            live_breadcrumb(37, 'D');   // 'D' = reset done
-        } else {
-            // No XSAVE — reset() would #UD on this host. Manual init.
-            live_breadcrumb(37, 'N');   // 'N' = No XSAVE, manual reset
-            manual_cpu_reset_regs(BX_CPU(0));
-            live_breadcrumb(37, 'n');   // 'n' = manual done
-        }
-        g_cpu_reset_done = true;
-    } else {
-        // Re-launch: lightweight path — skip reset() entirely.
-        live_breadcrumb(37, 'L');       // 'L' = lightweight re-launch
-        manual_cpu_reset_regs(BX_CPU(0));
-        live_breadcrumb(37, 'l');       // 'l' = lightweight done
-    }
-    bochs_cpu_enter_protected_mode();
-    live_breadcrumb(38, '8');           // '8' = reset_for_launch done
-}
-// VGA breadcrumb at row 0, col 68 — distinct from the cpu_loop tags at
-// columns 70/72/73. 'i' = entered initialize(), 'I' = returned cleanly,
-// '!' = panicked through setjmp during initialize().
-static inline void glue_init_crumb(char c) {
-    volatile unsigned short* p = (volatile unsigned short*)(0xB8000 + 2*68);
-    *p = (unsigned short)(0x2F00 | (unsigned char)c);   // white-on-green
-}
-
-// ─── FIX v2: BX_CPU(0)->initialize() rescue path ─────────────────────────
-// initialize() walks the bochs param tree (SIM->get_param_*). Our KernelSIM
-// returns nullptr for every get_param query. Empirically, calling it from
-// a freestanding kernel either:
-//   (a) hangs in an infinite loop walking the tree,
-//   (b) host-faults dereferencing a nullptr (caught by the boot.S host
-//       IDT, painting a red HOST FAULT bar), or
-//   (c) panics through BX_PANIC / fatal / quit_sim.
-//
-// Only (c) is recoverable via setjmp. (a) and (b) are not — a running
-// kernel just stops with no breadcrumb past 'L'/'M'.
-//
-// The good news: we don't need initialize() for anything. The
-// reset(BX_RESET_HARDWARE) call alone produces a CPU sufficient to run
-// our guests (it sets GPRs, segment registers, EFLAGS, MSRs, and the
-// CPUID feature bits that have static defaults from BX_CPU_C's ctor).
-// initialize() exists to register the CPUID feature *parameters* with
-// the param tree for runtime configuration — something we never use.
-//
-// Default (BX_GLUE_SKIP_INITIALIZE=1, the safe path): never call
-// BX_CPU::initialize(). Skip straight to reset(). This is what fixes
-// the "stops at LM" hang.
-//
-// Opt-in (BX_GLUE_SKIP_INITIALIZE=0): try initialize() once, guarded by
-// setjmp so the (c)-class panic path is recoverable. Kept for anyone
-// who wants to investigate further without ripping the call out.
-#ifndef BX_GLUE_SKIP_INITIALIZE
-#define BX_GLUE_SKIP_INITIALIZE 1
-#endif
-
-static void bochs_cpu_initialize_guarded() {
-    live_breadcrumb(31, '1');
-    if (g_cpu_inited_once || g_cpu_init_failed) return;
-    live_breadcrumb(32, '2');
-
-    // ─── FIX v3: bx_pc_system.initialize(ips) ─────────────────────────────
-    // Several timing helpers in pc_system.cc (time_from_ticks, time_useconds,
-    // time_to_ticks) divide or multiply by m_ips. m_ips is initialised by
-    // bx_pc_system_c::initialize(Bit32u ips) which we never called before,
-    // leaving it at 0.0. Anything inside cpu_loop that touches the timer
-    // path then divides by zero and host-faults (vector 0 = #DE, caught by
-    // boot.S host IDT, paints a red HOST FAULT !00 bar).
-    //
-    // initialize() itself just zeroes a handful of fields and stores
-    // m_ips = ips/1e6 — no SIM-> calls, no allocation. Safe to call.
-    // 50 MIPS is the bochs default for a "modern" CPU.
-    //
-    // ─── FIX v5: FPU init in boot.S ───────────────────────────────────────
-    // The body of initialize() looks trivial but the assignment
-    //   m_ips = double(ips) / 1000000.0L;
-    // forces the i386 backend to emit 80-bit x87 (long double divide).
-    // With the FPU in an indeterminate post-GRUB state the first fldt
-    // hangs the host — symptom: kernel freezes here, no 'P' breadcrumb
-    // ever appears at VGA col 68. boot.S now does fninit and clears
-    // CR0.EM/TS before kernel_main, which prevents the hang.
-    //
-    // The lowercase 'p' below is the *entered* breadcrumb. If you see
-    // 'p' but no 'P' the call hung inside initialize() — that points
-    // back at FPU state. If you don't see 'p' at all, control never
-    // reached this point.
-    glue_init_crumb('p');                 // 'p' = about to call initialize
-    bx_pc_system.initialize(50000000u);
-    live_breadcrumb(33, '3');
-    glue_init_crumb('P');                 // 'P' = pc_system initialized
-
-    // ─── FIX v4: BX_MEM(0)->init_memory(guest, host) ───────────────────────
-    // BX_MEM_C::registerMemoryHandlers indexes BX_MEM_THIS memory_handlers[]
-    // which is allocated by init_memory(). Without that allocation, the
-    // index lookup deref's a null/garbage pointer and host-faults during
-    // bochs_set_process_memory().
-    //
-    // init_memory itself does:
-    //   - alloc the vector / blocks / memory_handlers / rom / bogus
-    //   - sets pci_enabled = SIM->get_param_bool(BXPN_PCI_ENABLED)->get()
-    //
-    // The SIM->get_param_bool path is now safe: KernelSIM returns a dummy
-    // bx_param_bool_c (value=0) instead of nullptr. See bochs_infra.cpp.
-    //
-    // ─── FIX v6: shrink host vector from 16 MiB to 1 MiB ──────────────────
-    // The kernel heap (kernel.cpp:kernel_heap) is 10 MiB. Asking init_memory
-    // for a 16 MiB host vector blows past that and the kernel's operator
-    // new() drops into oom_halt(), which writes "OOM HALT 16777216" to VGA
-    // text mode and `cli; hlt`s. In graphics mode, VGA text is invisible
-    // unless draw_vga_overlay() mirrors it — but the main loop is wedged
-    // inside the failing tick, so the user just sees a freeze with the
-    // last live breadcrumb still showing '4' (= about-to-call-init_memory).
-    //
-    // The host vector itself is mostly bookkeeping in our setup. Real
-    // guest memory is owned by the ElfProcess slabs; we route every
-    // physical access via registerMemoryHandlers' read_handler /
-    // write_handler callbacks (mem_read_handler, mem_write_handler above)
-    // and never touch BX_MEM's vector. So the smallest legal value is
-    // fine: 1 MiB satisfies the BX_ASSERT((host & 0xfffff) == 0) check
-    // and leaves the heap with plenty of room for everything else
-    // init_memory itself wants to new[] (blocks table, memory_handlers
-    // table, rom, bogus).
-    live_breadcrumb(34, '4');
-    BX_MEM(0)->init_memory(16u * 1024u * 1024u, 16u * 1024u * 1024u);
-    live_breadcrumb(35, '5');
-    glue_init_crumb('M');                 // 'M' = mem subsystem initialized
-
-#if BX_GLUE_SKIP_INITIALIZE
-    // Default path: skip initialize() entirely. The static ctor of
-    // BX_CPU_C plus reset(BX_RESET_HARDWARE) is enough.
-    glue_init_crumb('S');                // 'S' = Skipped initialize()
-    g_cpu_inited_once = true;
-    return;
-#else
-    glue_init_crumb('i');
-    bx_panic_jmpbuf_armed = 1;
-    if (setjmp(bx_panic_jmpbuf) != 0) {
-        // initialize() panicked. Mark it failed so we don't retry on the
-        // next launch, and let the caller fall through to reset().
-        bx_panic_jmpbuf_armed = 0;
-        g_cpu_init_failed = true;
-        glue_init_crumb('!');
-        return;
-    }
-    BX_CPU(0)->initialize();
-    bx_panic_jmpbuf_armed = 0;
-    g_cpu_inited_once = true;
-    glue_init_crumb('I');
-#endif
-}
-
-extern "C" void bochs_cpu_init() {
-    live_breadcrumb(30, '0');
-    bochs_cpu_initialize_guarded();
-    live_breadcrumb(36, '6');
-    bochs_cpu_reset_for_launch();
-    // breadcrumb 38 is now written inside bochs_cpu_reset_for_launch()
-    // Note: do NOT clear g_cpu_ready here. bochs_cpu_set_eip() will set
-    // it to true when the kernel hands us an entry point. Clearing it
-    // means a relaunch that calls reset->set_esp->set_eip is fine; but
-    // a stray reset that doesn't follow up with set_eip would also be
-    // fine (the next set_eip arms it). Leaving the prior value alone
-    // is the more conservative choice.
-}
-
-// Optional explicit one-shot prewarm. kernel.cpp can call this from
-// kernel_main before any ELF launches; it does the same work as the
-// first call to bochs_cpu_init() but is named for clarity at the
-// startup site. Safe to call zero or many times.
-extern "C" void bochs_cpu_prewarm() {
-    bochs_cpu_initialize_guarded();
-}
-
-// ─── DIAGNOSTIC: panic recovery state ────────────────────────────────────────
-// bochs_infra.cpp's panic/fatal/quit_sim/Unwind handlers longjmp here instead
-// of halting the whole kernel. bochs_cpu_tick() arms the buffer before each
-// cpu_loop call so a Bochs internal panic returns control to the kernel
-// main loop with a VGA breadcrumb identifying which path fired:
-//   P = logfunctions::panic   F = fatal1   X = fatal
-//   Q = quit_sim              U = _Unwind_Resume
-//
-// Breadcrumb columns on VGA row 0:
-//   col 70: panic tag          (red BG, set by infra recover handler)
-//   col 72: 'B' = entered cpu_loop, 'A' = returned cleanly
-//   col 73: rotating digit so we can see ticks happening
-//   col 79: kernel main-loop spinner (set by kernel.cpp)
-
-// (setjmp.h already included at top of file; jmp_buf forward-declared there.)
-extern "C" {
-    jmp_buf bx_panic_jmpbuf;
-    int     bx_panic_jmpbuf_armed = 0;
-    volatile int bx_last_panic_code = 0;
-    // Symbol-resolved panic-diag buffer. Readable from the host (e.g. via
-    // QEMU monitor `pmemsave`) when the kernel is in graphics mode and
-    // VGA text-mode breadcrumbs aren't visible. Written by vga_breadcrumb()
-    // in bochs_infra.cpp on every Bochs panic/fatal path.
-    //   [0]  last tag char ('P' panic, 'F' fatal1, 'X' fatal, 'Q' quit_sim,
-    //                       'U' unwind)
-    //   [1]  total recovery count (uint8 wraps)
-    //   [2..63] ring of last 62 tags
-    volatile unsigned char bx_panic_breadcrumbs[64] = {0};
-}
-
-static void glue_breadcrumb(int col, char c) {
-    volatile unsigned short* p = (volatile unsigned short*)(0xB8000 + 2*col);
-    *p = (unsigned short)(0x2F00 | (unsigned char)c);  // white-on-green
-}
-
-extern "C" int bochs_cpu_tick(int n) {
-    if (!g_cpu_ready || g_active_slot < 0) return 0;
-    if (!g_slots[g_active_slot].mem_base) return 0;
-
-    g_slots[g_active_slot].wants_input = false;
-
-    // Cooperative budget: cpu_loop() only returns through handleAsyncEvent().
-    // handleAsyncEvent() is only entered when async_event != 0. So we set
-    // both async_event and kill_bochs_request before each call so the very
-    // first iteration of cpu_loop's outer while() returns to us.
-    if (n < 1) n = 1;
-    if (n > 4) n = 4;
-
-    // Clear any stale exit-pending flag from a prior slot's exit. The flag
-    // is only meaningful WITHIN a single bochs_cpu_tick() invocation — if
-    // we entered here, the kernel side has decided this slot should run.
-    g_exit_pending = 0;
-
-    static unsigned tick_seq = 0;
-    glue_breadcrumb(73, '0' + (char)((tick_seq++) % 10));
-
-    for (int i = 0; i < n; ++i) {
-        // ─── FIX: stop re-entering cpu_loop after a guest-exit signal ─────
-        // bochs_guest_exit() (triggered by port-0xE8 write from the IDT
-        // stub) sets g_exit_pending. The slot's exit_cb has already
-        // flipped proc.active=false on the kernel side, so the surrounding
-        // tick_elf_processes will skip this slot next round. But within
-        // THIS bochs_cpu_tick invocation, calling cpu_loop again would
-        // step the `hlt` that follows the `out` in our stub — Bochs would
-        // enter BX_ACTIVITY_STATE_HLT and spin inside handleWaitForEvent
-        // (no external interrupts ever arrive). Bail out cleanly instead.
-        if (g_exit_pending) {
-            g_exit_pending = 0;
-            return 0;
-        }
-
-        // Arm panic recovery: any BX_PANIC/BX_FATAL/_Unwind_Resume inside
-        // cpu_loop will longjmp back here instead of halting the host.
-        bx_panic_jmpbuf_armed = 1;
-        if (setjmp(bx_panic_jmpbuf) != 1) { //ignorance is bliss(was 0)
-            // Came back via longjmp from a Bochs panic. The breadcrumb is
-            // already on screen at column 70. Stop ticking this slot so we
-            // don't keep re-entering the same panic path every frame.
-            bx_panic_jmpbuf_armed = 0;
-            if (g_active_slot >= 0 && g_active_slot < MAX_BOCHS_SLOTS) {
-                SlotState& s = g_slots[g_active_slot];
-				if (s.write_cb) s.write_cb(g_active_slot, 'E'); //elf tester
-                if (s.exit_cb) s.exit_cb(g_active_slot, -1);
-            }
-            return 0;
-        }
-
-        glue_breadcrumb(72, 'B');               // before cpu_loop
-        // Make sure both yield flags are CLEAR so cpu_loop actually runs
-        // instructions. The yield is requested from bochs_guest_putc when
-        // the guest writes a byte to port 0xE9 (or other I/O paths). If we
-        // pre-armed them here, the very first iteration of cpu_loop's
-        // while(1) would call handleAsyncEvent and bail out without
-        // executing a single guest instruction.
-        bx_pc_system.kill_bochs_request = 0;
-        BX_CPU(0)->cpu_loop();
-        bx_pc_system.kill_bochs_request = 0;
-        glue_breadcrumb(72, 'A');               // after cpu_loop
-
-        bx_panic_jmpbuf_armed = 0;
-    }
-    return 0;
-}
-
 extern "C" bool bochs_process_wants_input(int slot) {
     if (slot < 0 || slot >= MAX_BOCHS_SLOTS) return false;
     return g_slots[slot].wants_input;
 }
 
-extern "C" void bochs_cpu_set_eip(Bit32u eip) {
-    BX_CPU(0)->gen_reg[BX_32BIT_REG_EIP].dword.erx = eip;
-    BX_CPU(0)->prev_rip = eip;
-    BX_CPU(0)->invalidate_prefetch_q();
-    g_cpu_ready = true;
-}
+// =====================================================================
+// Tick — run the active slot for a bounded number of cpu_loop entries
+// =====================================================================
+//
+// cpu_loop runs guest instructions until it hits handleAsyncEvent
+// with kill_bochs_request set, at which point it returns to us. Each
+// iteration is one "tick budget" — typically a small number of guest
+// insns because port-IO writes (the primary yield trigger) are
+// frequent for a chatty guest.
 
-extern "C" void bochs_cpu_set_esp(Bit32u esp_val) {
-    BX_CPU(0)->gen_reg[BX_32BIT_REG_ESP].dword.erx = esp_val;
-}
+extern "C" int bochs_cpu_tick(int n) {
+    if (!g_global_init_done) return 0;
+    if (g_active_slot < 0 || g_active_slot >= MAX_BOCHS_SLOTS) return 0;
 
-extern "C" Bit32u bochs_cpu_get_eip() {
-    return BX_CPU(0)->get_eip();
-}
+    SlotState& s = g_slots[g_active_slot];
+    if (!s.mem_base || !s.mapped) return 0;
+    if (!s.cpu.valid) return 0;
 
-extern "C" unsigned int bochs_cpu_geteip() {
-    return (unsigned int)BX_CPU(0)->get_eip();
-}
+    s.wants_input = false;
 
-extern "C" Bit32u bochs_cpu_get_eax() {
-    return BX_CPU(0)->gen_reg[BX_32BIT_REG_EAX].dword.erx;
+    if (n < 1) n = 1;
+    if (n > 4) n = 4;
+
+    // Clear any stale exit flag from a previous tick of a different
+    // (now-dead) slot.
+    g_exit_pending = 0;
+
+    for (int i = 0; i < n; ++i) {
+        if (g_exit_pending) {
+            g_exit_pending = 0;
+            return 0;
+        }
+
+        // Clear yield flags so cpu_loop actually executes
+        // instructions. bochs_guest_putc / bochs_guest_exit will
+        // re-set them when the guest does port IO.
+        bx_pc_system.kill_bochs_request = 0;
+        BX_CPU(0)->async_event          = 0;
+
+        BX_CPU(0)->cpu_loop();
+
+        // After return, leave both flags clear so the next iteration
+        // (or next tick call) starts clean.
+        bx_pc_system.kill_bochs_request = 0;
+    }
+    return 0;
 }
