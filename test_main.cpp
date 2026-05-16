@@ -173,11 +173,56 @@ static volatile int g_guest_exit_seen    = 0;
 static volatile int g_guest_exit_code    = 0;
 static char g_guest_output[64];
 
+// ─── VGA row 2: live guest-output line ─────────────────────────────────
+// Guest port-0xE9 bytes are echoed here as they arrive, behind a
+// "GUEST: " label, so the guest's output is visible on the actual
+// screen — not only on the port-0xE9 debug console. Row 2 is the
+// third text row (cells 160..239); rows 0/1 are the breadcrumb /
+// fault-tag overlay.
+#define VGA_GUEST_ROW    2
+#define VGA_GUEST_LABEL  "GUEST: "
+static const int VGA_GUEST_LABEL_LEN = 7;            // strlen("GUEST: ")
+static int g_vga_guest_col = VGA_GUEST_LABEL_LEN;     // next free cell in row
+
+// Paint the static "GUEST: " label and blank the rest of row 2.
+static void vga_guest_init_row() {
+    const int base = VGA_GUEST_ROW * 80;
+    const char* p = VGA_GUEST_LABEL;
+    int i = 0;
+    for (; p[i]; ++i)                                 // label: grey on black
+        VGA[base + i] = (uint16_t)(0x07u << 8 | (uint8_t)p[i]);
+    for (; i < 80; ++i)                               // clear remainder
+        VGA[base + i] = 0x0F00u | ' ';
+    g_vga_guest_col = VGA_GUEST_LABEL_LEN;
+}
+
+// Echo one guest output character to VGA row 2.
+//   - printable chars are written at the cursor (bright green on black)
+//   - '\n' returns the cursor to just after the label (so a multi-line
+//     guest overwrites in place rather than scrolling off the row)
+//   - other control chars are shown as a '.'
+//   - if the row fills up, further chars are dropped (no scroll)
+static void vga_guest_putc(char c) {
+    const int base = VGA_GUEST_ROW * 80;
+    if (c == '\n') {
+        g_vga_guest_col = VGA_GUEST_LABEL_LEN;
+        return;
+    }
+    if (g_vga_guest_col >= 80) return;                // row full — drop
+    char show = (c >= 32 && c < 127) ? c : '.';
+    VGA[base + g_vga_guest_col] =
+        (uint16_t)(0x0A00u | (uint8_t)show);          // bright green
+    g_vga_guest_col++;
+}
+
 static int  test_io_read(int /*slot*/) { return 0; }
 static void test_io_write(int slot, char c) {
     if (g_guest_output_count < (int)sizeof(g_guest_output) - 1) {
         g_guest_output[g_guest_output_count++] = c;
     }
+
+    // Mirror the guest byte to VGA row 2 so it shows on screen.
+    vga_guest_putc(c);
     e9_puts("  [guest port-0xE9 slot=");
     e9_putc((char)('0' + slot));
     e9_puts(" wrote ");
@@ -244,6 +289,9 @@ extern "C" void kernel_main(uint32_t /*magic*/, uint32_t /*mbi*/) {
     // Clear VGA rows 0/1 so stale data from a prior boot doesn't fool us.
     for (int i = 0; i < 80; ++i) VGA[i]      = 0x0F00u | ' ';
     for (int i = 0; i < 80; ++i) VGA[80 + i] = 0x0F00u | ' ';
+
+    // Paint row 2's "GUEST: " label; guest output is echoed there live.
+    vga_guest_init_row();
 
     e9_puts("\n=== test_main: BX_CPU(0)->initialize() + cpu_tick verification ===\n");
 
