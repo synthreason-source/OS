@@ -261,40 +261,22 @@ static void test_io_exit(int slot, int code) {
 //     F4           hlt                    ; safety: never reached
 //     EB FE        jmp  .                 ; safety: spin if it is
 static const uint8_t guest_program[] = {
-    // Compute 2 + 3 -> result in AL
-    0xB0, 0x02,        // mov al, 2
-    0xB4, 0x03,        // mov ah, 3
-    0x00, 0xE0,        // add al, ah   ; AL = 2 + 3 = 5
-
-    // Convert AL (0–9) to ASCII digit
-    0x04, 0x30,        // add al, '0'  ; AL = '5'
-
-    // Print "2+3="
     0xB0, 0x32,        // mov al, '2'
+    0x2C, 0x30,        // sub al, '0'   ; AL = 2
+
+    0xB4, 0x03,        // mov ah, 3
+    0x00, 0xE0,        // add al, ah    ; AL = 5
+
+    0x04, 0x30,        // add al, '0'   ; AL = '5'
     0xE6, 0xE9,        // out 0xE9, al
 
-    0xB0, 0x2B,        // mov al, '+'
-    0xE6, 0xE9,        // out 0xE9, al
-
-    0xB0, 0x33,        // mov al, '3'
-    0xE6, 0xE9,        // out 0xE9, al
-
-    0xB0, 0x3D,        // mov al, '='
-    0xE6, 0xE9,        // out 0xE9, al
-
-    // Print result digit (already in AL as '5')
-    0xE6, 0xE9,        // out 0xE9, al
-
-    // Newline
     0xB0, 0x0A,        // mov al, '\n'
     0xE6, 0xE9,        // out 0xE9, al
 
-    // Exit via port 0xE8 with AL = 0
     0xB0, 0x00,        // mov al, 0
     0xE6, 0xE8,        // out 0xE8, al
-
-    0xF4,              // hlt
-    0xEB, 0xFE         // jmp .
+    0xF4,
+    0xEB, 0xFE
 };
 // Slot backing slab. 1 MiB, page-aligned, kept in BSS so we don't
 // allocate from the bump pool (which is now committed to Bochs).
