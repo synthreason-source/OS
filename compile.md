@@ -7,7 +7,8 @@ sudo apt install make gcc-multilib gcc-13-multilib gcc gcc-13 binutils grub-comm
 
 # 1 Bochs test
 sudo make test_main
-qemu-system-i386 -cdrom test_main.iso -m 256     -debugcon stdio -no-reboot -no-shutdown
+
+qemu-system-i386 -cdrom test_main.iso -m 256 -debugcon stdio -no-reboot -no-shutdown
 
 
 # 1 Kernel Build
