@@ -3,11 +3,17 @@ sudo apt update
 sudo apt install make gcc-multilib gcc-13-multilib gcc gcc-13 binutils grub-common xorriso qemu-system-x86 build-essential nasm gcc binutils qemu-system-x86 xorriso grub-pc-bin mtools g++-multilib libncurses-dev bison flex git bc libssl-dev xorg-dev libx11-dev
 
 
-# 1 Kernel Build
 
+
+# 1 Bochs test
+sudo make test_main
+qemu-system-i386 -cdrom test_main.iso -m 256     -debugcon stdio -no-reboot -no-shutdown
+
+
+# 1 Kernel Build
 sudo make clean
 
-make clean && make BOCHS=1 // must be 1 for bochs to work...
+make clean && make BOCHS=1
 
 	qemu-system-i386 \
 	    -M q35 \
