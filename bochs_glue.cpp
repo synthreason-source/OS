@@ -780,19 +780,7 @@ extern "C" Bit32u bochs_cpu_get_eax() {
 // Guest I/O sentinels (port 0xE9 = putc, port 0xE8 = exit)
 // =====================================================================
 
-// Forward decl — defined in bochs_bios.cpp.
-extern "C" bool bochs_bios_is_active();
-extern "C" void bochs_bios_putc(char c);
-
 extern "C" void bochs_guest_putc(char c) {
-    // In BIOS mode no slot is active; redirect to the BIOS debug ticker.
-    if (bochs_bios_is_active()) {
-        bochs_bios_putc(c);
-        // Yield cpu_loop so the kernel can process the output.
-        bx_pc_system.kill_bochs_request = 1;
-        BX_CPU(0)->async_event = 1;
-        return;
-    }
     if (g_active_slot < 0 || g_active_slot >= MAX_BOCHS_SLOTS) return;
     SlotState& s = g_slots[g_active_slot];
     if (s.write_cb) s.write_cb(g_active_slot, c);

@@ -60,14 +60,28 @@ iso: $(MULTIBOOT)
 clean:
 	rm -rf *.o main.iso iso hello hello_blob.o
 
-# distclean also removes the disk image and downloaded sources
+# distclean removes build artifacts and the disk image, but KEEPS the
+# prebuilt bochs-2.7/ tree (see note in recipe).
 distclean: clean
-	rm -rf $(BOCHS_DIR) $(BOCHS_ARCHIVE) $(BUSYBOX_BIN) ramdisk.o $(DISK_IMG)
+	# NOTE: the prebuilt bochs-2.7/ tree is intentionally NOT removed,
+	#       so the offline bundle stays buildable. Remove it by hand to
+	#       force a fresh download + configure on the next build.
+	rm -rf $(BOCHS_ARCHIVE) ramdisk.o $(DISK_IMG)
 
-.PHONY: all clean distclean iso
+.PHONY: all clean distclean iso test_main run-test
 
 # ============================================================
-#  Bochs: download -> extract -> configure -> build cpu libs
+#  Bochs CPU/FPU/cpudb/memory static libraries
+# ------------------------------------------------------------
+#  OFFLINE BUNDLE: this tree ships with bochs-2.7/ already
+#  configured and with the four static libs prebuilt
+#  (cpu/libcpu.a, cpu/fpu/libfpu.a, cpu/cpudb/libcpudb.a,
+#  memory/libmemory.a). When those libs are present "make"
+#  uses them directly and performs NO download / configure.
+#
+#  If the prebuilt libs are absent, the rule falls back to the
+#  original behaviour: download the tarball, extract, configure
+#  --with-nogui, and build the four libs.
 # ============================================================
 $(BOCHS_ARCHIVE):
 	wget -O $@ "$(BOCHS_URL)" || curl -L -o $@ "$(BOCHS_URL)"
@@ -76,23 +90,28 @@ $(BOCHS_DIR)/.extracted: $(BOCHS_ARCHIVE)
 	tar -xzf $(BOCHS_ARCHIVE)
 	touch $@
 
-# We only need the CPU / FPU / cpudb / memory static libs.
-$(BOCHS_CPU_LIB): $(BOCHS_DIR)/.extracted
-	cd $(BOCHS_DIR) && ./configure          \
-	    --enable-cpu-level=6                \
-	    --enable-fpu                         \
-	    --with-nogui                         \
-	    --host=i686-linux-gnu               \
-		--enable-x86-64						\
-	    CXXFLAGS="-O2 -m32 -fno-stack-protector -fno-pie" \
-	    CFLAGS="-O2 -m32 -fno-stack-protector -fno-pie"
-	$(MAKE) -C $(BOCHS_DIR)/cpu
-	$(MAKE) -C $(BOCHS_DIR)/cpu/fpu
-	$(MAKE) -C $(BOCHS_DIR)/cpu/cpudb
-	$(MAKE) -C $(BOCHS_DIR)/memory
+# libcpu.a is prebuilt in the offline bundle. The download+configure
+# +build recipe only runs if the file is genuinely missing.
+$(BOCHS_CPU_LIB):
+	@if [ -f "$(BOCHS_CPU_LIB)" ]; then \
+	    echo ">>> Using prebuilt Bochs libs in $(BOCHS_DIR) (offline bundle)."; \
+	else \
+	    echo ">>> Prebuilt Bochs libs not found - downloading and building..."; \
+	    $(MAKE) $(BOCHS_DIR)/.extracted; \
+	    cd $(BOCHS_DIR) && ./configure \
+	        --enable-cpu-level=6 --enable-fpu --with-nogui \
+	        --host=i686-linux-gnu --enable-x86-64 \
+	        CXXFLAGS="-O2 -m32 -fno-stack-protector -fno-pie" \
+	        CFLAGS="-O2 -m32 -fno-stack-protector -fno-pie" && cd ..; \
+	    $(MAKE) -C $(BOCHS_DIR)/cpu; \
+	    $(MAKE) -C $(BOCHS_DIR)/cpu/fpu; \
+	    $(MAKE) -C $(BOCHS_DIR)/cpu/cpudb; \
+	    $(MAKE) -C $(BOCHS_DIR)/memory; \
+	fi
 
-# Bochs instrument stub header (required by bochs_glue.cpp)
-$(BOCHS_DIR)/instrument.h: $(BOCHS_CPU_LIB)
+# Bochs instrument stub header (required by bochs_glue.cpp).
+# Prebuilt bundle already contains it; re-copying is harmless.
+$(BOCHS_DIR)/instrument.h:
 	cp instrument_stub.h $@
 
 # ============================================================
@@ -241,3 +260,52 @@ $(MAIN): $(MULTIBOOT)
 	    > iso/boot/grub/grub.cfg
 	grub-mkrescue -o $(MAIN) iso
 	@echo ">>> ISO ready: $(MAIN)"
+
+# ============================================================
+#  test_main — standalone Bochs init + cpu_tick verification
+# ------------------------------------------------------------
+#  Builds test_main.cpp (which provides its own kernel_main and a
+#  two-phase self-test) instead of the full kernel.cpp. Produces a
+#  bootable test_main.iso. This is the smallest end-to-end check
+#  that the Bochs glue works: Phase 1 runs BX_CPU(0)->initialize()
+#  + reset(); Phase 2 loads a tiny guest and ticks it, expecting
+#  "HI\n" on the guest port-0xE9 console.
+#
+#  Run it headless and watch the port-0xE9 trace:
+#    make test_main
+#    qemu-system-i386 -M q35 -cdrom test_main.iso -boot d \
+#        -m 512M -display none -debugcon stdio -no-reboot
+#  A passing run prints:  === TEST PASSED (init + tick) ===
+#
+#  `make run-test` does both steps in one go.
+# ============================================================
+TEST_ISO   := test_main.iso
+TEST_ELF   := iso/boot/main.elf
+
+test_main.o: test_main.cpp $(BOCHS_DEP)
+	g++ -m32 -O2 $(BOCHS_IFLAGS) $(CXXFLAGS) $(BOCHS_CDEF) -c test_main.cpp -o test_main.o
+
+# test_main links WITHOUT ramdisk.o / hello_blob.o — the harness
+# references none of the busybox/hello blob symbols.
+test_main: boot.o test_main.o $(BOCHS_OBJ) $(BOCHS_DEP)
+	mkdir -p iso/boot/grub
+	g++ -m32 -T linker.ld -nostdlib -no-pie -static \
+	    -o $(TEST_ELF) \
+	    boot.o test_main.o $(BOCHS_OBJ) \
+	    $(BOCHS_LIBS) \
+	    -lgcc $(LIBGCC_EH) \
+	    -Wl,--allow-multiple-definition
+	printf '%s\n' \
+	    'set timeout=0' \
+	    'set default=0' \
+	    'menuentry "RTOS++ test_main" {' \
+	    '    multiboot /boot/main.elf' \
+	    '    boot' \
+	    '}' \
+	    > iso/boot/grub/grub.cfg
+	grub-mkrescue -o $(TEST_ISO) iso
+	@echo ">>> $(TEST_ISO) ready. Boot it with -debugcon stdio to see the trace."
+
+run-test: test_main
+	qemu-system-i386 -M q35 -cdrom $(TEST_ISO) -boot d \
+	    -m 512M -display none -debugcon stdio -no-reboot
