@@ -1,3 +1,0 @@
-Storage only OS with matrix multiplier, numpy style array functionality, R/W/RX/TX patterns, with ASCII translator/display/keyboard, custom dot cursor patterns within programmed windows...
-
-
