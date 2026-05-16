@@ -338,6 +338,54 @@ extern "C" void bochs_register_io_callbacks(
     void (*exit_cb )(int, int));
 extern "C" bool bochs_process_wants_input(int slot);
 
+// --- STEP 5b: Activatable Bochs self-test module ----------------------------
+// test_module.cpp holds the test execution code (formerly the standalone
+// test_main.cpp). It is activated by typing `test` in a terminal. The module
+// renders a three-row "VGA-style" overlay (breadcrumbs / fault tag / GUEST
+// row) by calling back through a TestSink — it has no knowledge of windows.
+//
+// The kernel side, below, owns:
+//   - g_test_vga[]   : a 3x80 cell buffer the module writes via vga_cell()
+//   - test_sink_*    : the C callbacks the module invokes
+//   - g_test_overlay_owner : which TerminalWindow currently shows the overlay
+// The TerminalWindow::draw() method paints g_test_vga[] as three colored
+// rows at the top of its content area whenever it owns the overlay.
+#include "test_module.h"
+
+struct TestVgaCell { char ch; uint8_t attr; };
+static TestVgaCell g_test_vga[3][80];
+static bool        g_test_overlay_active = false;
+// Forward decl: set to the TerminalWindow that ran `test`. Declared void*
+// here because TerminalWindow is defined much further down; the command
+// handler casts it back.
+static void*       g_test_overlay_owner  = nullptr;
+
+// Clear the overlay buffer to blank grey-on-black cells.
+static void test_vga_clear() {
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 80; ++c) {
+            g_test_vga[r][c].ch   = ' ';
+            g_test_vga[r][c].attr = 0x0F;
+        }
+}
+
+// --- TestSink callbacks (C linkage so the module can take their address) ---
+// vga_cell: the module's faithful reproduction of writing VGA text memory.
+extern "C" void test_sink_vga_cell(int row, int col, char ch, uint8_t attr) {
+    if (row < 0 || row >= 3 || col < 0 || col >= 80) return;
+    g_test_vga[row][col].ch   = ch;
+    g_test_vga[row][col].attr = attr;
+    g_test_overlay_active     = true;
+}
+// put_line: forwarded to the owning terminal's console_print (defined after
+// TerminalWindow, since it needs the full class — see test_sink_put_line()).
+extern "C" void test_sink_put_line(const char* s);
+// flush: repaints the whole screen and swaps buffers mid-test. Defined
+// after WindowManager / swap_buffers are available (see test_sink_flush()).
+// Without this the GUI would freeze for the whole blocking test run and
+// the overlay would never become visible.
+extern "C" void test_sink_flush(void);
+
 // --- STEP 6: NOW TerminalWindow and everything else follows ---
 // Moved here to be visible to all classes and functions
 static bool    g_fs_encryption_enabled = false;
@@ -1009,6 +1057,10 @@ static inline unsigned read_caller_eip(void) {
 }
 
 extern "C" void host_fault_handler(unsigned vector) {
+    // If a `test` self-test is running, mirror the fault into its
+    // window overlay (row 1, "!XX") before the kernel's own rendering.
+    if (test_module_active()) test_module_fault((int)vector);
+
     if (!fb_info.ptr) return;
     unsigned caller_eip = read_caller_eip();
 
@@ -1107,6 +1159,10 @@ extern "C" void host_fault_handler(unsigned vector) {
 // Layout convention: slots 0..15 are reserved for bochs_glue diagnostics;
 // rendered at fb x=col*8, y=0 with a black background tile.
 extern "C" void live_breadcrumb(int slot, char ch) {
+    // If a `test` self-test is running, mirror each breadcrumb into its
+    // window overlay (row 0, white-on-blue) as well as the framebuffer.
+    if (test_module_active()) test_module_breadcrumb(slot, ch);
+
     if (!fb_info.ptr) return;
     if (slot < 0 || slot >= 80) return;
 
@@ -6093,7 +6149,42 @@ void handle_command() {
 		console_print("Commands: help, clear, version, time, ps, ls, edit, run, exec,\n"
 					  "  compile, rm, cp, mv, formatfs, chkdsk (/r /f), select_disk,\n"
 					  "  setpass, removepass, unlock, busybox, pself, killelf,\n"
-					  "  killexec, killrun, aesenc, aesdec\n");
+					  "  killexec, killrun, aesenc, aesdec, test\n");
+	}
+	else if (strcmp(command, "test") == 0) {
+		// Activate the Bochs self-test module. This runs the same two-
+		// phase verification the standalone test_main.cpp performed
+		// (Phase 1: bochs_cpu_init(); Phase 2: load a 23-byte guest and
+		// tick it), but renders test_main.cpp's three-row 0xB8000 VGA
+		// overlay INTO this terminal window via the TestSink.
+		test_vga_clear();
+		g_test_overlay_active = false;
+		g_test_overlay_owner  = (void*)this;   // this window shows it
+
+		// The kernel already ran the file-scope C++ ctors at boot, so
+		// tell the module not to re-run __init_array (that would re-
+		// construct bx_cpu / bx_mem).
+		test_module_mark_ctors_done();
+
+		TestSink sink;
+		sink.put_line = test_sink_put_line;
+		sink.vga_cell = test_sink_vga_cell;
+		sink.flush    = test_sink_flush;
+
+		TestResult res;
+		res.phase1_ok = 0; res.phase2_ticked = 0;
+		res.guest_exit_seen = 0; res.guest_exit_code = 0;
+		res.guest_out_len = 0; res.guest_out[0] = 0;
+
+		test_module_run(&sink, &res);
+
+		// Final one-line verdict in the terminal.
+		if (res.phase1_ok && res.guest_exit_seen)
+			console_print("test: PASSED (cpu init + guest tick OK)\n");
+		else if (res.phase1_ok)
+			console_print("test: PARTIAL (init OK, guest did not exit)\n");
+		else
+			console_print("test: FAILED (cpu init did not return)\n");
 	}
 	else if (strcmp(command, "aesenc") == 0 || strcmp(command, "aesdec") == 0) {
         bool encrypt = strcmp(command, "aesenc") == 0;
@@ -6818,6 +6909,12 @@ public:
     int get_elf_slot() const override { return captured_elf_slot; }
 
     void close() override {
+        // If this window owned the Bochs self-test overlay, relinquish it
+        // so g_test_overlay_owner never dangles after we are deleted.
+        if (g_test_overlay_owner == (void*)this) {
+            g_test_overlay_owner  = nullptr;
+            g_test_overlay_active = false;
+        }
         // Kill the attached ELF process so it disappears from the taskbar
         if (captured_elf_slot >= 0 && captured_elf_slot < MAX_ELF_PROCESSES) {
             ElfProcess& proc = elf_processes[captured_elf_slot];
@@ -6834,6 +6931,52 @@ public:
             for(int i = 0; i < edit_line_count; i++) delete[] edit_lines[i];
             delete[] edit_lines;
         }
+    }
+
+    // Map a VGA attribute byte (bg<<4 | fg) to a framebuffer RGB color.
+    // Only the foreground nibble drives the glyph color; we use a compact
+    // 16-entry CGA-style palette. The background nibble tints the row.
+    static uint32_t test_vga_palette(uint8_t nibble) {
+        static const uint32_t pal[16] = {
+            0x000000, 0x0000AA, 0x00AA00, 0x00AAAA,
+            0xAA0000, 0xAA00AA, 0xAA5500, 0xAAAAAA,
+            0x555555, 0x5555FF, 0x55FF55, 0x55FFFF,
+            0xFF5555, 0xFF55FF, 0xFFFF55, 0xFFFFFF
+        };
+        return pal[nibble & 0x0F];
+    }
+
+    // Draw the three g_test_vga[] rows at the top of the content area.
+    // Returns the vertical pixel offset the terminal text should shift by
+    // so it sits below the overlay.
+    int render_test_overlay() {
+        const int cell_w  = 8;             // font glyph width
+        const int row_h   = 10;            // overlay row height
+        const int top     = y + 28;        // just under the titlebar
+        const int max_col = (w - 10) / cell_w < 80 ? (w - 10) / cell_w : 80;
+
+        for (int r = 0; r < 3; ++r) {
+            int row_y = top + r * row_h;
+            // Tint strip: use the background nibble of the row's first
+            // non-blank cell (cells in a row share a background).
+            uint8_t bg_nib = 0;
+            for (int c = 0; c < max_col; ++c) {
+                if (g_test_vga[r][c].ch != ' ') {
+                    bg_nib = (g_test_vga[r][c].attr >> 4) & 0x0F;
+                    break;
+                }
+            }
+            draw_rect_filled(x + 4, row_y, max_col * cell_w, row_h,
+                             test_vga_palette(bg_nib));
+            for (int c = 0; c < max_col; ++c) {
+                char ch = g_test_vga[r][c].ch;
+                if (ch == ' ' || ch == 0) continue;
+                uint32_t fg = test_vga_palette(g_test_vga[r][c].attr & 0x0F);
+                char s[2] = { ch, 0 };
+                draw_string(s, x + 5 + c * cell_w, row_y + 1, fg);
+            }
+        }
+        return 3 * row_h + 2;              // shift terminal text down
     }
 
     void draw() override {
@@ -6867,9 +7010,22 @@ public:
         for (int i = 0; i < h; i++) put_pixel_back(x, y + i, WINDOW_BORDER);
         for (int i = 0; i < h; i++) put_pixel_back(x + w - 1, y + i, WINDOW_BORDER);
 
+        // ── Bochs self-test VGA overlay ─────────────────────────────────
+        // When this terminal activated the `test` module, paint the three
+        // VGA-style rows (breadcrumbs / fault tag / GUEST line) the module
+        // wrote into g_test_vga[]. This reproduces test_main.cpp's 0xB8000
+        // overlay inside the window. The terminal text is shifted down by
+        // overlay_dy so it doesn't collide with the three rows.
+        int overlay_dy = 0;
+        if (!in_editor && g_test_overlay_active &&
+            g_test_overlay_owner == (void*)this) {
+            overlay_dy = render_test_overlay();
+        }
+
         if (!in_editor) {
     for (int i = 0; i < line_count && i < 38; i++) {
-        draw_string(buffer[i], x + 5, y + 30 + i * 10, ColorPalette::TEXT_WHITE);
+        draw_string(buffer[i], x + 5, y + 30 + overlay_dy + i * 10,
+                    ColorPalette::TEXT_WHITE);
     }
 } else {
     for (int row = 0; row < EDIT_ROWS; ++row) {
@@ -7107,6 +7263,17 @@ public:
         update_prompt_display();
     }
 };
+
+// TestSink::put_line implementation. Defined here because it needs the
+// complete TerminalWindow type to route text into the window that owns
+// the test overlay. Falls back silently if no terminal owns it.
+extern "C" void test_sink_put_line(const char* s) {
+    if (!s) return;
+    if (g_test_overlay_owner) {
+        ((TerminalWindow*)g_test_overlay_owner)->console_print(s);
+    }
+}
+
 void WindowManager::execute_context_menu_action(int item_index) {
     if (item_index < 0 || item_index >= num_context_menu_items) return;
     const char* action = context_menu_items[item_index];
@@ -7434,6 +7601,21 @@ void swap_buffers() {
             );
         }
     }
+}
+
+// TestSink::flush implementation. test_module_run() blocks the kernel
+// main loop for the entire duration of a test, so the normal per-frame
+// wm.update_all() + swap_buffers() pass never gets to run. The module
+// calls this between breadcrumbs and around blocking calls so the
+// overlay is painted and pushed to the screen live — and so a hang
+// inside the Bochs glue still leaves a frame on screen showing exactly
+// how far the test got. It mirrors the main loop's paint sequence.
+extern "C" void test_sink_flush(void) {
+    g_gfx.clear_screen(ColorPalette::DESKTOP_BLUE);
+    wm.update_all();                       // draws windows incl. overlay
+    draw_cursor(mouse_x, mouse_y, ColorPalette::CURSOR_WHITE);
+    draw_vga_overlay();                    // framebuffer breadcrumb rows
+    swap_buffers();                        // push frame to the display
 }
 
 static volatile bool g_evt_timer = false;
