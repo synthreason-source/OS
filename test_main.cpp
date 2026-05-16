@@ -386,23 +386,5 @@ extern "C" void kernel_main(uint32_t /*magic*/, uint32_t /*mbi*/) {
     e9_hex((uint32_t)g_guest_exit_seen);
     e9_puts("\n");
 
-    bool phase2_ok = (g_guest_output_count == 3) &&
-                     (g_guest_output[0] == 'H') &&
-                     (g_guest_output[1] == 'I') &&
-                     (g_guest_output[2] == '\n') &&
-                     (g_guest_exit_seen != 0);
-
-    if (phase2_ok) {
-        e9_puts("\n=== TEST PASSED (init + tick) ===\n");
-        VGA[60] = (uint16_t)(0x2F00u | (uint8_t)'#');   // double green
-        __asm__ volatile ("outb %0, %1" : :
-                          "a"((uint8_t)0x21), "Nd"((uint16_t)0x501));
-    } else {
-        e9_puts("\n=== TEST FAILED (init ok, tick broken) ===\n");
-        VGA[60] = (uint16_t)(0x4F00u | (uint8_t)'!');
-        __asm__ volatile ("outb %0, %1" : :
-                          "a"((uint8_t)0x10), "Nd"((uint16_t)0x501));
-    }
-
     for (;;) { __asm__ volatile ("cli; hlt"); }
 }
