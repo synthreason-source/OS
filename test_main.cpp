@@ -261,12 +261,29 @@ static void test_io_exit(int slot, int code) {
 //     F4           hlt                    ; safety: never reached
 //     EB FE        jmp  .                 ; safety: spin if it is
 static const uint8_t guest_program[] = {
-    0xB0, 0x48,  0xE6, 0xE9,        // out 'H'
-    0xB0, 0x49,  0xE6, 0xE9,        // out 'I'
-    0xB0, 0x0A,  0xE6, 0xE9,        // out '\n'
-    0xB0, 0x00,  0xE6, 0xE8,        // out 0 to 0xE8 → exit
-    0xF4,                            // hlt
-    0xEB, 0xFE                       // jmp .
+    0xB0, 0x32,        // mov al, '2'
+    0xE6, 0xE9,        // out 0xE9, al
+
+    0xB0, 0x2B,        // mov al, '+'
+    0xE6, 0xE9,        // out 0xE9, al
+
+    0xB0, 0x33,        // mov al, '3'
+    0xE6, 0xE9,        // out 0xE9, al
+
+    0xB0, 0x3D,        // mov al, '='
+    0xE6, 0xE9,        // out 0xE9, al
+
+    0xB0, 0x35,        // mov al, '5'
+    0xE6, 0xE9,        // out 0xE9, al
+
+    0xB0, 0x0A,        // mov al, '\n'
+    0xE6, 0xE9,        // out 0xE9, al
+
+    0xB0, 0x00,        // mov al, 0
+    0xE6, 0xE8,        // out 0xE8, al -> exit
+
+    0xF4,              // hlt
+    0xEB, 0xFE         // jmp .
 };
 
 // Slot backing slab. 1 MiB, page-aligned, kept in BSS so we don't
