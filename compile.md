@@ -25,6 +25,6 @@ make clean && make BOCHS=1
 	    -device ahci,id=ahci \
 	    -device ide-hd,drive=disk0,bus=ahci.0
       
-use VMware (other-64bit) with SATA drive, port 0
+compatible with SATA drives, currently using port 0
 
 
