@@ -71,6 +71,13 @@ extern "C" {
     volatile unsigned char bx_panic_breadcrumbs[64] = {0};
 }
 
+// Panic message captured by logfunctions::panic in bochs_infra.cpp.
+// bochs_guest_exit() dumps this to the host debug console so a panic
+// during init reports WHICH Bochs check failed instead of just freezing.
+extern "C" {
+    extern volatile char bx_last_panic_msg[128];
+}
+
 #define MAX_BOCHS_SLOTS 4
 
 // ─── Per-slot state ───────────────────────────────────────────────────────
@@ -618,12 +625,21 @@ static void bochs_global_init() {
     // the params they need (non-null pointers returning safe defaults)
     // without trapping. Calling initialize() is by-the-book and gives
     // us a proper CPUID table for the guest.
+    //
+    // DIAGNOSTIC: the trail used to jump 32 -> 33 across this whole call,
+    // so a hang reported only "somewhere after init_memory". Bracket the
+    // two heavy sub-steps separately:
+    //   ...2 a        frozen  => hang is INSIDE BX_CPU(0)->initialize()
+    //   ...2 a 3 b    frozen  => hang is INSIDE BX_CPU(0)->reset()
+    //   ...2 a 3 b 4         => both completed, init is fine
+    live_breadcrumb(38, 'a');           // entering initialize()
     BX_CPU(0)->initialize();
-    live_breadcrumb(33, '3');
+    live_breadcrumb(33, '3');           // initialize() returned
 
     // (4) hardware reset.
+    live_breadcrumb(39, 'b');           // entering reset()
     BX_CPU(0)->reset(BX_RESET_HARDWARE);
-    live_breadcrumb(34, '4');
+    live_breadcrumb(34, '4');           // reset() returned
 
     // (5) FPU clean state. Not strictly required after reset() but
     // explicit and by-the-book.
@@ -806,6 +822,32 @@ extern "C" void bochs_guest_exit(int code) {
         const char hex[] = "0123456789ABCDEF";
         live_breadcrumb(41, hex[(v >> 4) & 0xF]);
         live_breadcrumb(42, hex[ v       & 0xF]);
+
+        // Also dump a readable diagnostic to the host debug console
+        // (port 0xE9, captured by QEMU `-debugcon stdio`). Without this
+        // a panic during init was a silent freeze — the breadcrumbs
+        // alone could not say WHICH Bochs internal check failed.
+        // bx_last_panic_msg is filled by logfunctions::panic in
+        // bochs_infra.cpp just before it calls us.
+        {
+            auto e9c = [](char c) {
+                __asm__ volatile ("outb %0, %1"
+                    : : "a"((unsigned char)c), "Nd"((unsigned short)0xE9));
+            };
+            const char* m = "\n*** BOCHS PANIC during init (no slot) ***\n"
+                             "  exit code = -";
+            for (const char* p = m; *p; ++p) e9c(*p);
+            e9c(hex[(v >> 4) & 0xF]);
+            e9c(hex[ v       & 0xF]);
+            const char* lbl = "\n  panic msg = ";
+            for (const char* p = lbl; *p; ++p) e9c(*p);
+            const char* pm = (const char*)bx_last_panic_msg;
+            if (pm && pm[0]) { for (int i = 0; i < 127 && pm[i]; ++i) e9c(pm[i]); }
+            else             { const char* none = "(not captured)";
+                               for (const char* p = none; *p; ++p) e9c(*p); }
+            e9c('\n');
+        }
+
         // Hard halt: do NOT return into Bochs's panic-then-keep-going
         // sequence, which is what was causing the NULL-cpuid deref.
         for (;;) { __asm__ volatile("cli; hlt"); }

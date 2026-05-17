@@ -128,19 +128,34 @@ extern "C" void test_module_breadcrumb(int slot, char ch) {
     sink_flush();
 }
 
-/* row 1, "!XX" white-on-red (0x4F) — test_main.cpp's fault tag */
-extern "C" void test_module_fault(int vec) {
+/* row 1, "!XX" white-on-red (0x4F) — test_main.cpp's fault tag.
+ * Also reports the faulting EIP: a host fault during a `test` run is
+ * almost always an invalid-opcode (#UD, vec 6) or GP inside the
+ * prebuilt libcpu.a, and the EIP is what lets that exact instruction
+ * be located by disassembling the library. */
+extern "C" void test_module_fault(int vec, unsigned int eip) {
     if (!g_test_active) return;
     static const char H[] = "0123456789ABCDEF";
     sink_cell(1, 0, '!',                 0x4F);
     sink_cell(1, 1, H[(vec >> 4) & 0xF], 0x4F);
     sink_cell(1, 2, H[ vec       & 0xF], 0x4F);
 
+    /* EIP into row 1, cols 4..13: "EIP=XXXXXXXX" */
+    {
+        const char* p = "EIP=";
+        int c = 4;
+        for (int i = 0; p[i]; ++i) sink_cell(1, c++, p[i], 0x4F);
+        for (int i = 7; i >= 0; --i)
+            sink_cell(1, c++, H[(eip >> (i * 4)) & 0xF], 0x4F);
+    }
+
     e9_puts("[HOST_FAULT vec=");
     e9_hex((uint32_t)vec);
+    e9_puts(" eip=");
+    e9_hex(eip);
     e9_puts("]\n");
 
-    sink_line("  !! HOST FAULT during test — see fault tag\n");
+    sink_line("  !! HOST FAULT during test — see fault tag (vec/EIP)\n");
 }
 
 /* ── init-array walk — runs AT MOST ONCE ────────────────────────────────
@@ -271,6 +286,72 @@ static char* u32_to_hex(uint32_t v, char* buf) {
     return buf;
 }
 
+/* ── Guest program listing ──────────────────────────────────────────────
+ * Show the guest program that Phase 2 is about to load and run, so the
+ * user can actually SEE the code under test rather than just its verdict.
+ * Two views are emitted: a raw hex dump of guest_program[] and a short
+ * human-readable disassembly. Both go to the terminal sink and to the
+ * port-0xE9 trace. The disassembly is the static listing already
+ * documented in the comment above guest_program[] — the guest is a fixed
+ * 23-byte blob, so a hand-written table is exact and needs no decoder. */
+static const char* const guest_disasm[] = {
+    "  B0 32        mov   al, '2'",
+    "  2C 30        sub   al, '0'      ; al = 2",
+    "  B4 03        mov   ah, 3",
+    "  00 E0        add   al, ah       ; al = 5",
+    "  04 30        add   al, '0'      ; al = '5'",
+    "  E6 E9        out   0xE9, al     ; emit '5'",
+    "  B0 0A        mov   al, 0x0A",
+    "  E6 E9        out   0xE9, al     ; emit newline",
+    "  B0 00        mov   al, 0",
+    "  E6 E8        out   0xE8, al     ; exit sentinel",
+    "  F4           hlt",
+    "  EB FE        jmp   .            ; safety spin",
+};
+
+static void show_guest_program(void) {
+    static const char H[] = "0123456789ABCDEF";
+
+    e9_puts("\n[Phase 2] guest program (");
+    e9_hex((uint32_t)sizeof(guest_program));
+    e9_puts(" bytes):\n");
+    sink_line("[Phase 2] guest program listing:\n");
+
+    /* Raw hex dump — up to 16 bytes per line. */
+    {
+        unsigned i = 0;
+        while (i < sizeof(guest_program)) {
+            char line[80];
+            int k = 0;
+            const char* pre = "  hex:";
+            for (; pre[k]; ++k) line[k] = pre[k];
+            unsigned j = 0;
+            for (; j < 16 && (i + j) < sizeof(guest_program); ++j) {
+                uint8_t b = guest_program[i + j];
+                line[k++] = ' ';
+                line[k++] = H[(b >> 4) & 0xF];
+                line[k++] = H[b & 0xF];
+            }
+            line[k++] = '\n'; line[k] = 0;
+            sink_line(line);
+            e9_puts(line);
+            i += j;
+        }
+    }
+
+    /* Human-readable disassembly. */
+    sink_line("  --- disassembly ---\n");
+    e9_puts("  --- disassembly ---\n");
+    for (unsigned i = 0; i < sizeof(guest_disasm) / sizeof(guest_disasm[0]); ++i) {
+        sink_line(guest_disasm[i]);
+        sink_line("\n");
+        e9_puts(guest_disasm[i]);
+        e9_putc('\n');
+    }
+    sink_line("  expected guest output: \"5\\n\"\n");
+    e9_puts("  expected guest output: \"5\\n\"\n");
+}
+
 /* ── test_module_run — the activation entry point ───────────────────────
  * This is the "test execution code" the kernel copies in and activates.
  * It performs the same two-phase verification test_main.cpp did. */
@@ -293,6 +374,14 @@ extern "C" void test_module_run(const TestSink* sink, TestResult* out) {
 
     e9_puts("\n=== test_module: BX_CPU(0)->initialize() + cpu_tick ===\n");
     sink_line("=== Bochs self-test (activated by `test`) ===\n");
+
+    /* Show the guest program up front, BEFORE Phase 1. The guest is a
+     * fixed constant blob that does not depend on anything Phase 1 does,
+     * so listing it here means `test` always displays the code under
+     * test — even if bochs_cpu_init() below hangs or panics and the run
+     * never reaches Phase 2. */
+    show_guest_program();
+    sink_flush();
 
     run_init_array_once();
 
@@ -351,6 +440,8 @@ extern "C" void test_module_run(const TestSink* sink, TestResult* out) {
      * (stub/GDT/IDT, all below offset 0x900) cannot overwrite it. */
     for (unsigned i = 0; i < sizeof(guest_program); ++i)
         slab[GUEST_ENTRY_OFF + i] = guest_program[i];
+
+    /* (The guest program listing was already shown before Phase 1.) */
 
     bochs_cpu_set_eip(SLAB_VADDR_BASE + GUEST_ENTRY_OFF);
     bochs_cpu_set_esp(SLAB_VADDR_BASE + SLAB_SIZE - 16);

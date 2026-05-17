@@ -109,6 +109,8 @@ $(BOCHS_CPU_LIB):
 	    $(MAKE) -C $(BOCHS_DIR)/memory; \
 	fi
 
+
+
 # Bochs instrument stub header (required by bochs_glue.cpp).
 # Prebuilt bundle already contains it; re-copying is harmless.
 $(BOCHS_DIR)/instrument.h:
@@ -170,7 +172,7 @@ hello_blob.o: hello
 
 
 
-BOCHS_OBJ    := bochs_glue.o bochs_infra.o bochs_paramtree.o bochs_pc_system.o bochs_cstubs.o setjmp.o
+BOCHS_OBJ    := bochs_glue.o bochs_infra.o bochs_paramtree.o bochs_pc_system.o bochs_cstubs.o setjmp.o test_module.o
 BOCHS_LIBS   := $(BOCHS_DIR)/cpu/libcpu.a \
                 $(BOCHS_DIR)/cpu/fpu/libfpu.a \
                 $(BOCHS_DIR)/cpu/cpudb/libcpudb.a \
@@ -232,11 +234,14 @@ bochs_cstubs.o: bochs_cstubs.c
 # bochs_glue.cpp's rescue path.
 setjmp.o: setjmp.S
 	as --32 setjmp.S -o setjmp.o
+	
+test_module.o: test_module.cpp
+	g++ -m32 -O2 $(BOCHS_IFLAGS) $(CXXFLAGS) -c test_module.cpp -o test_module.o
 
 # ============================================================
 #  Link
 # ============================================================
-$(MULTIBOOT): boot.o kernel.o ramdisk.o hello_blob.o $(BOCHS_OBJ) $(BOCHS_DEP)
+$(MULTIBOOT): boot.o kernel.o ramdisk.o hello_blob.o test_module.o $(BOCHS_OBJ) $(BOCHS_DEP)
 	mkdir -p iso/boot
 	g++ -m32 -T linker.ld -nostdlib -no-pie -static \
 	    -o $(MULTIBOOT)              \

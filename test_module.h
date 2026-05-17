@@ -102,7 +102,10 @@ void test_module_mark_ctors_done(void);
  * of a test_module_run() call, so forwarding is a no-op otherwise. */
 int  test_module_active(void);
 void test_module_breadcrumb(int slot, char ch);
-void test_module_fault(int vec);
+/* test_module_fault now also takes the faulting EIP so a host fault
+ * during a `test` run reports WHERE it faulted, not just the vector.
+ * Pass 0 for eip if the caller cannot determine it. */
+void test_module_fault(int vec, unsigned int eip);
 
 #ifdef __cplusplus
 }

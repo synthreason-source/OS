@@ -90,6 +90,25 @@ void* malloc(size_t n) {
 
 void free(void* p) { (void)p; }   /* bump allocator: no-op free */
 
+/* ── Bump-pool fallback for the kernel's operator new ───────────────────
+ * The Bochs constructors (e.g. icache.o's pageWriteStampTable ctor, which
+ * allocates 4 MiB) call the global C++ operator new, which kernel.cpp
+ * routes to its own FreeListAllocator. By the time `test` runs, that heap
+ * is mostly consumed by the running desktop, so the 4 MiB request fails
+ * and the kernel OOM-halts. This 48 MiB pool was sized specifically for
+ * Bochs (see the header comment). These two helpers let kernel.cpp's
+ * operator new fall back here instead of halting:
+ *   bochs_pool_alloc(n)      — allocate n bytes from the pool (NULL if full)
+ *   bochs_pool_owns(p)       — nonzero if p points inside the pool, so the
+ *                              kernel's operator delete can skip it (the
+ *                              bump allocator never frees individually). */
+void* bochs_pool_alloc(size_t n) { return malloc(n); }
+
+int bochs_pool_owns(const void* p) {
+    const char* c = (const char*)p;
+    return (c >= _bheap) && (c < _bheap + BHEAP_BYTES);
+}
+
 void abort(void) { __asm__("cli; hlt"); __builtin_unreachable(); }
 
 /* ── String / memory functions ─────────────────────────────────────────── */

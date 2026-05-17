@@ -715,9 +715,19 @@ static void oom_halt(size_t size) {
     for(;;) asm volatile("hlt");
 }
 
+// Bump-pool fallback, implemented in bochs_cstubs.c. The Bochs ctors do
+// large allocations (icache.o's pageWriteStampTable ctor needs 4 MiB)
+// through the global operator new; when the kernel's FreeListAllocator
+// is exhausted we fall back to the dedicated 48 MiB Bochs pool instead
+// of halting. bochs_pool_owns() lets operator delete recognise a pointer
+// that came from that pool (the bump allocator does not free per-object).
+extern "C" void* bochs_pool_alloc(size_t n);
+extern "C" int   bochs_pool_owns(const void* p);
+
 void* operator new(size_t size) {
     void* p = g_allocator.allocate(size);
-    if (!p) oom_halt(size);
+    if (!p) p = bochs_pool_alloc(size);   // fall back to the Bochs pool
+    if (!p) oom_halt(size);               // both exhausted — now halt
     return p;
 }
 
@@ -726,6 +736,8 @@ void* operator new[](size_t size) {
 }
 
 void operator delete(void* ptr) noexcept {
+    if (!ptr) return;
+    if (bochs_pool_owns(ptr)) return;     // bump-pool memory: never freed
     g_allocator.deallocate(ptr);
 }
 
@@ -1057,12 +1069,17 @@ static inline unsigned read_caller_eip(void) {
 }
 
 extern "C" void host_fault_handler(unsigned vector) {
+    // Read the faulting EIP up front so we can hand it to the test
+    // module too — a #UD/GP inside libcpu.a is only diagnosable if we
+    // know WHERE it faulted, not just the vector.
+    unsigned caller_eip = read_caller_eip();
+
     // If a `test` self-test is running, mirror the fault into its
-    // window overlay (row 1, "!XX") before the kernel's own rendering.
-    if (test_module_active()) test_module_fault((int)vector);
+    // window overlay (row 1, "!XX  EIP=...") before the kernel's own
+    // rendering, and emit the vector+EIP to the host debug console.
+    if (test_module_active()) test_module_fault((int)vector, caller_eip);
 
     if (!fb_info.ptr) return;
-    unsigned caller_eip = read_caller_eip();
 
     auto put_glyph = [](char ch, int x0, int y0, uint32_t color, uint32_t bg) {
         if ((unsigned char)ch > 127) ch = '?';
@@ -6161,10 +6178,21 @@ void handle_command() {
 		g_test_overlay_active = false;
 		g_test_overlay_owner  = (void*)this;   // this window shows it
 
-		// The kernel already ran the file-scope C++ ctors at boot, so
-		// tell the module not to re-run __init_array (that would re-
-		// construct bx_cpu / bx_mem).
-		test_module_mark_ctors_done();
+		// Do NOT mark ctors done — let test_module_run() walk
+		// __init_array, exactly as the standalone test_main.cpp does, so
+		// the file-scope C++ ctors that construct bx_cpu(0), bx_mem and
+		// the dummy CPUID param objects in bochs_infra.cpp actually run.
+		// Without them bochs_cpu_init() -> BX_CPU(0)->initialize() runs
+		// against unconstructed objects (null vtables) and faults #UD.
+		//
+		// Earlier this OOM-halted: a Bochs ctor (icache.o's 4 MiB
+		// pageWriteStampTable) allocates via the global operator new,
+		// and by test-time the kernel heap is mostly used. That is now
+		// fixed — operator new falls back to the 48 MiB Bochs bump pool
+		// (see operator new above) instead of halting, so the walk is
+		// safe. test_module_run() calls run_init_array_once() itself;
+		// that guard prevents a second `test` re-running the ctors.
+		// (We simply do NOT call test_module_mark_ctors_done() here.)
 
 		TestSink sink;
 		sink.put_line = test_sink_put_line;

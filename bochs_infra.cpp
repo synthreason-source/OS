@@ -60,9 +60,38 @@ void logfunctions::ldebug(const char*, ...)      {}
 // failed) — the safe move is to let cpu_loop unwind through its
 // normal exit path. The slot is marked dead; its exit_cb has already
 // flipped proc.active = false on the kernel side.
-void logfunctions::panic (const char*, ...) { bochs_guest_exit(-1); }
-void logfunctions::fatal1(const char*, ...) { bochs_guest_exit(-2); }
-void logfunctions::fatal (int, const char*, const char*, va_list, int) {
+//
+// DIAGNOSTIC: the panic format string used to be discarded outright,
+// so a panic during bochs_global_init() became an unexplained freeze
+// (bochs_guest_exit's no-slot path hard-halts). Capture the raw format
+// string here into a global buffer so bochs_guest_exit() — and the
+// kernel — can show WHICH Bochs check failed. The string is a static
+// literal inside libcpu.a, so storing the pointer is safe and cheap;
+// we also copy the leading bytes in case the literal lives in a
+// section that becomes unmapped later.
+extern "C" {
+    volatile const char* bx_last_panic_fmt = nullptr;  // raw pointer
+    volatile char        bx_last_panic_msg[128] = {0};  // copied text
+}
+static void bx_capture_panic(const char* fmt) {
+    bx_last_panic_fmt = fmt;
+    if (fmt) {
+        unsigned i = 0;
+        for (; i < sizeof(bx_last_panic_msg) - 1 && fmt[i]; ++i)
+            bx_last_panic_msg[i] = fmt[i];
+        bx_last_panic_msg[i] = '\0';
+    }
+}
+void logfunctions::panic (const char* fmt, ...) {
+    bx_capture_panic(fmt);
+    bochs_guest_exit(-1);
+}
+void logfunctions::fatal1(const char* fmt, ...) {
+    bx_capture_panic(fmt);
+    bochs_guest_exit(-2);
+}
+void logfunctions::fatal (int, const char* p, const char* fmt, va_list, int) {
+    bx_capture_panic(fmt ? fmt : p);
     bochs_guest_exit(-3);
 }
 void logfunctions::warn(int, const char*, const char*, va_list) {}
