@@ -338,7 +338,20 @@ extern "C" void bochs_register_io_callbacks(
     void (*exit_cb )(int, int));
 extern "C" bool bochs_process_wants_input(int slot);
 
-// --- STEP 5b: Activatable Bochs self-test module ----------------------------
+// Forward declarations for the ELF loader helpers and IO callbacks defined
+// later in this file. busybox/hello use the same lazy-init pattern as
+// load_and_execute_elf (cpu_initialized=false, no bochs_cpu_init here).
+// start_elf_process/load_elf_image_to_slab are kept for test_main usage.
+static bool load_elf_image_to_slab(int slot, const unsigned char* elf,
+                                   unsigned int elf_size, unsigned int& entry_out);
+static bool start_elf_process(int slot, const unsigned char* elf,
+                              unsigned int elf_size);
+// IO callbacks — forward-declared so the `test` command handler can
+// restore them after test_module_run() overwrites slot 0's callbacks.
+static int  elf_io_read (int slot);
+static void elf_io_write(int slot, char c);
+static void elf_io_exit (int slot, int code);
+
 // test_module.cpp holds the test execution code (formerly the standalone
 // test_main.cpp). It is activated by typing `test` in a terminal. The module
 // renders a three-row "VGA-style" overlay (breadcrumbs / fault tag / GUEST
@@ -6206,6 +6219,15 @@ void handle_command() {
 
 		test_module_run(&sink, &res);
 
+		// test_module_run() replaces slot 0's IO callbacks with its own
+		// internal stubs (test_io_read/write/exit). Restore the real kernel
+		// callbacks for every slot so ELF processes launched after `test`
+		// get proper output routing and elf_io_exit correctly marks them
+		// inactive. Without this, the first ELF on slot 0 after a `test`
+		// run would silently swallow its exit signal and appear to freeze.
+		for (int s = 0; s < MAX_ELF_PROCESSES; ++s)
+			bochs_register_io_callbacks(s, elf_io_read, elf_io_write, elf_io_exit);
+
 		// Final one-line verdict in the terminal.
 		if (res.phase1_ok && res.guest_exit_seen)
 			console_print("test: PASSED (cpu init + guest tick OK)\n");
@@ -6455,23 +6477,21 @@ void handle_command() {
     }
 	
     else if (strcmp(command, "busybox") == 0 || strcmp(command, "bb") == 0) {
-        // Launch BusyBox from the embedded ramdisk (no disk I/O required).
+        // Launch BusyBox from the embedded ramdisk using the same
+        // segment-loading and lazy-CPU-init pattern as load_and_execute_elf.
+        // bochs_cpu_init() must NOT be called here — only x86_tick's lazy
+        // path may call it (calling from the command handler context freezes
+        // the kernel before the first tick).
         uint8_t* elf_src = ramdisk_start;
         uint32_t elf_sz  = (uint32_t)(ramdisk_end - ramdisk_start);
 
-        if (elf_sz < sizeof(Elf32_Ehdr) || elf_sz > 8 * 1024 * 1024) {
+        if (elf_sz < 52 || elf_sz > 8 * 1024 * 1024) {
             console_print("BusyBox: ramdisk missing or corrupt\n");
             return;
         }
-
-        Elf32_Ehdr* ehdr = (Elf32_Ehdr*)elf_src;
-        if (ehdr->e_ident[EI_MAG0] != ELFMAG0 ||
-            ehdr->e_ident[EI_MAG1] != ELFMAG1 ||
-            ehdr->e_ident[EI_MAG2] != ELFMAG2 ||
-            ehdr->e_ident[EI_MAG3] != ELFMAG3 ||
-            ehdr->e_ident[EI_CLASS] != ELFCLASS32 ||
-            ehdr->e_machine != EM_386) {
-            console_print("BusyBox: invalid ELF header\n");
+        if (!(elf_src[0] == 0x7f && elf_src[1] == 'E' &&
+              elf_src[2] == 'L'  && elf_src[3] == 'F')) {
+            console_print("BusyBox: invalid ELF magic\n");
             return;
         }
 
@@ -6480,95 +6500,76 @@ void handle_command() {
             if (!elf_processes[i].active) { slot = i; break; }
         if (slot < 0) { console_print("No free process slots\n"); return; }
 
-        // Compute virtual address range from PT_LOAD segments.
-        if (ehdr->e_phoff == 0 || ehdr->e_phnum == 0) {
-            console_print("BusyBox: no program headers\n");
-            return;
-        }
+        Elf32_Ehdr* ehdr = (Elf32_Ehdr*)elf_src;
         Elf32_Phdr* phdr = (Elf32_Phdr*)(elf_src + ehdr->e_phoff);
         uint32_t min_vaddr = 0xFFFFFFFFu, max_vaddr = 0;
         for (int i = 0; i < ehdr->e_phnum; i++) {
-            if (phdr[i].p_type == PT_LOAD) {
-                if (phdr[i].p_vaddr < min_vaddr) min_vaddr = phdr[i].p_vaddr;
-                uint32_t seg_end = phdr[i].p_vaddr + phdr[i].p_memsz;
-                if (seg_end > max_vaddr) max_vaddr = seg_end;
-            }
+            if (phdr[i].p_type != PT_LOAD) continue;
+            if (phdr[i].p_vaddr < min_vaddr) min_vaddr = phdr[i].p_vaddr;
+            uint32_t end = phdr[i].p_vaddr + phdr[i].p_memsz;
+            if (end > max_vaddr) max_vaddr = end;
         }
         if (min_vaddr == 0xFFFFFFFFu || max_vaddr <= min_vaddr) {
             console_print("BusyBox: no PT_LOAD segments\n");
             return;
         }
 
-        // Guard: total process image must fit in available heap.
-        uint32_t img_sz  = max_vaddr - min_vaddr;
-        uint32_t mem_sz  = img_sz + ELF_HEAP_SIZE;  // image + heap
-        // Sanity cap: 6 MB max to leave room for other allocations.
-        if (mem_sz > 6 * 1024 * 1024) {
+        uint32_t imgsize = max_vaddr - min_vaddr;
+        uint32_t memsize = imgsize + ELFHEAPSIZE;
+        if (memsize > 6 * 1024 * 1024) {
             console_print("BusyBox: process image too large\n");
             return;
         }
 
         ElfProcess& proc = elf_processes[slot];
-        proc.memory_base = new uint8_t[mem_sz];
-        if (!proc.memory_base) {
-            console_print("BusyBox: out of heap memory\n");
-            return;
-        }
-        memset(proc.memory_base, 0, mem_sz);
-        proc.memory_size = mem_sz;
+        proc = ElfProcess();
+        proc.memory_base = new uint8_t[memsize];
+        if (!proc.memory_base) { console_print("BusyBox: out of memory\n"); return; }
+        memset(proc.memory_base, 0, memsize);
+        proc.memory_size = memsize;
 
-        // Copy PT_LOAD segments into process memory.
         for (int i = 0; i < ehdr->e_phnum; i++) {
-            if (phdr[i].p_type == PT_LOAD) {
-                uint32_t dst_off = phdr[i].p_vaddr - min_vaddr;
-                // Bounds check each segment before copying.
-                if (dst_off + phdr[i].p_filesz > mem_sz ||
-                    phdr[i].p_offset + phdr[i].p_filesz > elf_sz) {
-                    delete[] proc.memory_base;
-                    proc.memory_base = nullptr;
-                    console_print("BusyBox: segment out of bounds\n");
-                    return;
-                }
-                memcpy(proc.memory_base + dst_off,
-                       elf_src + phdr[i].p_offset,
-                       phdr[i].p_filesz);
-                if (phdr[i].p_memsz > phdr[i].p_filesz)
-                    memset(proc.memory_base + dst_off + phdr[i].p_filesz,
-                           0, phdr[i].p_memsz - phdr[i].p_filesz);
+            if (phdr[i].p_type != PT_LOAD) continue;
+            uint32_t dst_off = phdr[i].p_vaddr - min_vaddr;
+            if (dst_off + phdr[i].p_filesz > memsize ||
+                phdr[i].p_offset + phdr[i].p_filesz > elf_sz) {
+                delete[] proc.memory_base; proc.memory_base = nullptr;
+                console_print("BusyBox: segment out of bounds\n");
+                return;
             }
+            memcpy(proc.memory_base + dst_off, elf_src + phdr[i].p_offset,
+                   phdr[i].p_filesz);
+            if (phdr[i].p_memsz > phdr[i].p_filesz)
+                memset(proc.memory_base + dst_off + phdr[i].p_filesz, 0,
+                       phdr[i].p_memsz - phdr[i].p_filesz);
         }
 
-        proc.stack = new uint8_t[ELF_STACK_SIZE];
+        proc.stack = new uint8_t[ELFSTACKSIZE];
         if (!proc.stack) {
-            delete[] proc.memory_base;
-            proc.memory_base = nullptr;
+            delete[] proc.memory_base; proc.memory_base = nullptr;
             console_print("BusyBox: out of stack memory\n");
             return;
         }
-        memset(proc.stack, 0, ELF_STACK_SIZE);
+        memset(proc.stack, 0, ELFSTACKSIZE);
 
-        // Finalize: inject IDT stub AFTER ELF segments are in place
         bochs_activate_slot(slot);
-        bochs_set_process_memory(proc.memory_base, mem_sz, min_vaddr);
+        bochs_set_process_memory(proc.memory_base, memsize, min_vaddr);
         bochs_finalize_process_memory();
 
-        proc.entry_point     = ehdr->e_entry;  // full VA, NOT offset
+        proc.entry_point     = ehdr->e_entry;
         proc.vaddr_base      = min_vaddr;
         proc.vaddr_end       = max_vaddr;
         proc.eip             = proc.entry_point;
-        // Stack: place at top of memory slab (below the heap padding)
-        proc.esp             = min_vaddr + (max_vaddr - min_vaddr) + ELF_HEAP_SIZE - 64;
+        proc.esp             = min_vaddr + imgsize + ELFHEAPSIZE - 16;
         proc.active          = true;
-        proc.cpu_initialized = false;
+        proc.cpu_initialized = false;  // x86_tick lazy path does CPU init
         proc.completed       = false;
         proc.waiting_for_input = false;
         proc.terminal        = this;
-        // cmdline = "busybox [subcommand]"; x86_tick parses subcommand for argv[0]
-        // Default subcommand "sh" gives an interactive shell.
         if (args && *args)
             strncpy(proc.cmdline, args, 255);
         else
-            strncpy(proc.cmdline, "sh", 255);  // default: run as shell
+            strncpy(proc.cmdline, "sh", 255);
 
         captured_elf_slot = slot;
         console_print("BusyBox started (slot ");
@@ -6586,27 +6587,21 @@ void handle_command() {
     else if (strcmp(command, "version") == 0) { console_print("RTOS++ v1.0 - Robust Parsing\n"); }
 
     // ── 'hello' command: launch the embedded hello test ELF ───────────────
-    // Mirrors the 'bb'/'busybox' launcher above but uses the hello blob
-    // (`hello_start..hello_end`) instead of the busybox ramdisk. Skipping
-    // FAT32 entirely lets us smoke-test the Bochs CPU emulation path
-    // independently of disk round-trip bugs.
+    // Uses the same segment-loading and lazy-CPU-init pattern as
+    // load_and_execute_elf and the busybox launcher above.
+    // bochs_cpu_init() is intentionally NOT called here — x86_tick's lazy
+    // path handles it on the first tick.
     else if (strcmp(command, "hello") == 0) {
         uint8_t* elf_src = hello_start;
         uint32_t elf_sz  = (uint32_t)(hello_end - hello_start);
 
-        if (elf_sz < sizeof(Elf32_Ehdr)) {
+        if (elf_sz < 52) {
             console_print("hello: embedded blob missing\n");
             return;
         }
-
-        Elf32_Ehdr* ehdr = (Elf32_Ehdr*)elf_src;
-        if (ehdr->e_ident[EI_MAG0] != ELFMAG0 ||
-            ehdr->e_ident[EI_MAG1] != ELFMAG1 ||
-            ehdr->e_ident[EI_MAG2] != ELFMAG2 ||
-            ehdr->e_ident[EI_MAG3] != ELFMAG3 ||
-            ehdr->e_ident[EI_CLASS] != ELFCLASS32 ||
-            ehdr->e_machine != EM_386) {
-            console_print("hello: invalid ELF header\n");
+        if (!(elf_src[0] == 0x7f && elf_src[1] == 'E' &&
+              elf_src[2] == 'L'  && elf_src[3] == 'F')) {
+            console_print("hello: invalid ELF magic\n");
             return;
         }
 
@@ -6615,81 +6610,73 @@ void handle_command() {
             if (!elf_processes[i].active) { slot = i; break; }
         if (slot < 0) { console_print("No free process slots\n"); return; }
 
+        Elf32_Ehdr* ehdr = (Elf32_Ehdr*)elf_src;
         Elf32_Phdr* phdr = (Elf32_Phdr*)(elf_src + ehdr->e_phoff);
         uint32_t min_vaddr = 0xFFFFFFFFu, max_vaddr = 0;
         for (int i = 0; i < ehdr->e_phnum; i++) {
-            if (phdr[i].p_type == PT_LOAD) {
-                if (phdr[i].p_vaddr < min_vaddr) min_vaddr = phdr[i].p_vaddr;
-                uint32_t seg_end = phdr[i].p_vaddr + phdr[i].p_memsz;
-                if (seg_end > max_vaddr) max_vaddr = seg_end;
-            }
+            if (phdr[i].p_type != PT_LOAD) continue;
+            if (phdr[i].p_vaddr < min_vaddr) min_vaddr = phdr[i].p_vaddr;
+            uint32_t end = phdr[i].p_vaddr + phdr[i].p_memsz;
+            if (end > max_vaddr) max_vaddr = end;
         }
         if (min_vaddr == 0xFFFFFFFFu || max_vaddr <= min_vaddr) {
             console_print("hello: no PT_LOAD segments\n");
             return;
         }
 
-        uint32_t img_sz = max_vaddr - min_vaddr;
-        uint32_t mem_sz = img_sz + ELF_HEAP_SIZE;
-        if (mem_sz > 6 * 1024 * 1024) {
+        uint32_t imgsize = max_vaddr - min_vaddr;
+        uint32_t memsize = imgsize + ELFHEAPSIZE;
+        if (memsize > 2 * 1024 * 1024) {
             console_print("hello: process image too large\n");
             return;
         }
 
         ElfProcess& proc = elf_processes[slot];
-        proc.memory_base = new uint8_t[mem_sz];
-        if (!proc.memory_base) { console_print("hello: oom\n"); return; }
-        memset(proc.memory_base, 0, mem_sz);
-        proc.memory_size = mem_sz;
+        proc = ElfProcess();
+        proc.memory_base = new uint8_t[memsize];
+        if (!proc.memory_base) { console_print("hello: out of memory\n"); return; }
+        memset(proc.memory_base, 0, memsize);
+        proc.memory_size = memsize;
 
         for (int i = 0; i < ehdr->e_phnum; i++) {
-            if (phdr[i].p_type == PT_LOAD) {
-                uint32_t dst_off = phdr[i].p_vaddr - min_vaddr;
-                if (dst_off + phdr[i].p_filesz > mem_sz ||
-                    phdr[i].p_offset + phdr[i].p_filesz > elf_sz) {
-                    delete[] proc.memory_base;
-                    proc.memory_base = nullptr;
-                    console_print("hello: segment out of bounds\n");
-                    return;
-                }
-                memcpy(proc.memory_base + dst_off,
-                       elf_src + phdr[i].p_offset,
-                       phdr[i].p_filesz);
-                if (phdr[i].p_memsz > phdr[i].p_filesz)
-                    memset(proc.memory_base + dst_off + phdr[i].p_filesz,
-                           0, phdr[i].p_memsz - phdr[i].p_filesz);
+            if (phdr[i].p_type != PT_LOAD) continue;
+            uint32_t dst_off = phdr[i].p_vaddr - min_vaddr;
+            if (dst_off + phdr[i].p_filesz > memsize ||
+                phdr[i].p_offset + phdr[i].p_filesz > elf_sz) {
+                delete[] proc.memory_base; proc.memory_base = nullptr;
+                console_print("hello: segment out of bounds\n");
+                return;
             }
+            memcpy(proc.memory_base + dst_off, elf_src + phdr[i].p_offset,
+                   phdr[i].p_filesz);
+            if (phdr[i].p_memsz > phdr[i].p_filesz)
+                memset(proc.memory_base + dst_off + phdr[i].p_filesz, 0,
+                       phdr[i].p_memsz - phdr[i].p_filesz);
         }
 
-        proc.stack = new uint8_t[ELF_STACK_SIZE];
+        proc.stack = new uint8_t[ELFSTACKSIZE];
         if (!proc.stack) {
             delete[] proc.memory_base; proc.memory_base = nullptr;
-            console_print("hello: stack oom\n");
+            console_print("hello: out of stack memory\n");
             return;
         }
-        memset(proc.stack, 0, ELF_STACK_SIZE);
+        memset(proc.stack, 0, ELFSTACKSIZE);
 
-        // Activate slot first, THEN inject memory + GDT/IDT. The order
-        // matters: the previous order (init→set_process_memory) caused
-        // bochs_cpu_init's reset() to wipe the gdtr/idtr we just set.
-        // bochs_glue.cpp now restores gdtr/idtr from the active slot
-        // inside enter_protected_mode, so x86_tick's lazy init does
-        // (set_process_memory → cpu_init) and the descriptors survive.
         bochs_activate_slot(slot);
-        bochs_set_process_memory(proc.memory_base, mem_sz, min_vaddr);
+        bochs_set_process_memory(proc.memory_base, memsize, min_vaddr);
         bochs_finalize_process_memory();
 
-        proc.entry_point       = ehdr->e_entry;
-        proc.vaddr_base        = min_vaddr;
-        proc.vaddr_end         = max_vaddr;
-        proc.eip               = proc.entry_point;
-        proc.esp               = min_vaddr + img_sz + ELF_HEAP_SIZE - 64;
-        proc.active            = true;
-        proc.cpu_initialized   = false;
-        proc.completed         = false;
+        proc.entry_point     = ehdr->e_entry;
+        proc.vaddr_base      = min_vaddr;
+        proc.vaddr_end       = max_vaddr;
+        proc.eip             = proc.entry_point;
+        proc.esp             = min_vaddr + imgsize + ELFHEAPSIZE - 16;
+        proc.active          = true;
+        proc.cpu_initialized = false;  // x86_tick lazy path does CPU init
+        proc.completed       = false;
         proc.waiting_for_input = false;
-        proc.terminal          = this;
-        proc.cmdline[0]        = 0;
+        proc.terminal        = this;
+        proc.cmdline[0]      = 0;
 
         captured_elf_slot = slot;
         console_print("hello started.\n");
@@ -7830,6 +7817,14 @@ static bool load_elf_image_to_slab(
     bochs_activate_slot(slot);
     bochs_set_process_memory(slab, slab_size, vaddr_base);
     bochs_finalize_process_memory();
+
+    // Populate ElfProcess so that start_elf_process (and kill_elf_process)
+    // can track and free this slab correctly.
+    ElfProcess& proc = elf_processes[slot];
+    proc.memory_base = slab;
+    proc.memory_size = slab_size;
+    proc.vaddr_base  = vaddr_base;
+    proc.vaddr_end   = vaddr_top;
 
     return true;
 }
