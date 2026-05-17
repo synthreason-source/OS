@@ -7639,7 +7639,7 @@ void swap_buffers() {
 // inside the Bochs glue still leaves a frame on screen showing exactly
 // how far the test got. It mirrors the main loop's paint sequence.
 extern "C" void test_sink_flush(void) {
-    g_gfx.clear_screen(ColorPalette::DESKTOP_BLUE);
+    g_gfx.clear_screen(ColorPalette::DESKTOP_GRAY );
     wm.update_all();                       // draws windows incl. overlay
     draw_cursor(mouse_x, mouse_y, ColorPalette::CURSOR_WHITE);
     draw_vga_overlay();                    // framebuffer breadcrumb rows
@@ -8375,6 +8375,7 @@ static SVGAResult vmware_svga_init(uint32_t w, uint32_t h) {
     return r;
 }
 
+
 extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
 
     // ── Initialise heap ───────────────────────────────────────────────────────
@@ -8436,7 +8437,7 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
     backbuffer = backbuffer_storage;
     g_gfx.init(false);
 
-    g_gfx.clear_screen(ColorPalette::DESKTOP_BLUE);
+    g_gfx.clear_screen(ColorPalette::DESKTOP_GRAY );
     swap_buffers();
 
     // ── Open first terminal window ────────────────────────────────────────────
@@ -8472,6 +8473,16 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
 
     // ── Bochs CPU / ELF subsystem ─────────────────────────────────────────────
     init_elf_system();
+
+    // Tell the test module that boot.S already walked __init_array before
+    // kernel_main, so the Bochs C++ global constructors (bx_cpu, bx_mem,
+    // icache pageWriteStampTable, etc.) have already run once. Without this,
+    // the first `test` command re-runs all constructors a second time, which
+    // corrupts already-initialised Bochs state and can overwrite live kernel
+    // heap objects (including the TerminalWindow), killing the window. The
+    // second `test` was fine because g_init_array_done was already 1 by then.
+    //test_module_mark_ctors_done();
+
     vga_status("Init complete - entering main loop", 0x0A);
 
     // ── Main loop ─────────────────────────────────────────────────────────────
@@ -8558,7 +8569,7 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
                 last_paint_tick           = g_timer_ticks;
                 g_evt_dirty               = false;
                 g_input_state.hasNewInput = false;
-                g_gfx.clear_screen(ColorPalette::DESKTOP_BLUE);
+                g_gfx.clear_screen(ColorPalette::DESKTOP_GRAY );
                 wm.update_all();
                 draw_cursor(mouse_x, mouse_y, ColorPalette::CURSOR_WHITE);
                 // Diagnostic overlay: paint VGA text-mode rows 0/1/2
