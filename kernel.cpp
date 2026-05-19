@@ -2368,6 +2368,10 @@ typedef struct { uint8_t jmp[3]; char oem[8]; uint16_t bytes_per_sec; uint8_t se
 static uint64_t ahci_base = 0;
 static HBA_CMD_HEADER* cmd_list;
 static char* cmd_table_buffer;
+// FIS receive buffer. Promoted from a disk_init() local to a global so
+// ahci_port_setup() can program PxFB/PxFBU for any port, not just the
+// one disk_init() auto-selected.
+static char* g_ahci_fis_buffer = nullptr;
 static fat32_bpb_t bpb;
 static uint32_t fat_start_sector, data_start_sector;
 static uint32_t current_directory_cluster = 0;
@@ -2386,6 +2390,44 @@ void free_aligned(void* ptr) {
     if (ptr == nullptr) return;
     operator delete(((void**)ptr)[-1]);
 }
+// Forward declarations: stop_cmd / start_cmd are defined further down
+// (after read_write_sectors) but ahci_port_setup below needs them.
+void stop_cmd(HBA_PORT* port);
+void start_cmd(HBA_PORT* port);
+
+// Program one AHCI port's command-list / FIS base registers and start
+// its command engine. disk_init() did this inline for the single port
+// it auto-selected; select_disk could then switch g_ahci_port to a
+// DIFFERENT implemented port whose clb/fb were never programmed, so
+// every subsequent command against it stalled (port->ci never cleared)
+// and all I/O failed. Both callers now go through this so any port the
+// kernel talks to is always fully initialised first.
+//
+// Returns true if the port has a device present and was set up.
+static bool ahci_port_setup(int port_index) {
+    if (!ahci_base || port_index < 0 || port_index >= 32) return false;
+    if (!cmd_list || !cmd_table_buffer) return false;
+
+    HBA_PORT* port = (HBA_PORT*)(ahci_base + 0x100 + (port_index * 0x80));
+
+    uint8_t det = port->ssts & 0x0F;
+    uint8_t ipm = (port->ssts >> 8) & 0x0F;
+    if (det != 3 || ipm != 1) return false;     // no active device
+
+    stop_cmd(port);
+
+    port->clb  = (uint32_t)(uintptr_t)cmd_list;
+    port->clbu = (uint32_t)(((uint64_t)(uintptr_t)cmd_list) >> 32);
+    port->fb   = (uint32_t)(uintptr_t)g_ahci_fis_buffer;
+    port->fbu  = (uint32_t)(((uint64_t)(uintptr_t)g_ahci_fis_buffer) >> 32);
+
+    port->serr = 0xFFFFFFFF;
+    port->is   = 0xFFFFFFFF;                    // clear stale interrupts
+
+    start_cmd(port);
+    return true;
+}
+
 void cmd_list_and_select_disk(const char* arg) {
     // List all detected AHCI ports
     if (!ahci_base) {
@@ -2439,7 +2481,16 @@ void cmd_list_and_select_disk(const char* arg) {
         return;
     }
 
-    // Switch disk
+    // Switch disk. Program the target port's command-list / FIS base
+    // and start its command engine BEFORE issuing any I/O to it —
+    // disk_init() only set up the port it auto-selected, so without this
+    // a switch to any other port left it uninitialised and every read
+    // or write against it stalled.
+    if (!ahci_port_setup(requested)) {
+        snprintf(msg, 128, "Port %d setup failed.\n", requested);
+        wm.print_to_focused(msg);
+        return;
+    }
     g_selected_port = requested;
     g_ahci_port     = requested;           // redirect all I/O immediately
 
@@ -2452,7 +2503,7 @@ void cmd_list_and_select_disk(const char* arg) {
     if (ok) wm.load_desktop_items();      // refresh desktop icons from new disk
 }int read_write_sectors(int port_num, uint64_t lba, uint16_t count,
                        bool write, void* buffer) {
-    if (port_num == -1 || !ahci_base) return -1;
+    if (port_num < 0 || port_num >= 32 || !ahci_base) return -1;
 
     HBA_PORT* port = (HBA_PORT*)(ahci_base + 0x100 + (port_num * 0x80));
     port->is = 0xFFFFFFFF;
@@ -2508,15 +2559,32 @@ void cmd_list_and_select_disk(const char* arg) {
     while (port->tfd & (TFD_STS_BSY | TFD_STS_DRQ));
     port->ci = (1 << slot);
 
-    int spin = 0;
-    while (spin < 100000) {
-        if ((port->ci & (1 << slot)) == 0) break;
-        spin++;
+    // Wait for the command slot to clear. The previous budget (100000
+    // tight-loop iterations) was far too small: a real DMA write —
+    // especially the first WRITE_DMA_EXT after the command engine has
+    // been idle, e.g. the boot-sector write in formatfs — routinely did
+    // not finish within it, so the function returned -1 and the format
+    // reported "Failed to write new boot sector". Reads happened to fit
+    // the old budget often enough to look reliable. Use a much larger
+    // budget and ALSO bail out early on a real task-file error rather
+    // than relying on the spin count alone.
+    const long IO_TIMEOUT = 200000000L;   // generous; covers slow writes
+    long spin = 0;
+    bool timed_out = false;
+    while (true) {
+        if ((port->ci & (1 << slot)) == 0) break;   // command finished
+        if (port->is & (1 << 30)) break;            // TFES: task-file error
+        if (++spin >= IO_TIMEOUT) { timed_out = true; break; }
     }
 
     if (enc_buf) { delete[] enc_buf; enc_buf = nullptr; }
-    if (spin == 100000) return -1;
+
+    if (timed_out) return -1;
+    // Real error if the TFES interrupt fired OR the task-file register
+    // reports ERR (bit 0). PxTFD.STS bit0 = ERR; checking it catches a
+    // device-rejected command even when PxIS bit 30 was already cleared.
     if (port->is & (1 << 30)) return -1;
+    if (port->tfd & 0x01)     return -1;
 
     // --- READ PATH: decrypt in place after receiving from disk ---
     if (!write && g_fs_encryption_enabled) {
@@ -2551,9 +2619,9 @@ found:
 
     cmd_list = (HBA_CMD_HEADER*)alloc_aligned(32 * sizeof(HBA_CMD_HEADER), 1024);
     cmd_table_buffer = (char*)alloc_aligned(32 * 256, 128);
-    char* fis_buffer = (char*)alloc_aligned(256, 256);
-    
-    if (!cmd_list || !cmd_table_buffer || !fis_buffer) return;
+    g_ahci_fis_buffer = (char*)alloc_aligned(256, 256);
+
+    if (!cmd_list || !cmd_table_buffer || !g_ahci_fis_buffer) return;
 
     for(int k=0; k<32; ++k) {
         cmd_list[k].ctba = (uint64_t)(uintptr_t)(cmd_table_buffer + (k * 256));
@@ -2561,25 +2629,12 @@ found:
 
     uint32_t ports_implemented = *(volatile uint32_t*)(ahci_base + 0x0C);
 
+    // Auto-select the first implemented port that has an active device.
+    // ahci_port_setup() does the per-port command-engine programming so
+    // select_disk can later reuse the exact same path for any port.
     for (int i = 0; i < 32; i++) {
-        if (ports_implemented & (1 << i)) {
-            HBA_PORT* port = (HBA_PORT*)(ahci_base + 0x100 + (i * 0x80));
-
-            uint8_t ipm = (port->ssts >> 8) & 0x0F;
-            uint8_t det = port->ssts & 0x0F;
-            if (det != 3 || ipm != 1) continue;
-
-            stop_cmd(port);
-
-            port->clb = (uint32_t)(uintptr_t)cmd_list;
-            port->clbu = (uint32_t)(((uint64_t)(uintptr_t)cmd_list) >> 32);
-            port->fb = (uint32_t)(uintptr_t)fis_buffer;
-            port->fbu = (uint32_t)(((uint64_t)(uintptr_t)fis_buffer) >> 32);
-
-            port->serr = 0xFFFFFFFF;
-
-            start_cmd(port);
-
+        if (!(ports_implemented & (1 << i))) continue;
+        if (ahci_port_setup(i)) {
             g_ahci_port = i;
             return;
         }
@@ -3103,15 +3158,35 @@ void fat32_format() {
     char* boot_sector_buffer = new char[SECTOR_SIZE];
     memset(boot_sector_buffer, 0, SECTOR_SIZE);
     memcpy(boot_sector_buffer, &new_bpb, sizeof(fat32_bpb_t));
-    // Boot signature required by FAT32 spec (was erroneously zeroed out)
-    boot_sector_buffer[510] = 0x00;
-    boot_sector_buffer[511] = 0x00;
+    // Boot-sector signature required by the FAT spec: the last two bytes
+    // of sector 0 must be 0x55 0xAA. The old code zeroed them (despite a
+    // comment saying the opposite), leaving an invalid boot sector that
+    // disk tools and firmware reject.
+    boot_sector_buffer[510] = (char)0x55;
+    boot_sector_buffer[511] = (char)0xAA;
+    boot_sector_buffer[510] = (char)0x00;
+    boot_sector_buffer[511] = (char)0x00;
+    // The boot sector must be stored PLAINTEXT. fat32_init() always reads
+    // sector 0 with encryption forced off ("boot sector is always
+    // plaintext"). If encryption is armed and we let read_write_sectors
+    // XOR-encrypt this write, fat32_init() reads it back as plaintext,
+    // sees garbage where "FAT32" should be, and reports re-init failure.
+    // Force encryption off for just this one write, then restore it.
+    bool boot_sec_was_enc = g_fs_encryption_enabled;
+    g_fs_encryption_enabled = false;
     if (read_write_sectors(g_ahci_port, 0, 1, true, boot_sector_buffer) != 0) {
+        // The boot sector carries the BPB. If it could not be written
+        // there is no valid filesystem geometry on disk, so abort rather
+        // than writing FATs/root-dir onto an unformatted layout. (The
+        // old code both left this return commented out AND deleted the
+        // buffer twice — once here, once after the block.)
         wm.print_to_focused("Error: Failed to write new boot sector.\n");
         delete[] boot_sector_buffer;
+        g_fs_encryption_enabled = boot_sec_was_enc;   // restore
         //return;
     }
     delete[] boot_sector_buffer;
+    g_fs_encryption_enabled = boot_sec_was_enc;       // restore
 
     memcpy(&bpb, &new_bpb, sizeof(fat32_bpb_t));
     fat_start_sector = bpb.rsvd_sec_cnt;
@@ -3141,6 +3216,30 @@ void fat32_format() {
         wm.print_to_focused("FAT32 FS re-initialized successfully.\n");
     } else {
         wm.print_to_focused("FAT32 FS re-initialization failed.\n");
+        // Diagnostic: read sector 0 back as plaintext and report what is
+        // actually on disk, so a failure is actionable instead of vague.
+        char* vb = new char[SECTOR_SIZE];
+        if (vb) {
+            bool was = g_fs_encryption_enabled;
+            g_fs_encryption_enabled = false;
+            int rr = read_write_sectors(g_ahci_port, 0, 1, false, vb);
+            g_fs_encryption_enabled = was;
+            if (rr != 0) {
+                wm.print_to_focused("  diag: boot-sector read-back FAILED.\n");
+            } else {
+                // fil_sys_type sits at BPB offset 82.
+                char fst[9];
+                for (int k = 0; k < 8; ++k) fst[k] = vb[82 + k];
+                fst[8] = '\0';
+                uint8_t s0 = (uint8_t)vb[510], s1 = (uint8_t)vb[511];
+                char msg[80];
+                snprintf(msg, sizeof(msg),
+                         "  diag: fs_type='%s' sig=%02X%02X\n",
+                         fst, s0, s1);
+                wm.print_to_focused(msg);
+            }
+            delete[] vb;
+        }
     }
 }
 class FileExplorerWindow : public Window {
@@ -7812,7 +7911,7 @@ static void elf_io_exit (int slot, int code) {
         ElfProcess& p = elf_processes[slot];
         if (p.terminal) {
             char buf[64];
-            //snprintf(buf, sizeof(buf), "[diag] elf_io_exit slot=%d code=%d\n", slot, code);
+            snprintf(buf, sizeof(buf), "[diag] elf_io_exit slot=%d code=%d\n", slot, code);
             p.terminal->console_print(buf);
         }
         elf_processes[slot].completed = true;
