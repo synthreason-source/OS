@@ -365,6 +365,41 @@ static void elf_io_exit (int slot, int code);
 // rows at the top of its content area whenever it owns the overlay.
 #include "test_module.h"
 
+// =====================================================================
+// C++ global constructor (__init_array) walk — runs ONCE at boot.
+//
+// boot.S jumps straight from BSS-zero into kernel_main; it does NOT walk
+// __init_array. That means the file-scope C++ constructors that build
+// the Bochs core objects (bx_cpu(0), bx_mem, the CPUID parameter
+// objects in bochs_infra.cpp, icache's pageWriteStampTable, ...) never
+// run unless something explicitly walks the array.
+//
+// Previously the ONLY caller was test_module_run() (via its private
+// run_init_array_once()). So a freshly booted system that launched an
+// ELF in the Bochs emulator window *without first typing `test`* called
+// bochs_cpu_init() -> BX_CPU(0)->initialize() against raw, zero-filled
+// BSS objects — null vtables — and instantly faulted. The emulator
+// window's guest trapped out through the port-0xE8 exit stub on its
+// very first tick, so the window appeared to "crash / autoclose" the
+// first time it was used.
+//
+// The fix: walk __init_array here, once, from kernel_main, before any
+// Bochs entry point can be reached. test_module's own guard
+// (g_init_array_done) plus our call to test_module_mark_ctors_done()
+// guarantees the constructors are never run a second time by `test`.
+extern "C" void (*__init_array_start[])();
+extern "C" void (*__init_array_end[])();
+
+static bool g_kernel_ctors_done = false;
+
+static void kernel_run_global_ctors_once() {
+    if (g_kernel_ctors_done) return;
+    g_kernel_ctors_done = true;
+    for (void (**p)() = __init_array_start; p < __init_array_end; ++p) {
+        if (*p) (*p)();
+    }
+}
+
 struct TestVgaCell { char ch; uint8_t attr; };
 static TestVgaCell g_test_vga[3][80];
 static bool        g_test_overlay_active = false;
@@ -5499,6 +5534,14 @@ private:
     char current_line[TERM_WIDTH];
     int line_pos;
 
+    // True when the last character pushed by console_print() was a '\n'
+    // (or no output has been printed yet). When false, the next
+    // console_print() call must CONTINUE the current buffer line rather
+    // than starting a fresh one. This is what stops chatty guest output
+    // — which arrives a few bytes at a time, one console_print() per
+    // tick batch — from getting a spurious line break every few bytes.
+    bool output_at_line_start = true;
+
     // Editor state
     bool in_editor;
     char edit_filename[32];
@@ -5710,11 +5753,41 @@ private:
         prompt_visual_lines = seg_count;
     }
 
-    // Pushes word-wrapped text (from console_print) to the buffer
+    // Append a text fragment to the LAST buffer line (no wrapping, no
+    // newline). Used by push_wrapped_text to continue a line that a
+    // previous console_print() call left unterminated. If the line would
+    // overflow TERM_WIDTH the fragment spills onto a fresh line, so the
+    // ring of guest output still wraps cleanly.
+    void append_to_last_line(const char* frag) {
+        if (!frag || !*frag) return;
+        if (line_count == 0) push_line("");
+        char* line = buffer[line_count - 1];
+        int len = (int)strlen(line);
+        while (*frag) {
+            if (len >= TERM_WIDTH - 1) {
+                push_line("");
+                line = buffer[line_count - 1];
+                len  = 0;
+            }
+            line[len++] = *frag++;
+            line[len]   = '\0';
+        }
+    }
+
+    // Pushes word-wrapped text (from console_print) to the buffer.
+    //
+    // A single logical output line is only ever terminated by an actual
+    // '\n' in the input. Text that arrives WITHOUT a trailing newline
+    // leaves the line "open": output_at_line_start is set false, and the
+    // next call continues that same buffer line via append_to_last_line.
+    // Previously every call unconditionally push_line()'d its text, so a
+    // guest streaming output a few bytes per tick (one console_print per
+    // batch) got a line break every few bytes.
     void push_wrapped_text(const char* s, int cols) {
         const char* p = s;
         while (*p) {
             const char* nl = strchr(p, '\n');
+            bool has_newline = (nl != nullptr);
             if (!nl) nl = p + strlen(p);
 
             char line[512]; // Temporary buffer for a logical line
@@ -5723,10 +5796,21 @@ private:
             strncpy(line, p, len);
             line[len] = '\0';
 
-            const char* q = line;
-            if (*q == '\0' && nl != p) {
-                push_line(""); // Preserve blank lines
+            if (len == 0) {
+                // Empty segment. If it came from a real '\n' it is a
+                // blank line — but only "blank" if the current line was
+                // already started fresh; otherwise the '\n' just closes
+                // the open line and emits nothing extra.
+                if (has_newline && output_at_line_start) {
+                    push_line("");
+                }
+            } else if (!output_at_line_start) {
+                // Continue the open buffer line. We intentionally do NOT
+                // re-wrap here; append_to_last_line spills on overflow.
+                append_to_last_line(line);
             } else {
+                // Fresh line: word-wrap as before.
+                const char* q = line;
                 while (*q) {
                     int take = find_wrap_pos(q, cols);
                     char seg[120];
@@ -5734,8 +5818,8 @@ private:
                     seg[take] = '\0';
 
                     int trim = (int)strlen(seg);
-                        while (trim > 0 && (seg[trim-1] == ' ' || seg[trim-1] == '\t')) {
-                            seg[--trim] = '\0';
+                    while (trim > 0 && (seg[trim-1] == ' ' || seg[trim-1] == '\t')) {
+                        seg[--trim] = '\0';
                     }
 
                     push_line(seg);
@@ -5743,6 +5827,12 @@ private:
                     if (*q == ' ' || *q == '\t') q++;
                 }
             }
+
+            // The line is "closed" (next text starts fresh) only when we
+            // actually consumed a '\n'. Otherwise it stays open so the
+            // following console_print() continues it.
+            output_at_line_start = has_newline;
+
             p = (*nl == '\n') ? nl + 1 : nl;
         }
     }
@@ -6191,21 +6281,18 @@ void handle_command() {
 		g_test_overlay_active = false;
 		g_test_overlay_owner  = (void*)this;   // this window shows it
 
-		// Do NOT mark ctors done — let test_module_run() walk
-		// __init_array, exactly as the standalone test_main.cpp does, so
-		// the file-scope C++ ctors that construct bx_cpu(0), bx_mem and
-		// the dummy CPUID param objects in bochs_infra.cpp actually run.
-		// Without them bochs_cpu_init() -> BX_CPU(0)->initialize() runs
-		// against unconstructed objects (null vtables) and faults #UD.
+		// The file-scope C++ ctors that construct bx_cpu(0), bx_mem and
+		// the dummy CPUID param objects in bochs_infra.cpp are now run
+		// once by kernel_run_global_ctors_once() in kernel_main, and
+		// test_module_mark_ctors_done() was called there too. So
+		// test_module_run()'s internal run_init_array_once() is a
+		// guaranteed no-op here — the ctors are NOT re-run, which would
+		// otherwise re-construct bx_cpu / bx_mem on top of live state.
 		//
-		// Earlier this OOM-halted: a Bochs ctor (icache.o's 4 MiB
-		// pageWriteStampTable) allocates via the global operator new,
-		// and by test-time the kernel heap is mostly used. That is now
-		// fixed — operator new falls back to the 48 MiB Bochs bump pool
-		// (see operator new above) instead of halting, so the walk is
-		// safe. test_module_run() calls run_init_array_once() itself;
-		// that guard prevents a second `test` re-running the ctors.
-		// (We simply do NOT call test_module_mark_ctors_done() here.)
+		// (icache.o's 4 MiB pageWriteStampTable ctor allocates via the
+		// global operator new; that allocation now happens at boot when
+		// the kernel heap is still fresh, and operator new also falls
+		// back to the 48 MiB Bochs bump pool if needed.)
 
 		TestSink sink;
 		sink.put_line = test_sink_put_line;
@@ -7038,8 +7125,24 @@ public:
         }
 
         if (!in_editor) {
-    for (int i = 0; i < line_count && i < 38; i++) {
-        draw_string(buffer[i], x + 5, y + 30 + overlay_dy + i * 10,
+    // How many 10px text lines actually fit between the content-area
+    // top (y + 30 + overlay_dy) and the window's bottom border (y + h).
+    // The old code hard-coded `i < 38`, which — combined with the test
+    // overlay shifting text down by overlay_dy — drew lines past the
+    // bottom border ("overhanging by one"). Compute the real capacity.
+    int content_top = 30 + overlay_dy;
+    int visible_rows = (h - content_top) / 10;
+    if (visible_rows < 1) visible_rows = 1;
+
+    // When the buffer holds more lines than fit, show the most recent
+    // ones (tail) rather than the oldest (head) — otherwise fresh guest
+    // output scrolls off the bottom and stale text stays pinned at top.
+    int first = line_count - visible_rows;
+    if (first < 0) first = 0;
+
+    for (int i = first; i < line_count; i++) {
+        int screen_row = i - first;
+        draw_string(buffer[i], x + 5, y + content_top + screen_row * 10,
                     ColorPalette::TEXT_WHITE);
     }
 } else {
@@ -7709,7 +7812,7 @@ static void elf_io_exit (int slot, int code) {
         ElfProcess& p = elf_processes[slot];
         if (p.terminal) {
             char buf[64];
-            snprintf(buf, sizeof(buf), "[diag] elf_io_exit slot=%d code=%d\n", slot, code);
+            //snprintf(buf, sizeof(buf), "[diag] elf_io_exit slot=%d code=%d\n", slot, code);
             p.terminal->console_print(buf);
         }
         elf_processes[slot].completed = true;
@@ -7987,7 +8090,16 @@ void tick_elf_processes(int steps) {
             int n = 0;
             while (!out_empty(i) && n < 255) tmp[n++] = pop_output(i);
             tmp[n] = 0;
-            if (proc.terminal && n) proc.terminal->console_print(tmp);
+            if (proc.terminal && n) {
+                proc.terminal->console_print(tmp);
+                // Guest produced output. Flag the frame dirty so the main
+                // loop actually repaints. Without this the repaint is
+                // gated on g_evt_dirty / hasNewInput — both only set by
+                // user input — so guest output sat invisibly in the
+                // terminal buffer until the next keypress ("need to press
+                // enter to print the last lot").
+                g_evt_dirty = true;
+            }
         }
 
         if (proc.waiting_for_input && in_empty(i)) continue;
@@ -7999,13 +8111,19 @@ void tick_elf_processes(int steps) {
             int n = 0;
             while (!out_empty(i) && n < 255) tmp[n++] = pop_output(i);
             tmp[n] = 0;
-            if (proc.terminal && n) proc.terminal->console_print(tmp);
+            if (proc.terminal && n) {
+                proc.terminal->console_print(tmp);
+                g_evt_dirty = true;   // see note above
+            }
         }
 
         if (!running) {
             proc.active = false;
             proc.completed = true;
             if (proc.terminal) proc.terminal->captured_elf_slot = -1;
+            // A process just finished — the prompt needs to come back and
+            // any final output needs to show. Repaint this frame.
+            g_evt_dirty = true;
         }
     }
 }
@@ -8467,16 +8585,25 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
     }
 
     // ── Bochs CPU / ELF subsystem ─────────────────────────────────────────────
-    init_elf_system();
+    //
+    // Run the file-scope C++ constructors NOW, before init_elf_system()
+    // and before any code can reach a Bochs entry point. boot.S does not
+    // walk __init_array, so without this the Bochs core objects (bx_cpu,
+    // bx_mem, the CPUID param objects, icache's pageWriteStampTable, ...)
+    // stay as zero-filled BSS with null vtables. The first ELF launched
+    // in the Bochs emulator window would then call bochs_cpu_init() ->
+    // BX_CPU(0)->initialize() against those null vtables and fault out on
+    // its very first tick — the "first-time crash / autoclose" symptom.
+    kernel_run_global_ctors_once();
 
-    // Tell the test module that boot.S already walked __init_array before
-    // kernel_main, so the Bochs C++ global constructors (bx_cpu, bx_mem,
-    // icache pageWriteStampTable, etc.) have already run once. Without this,
-    // the first `test` command re-runs all constructors a second time, which
-    // corrupts already-initialised Bochs state and can overwrite live kernel
-    // heap objects (including the TerminalWindow), killing the window. The
-    // second `test` was fine because g_init_array_done was already 1 by then.
-    //test_module_mark_ctors_done();
+    // The constructors have now run exactly once. Tell the test module so
+    // its own run_init_array_once() inside test_module_run() becomes a
+    // no-op — otherwise the first `test` command would re-run every ctor
+    // a second time, re-constructing bx_cpu / bx_mem on top of live
+    // (already-initialised) Bochs state.
+    test_module_mark_ctors_done();
+
+    init_elf_system();
 
     vga_status("Init complete - entering main loop", 0x0A);
 
