@@ -16,14 +16,7 @@ sudo make clean
 
 make clean && make BOCHS=1
 
-	qemu-system-i386 \
-	    -M q35 \
-	    -cdrom main.iso -boot d \
-	    -m 8000M \
-	    -vga std \
-	    -drive id=disk0,file=disk.img,format=raw,if=none \
-	    -device ahci,id=ahci \
-	    -device ide-hd,drive=disk0,bus=ahci.0
+qemu-system-i386 -M q35 -m 2048M -vga std     -drive id=cd0,file=main.iso,format=raw,if=none,media=cdrom     -drive id=disk0,file=disk.img,format=raw,if=none     -device ahci,id=ahci     -device ide-cd,drive=cd0,bus=ahci.0     -device ide-hd,drive=disk0,bus=ahci.1     -boot d
       
 compatible with SATA drives, currently using port 0
 
