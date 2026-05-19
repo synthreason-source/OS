@@ -19,11 +19,11 @@ static void put_ch(char c) { out_byte(0xE9, (unsigned char)c); }
 static void put_str(const char* s) { while (*s) put_ch(*s++); }
 
 void _start(void) {
-    put_str("HELLO WORLD\n\n");
+    put_str("HELLO\n");
     /* End by deliberately faulting. The injected IDT vector points back
        to a stub that re-faults, which triple-faults Bochs. The host
        catches the panic via setjmp and kills the slot cleanly. The
        kernel keeps running. */
-    //__asm__ volatile("ud2");
-    //for (;;) {}
+    __asm__ volatile("ud2");
+    for (;;) {}
 }
