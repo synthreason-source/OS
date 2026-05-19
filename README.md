@@ -10,4 +10,4 @@ SATA port selection with 'disk_select'
 TODO: more GUI features, get busybox working and test elf functionality.
 
 
-TODO: register keyboard and graphics to bochs emulation window. (test execution available)
+TODO: register keyboard and graphics to bochs emulation window and fix jumping bochs window. (test execution available)
