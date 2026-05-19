@@ -7911,7 +7911,7 @@ static void elf_io_exit (int slot, int code) {
         ElfProcess& p = elf_processes[slot];
         if (p.terminal) {
             char buf[64];
-            snprintf(buf, sizeof(buf), "[diag] elf_io_exit slot=%d code=%d\n", slot, code);
+            //snprintf(buf, sizeof(buf), "[diag] elf_io_exit slot=%d code=%d\n", slot, code);
             p.terminal->console_print(buf);
         }
         elf_processes[slot].completed = true;
