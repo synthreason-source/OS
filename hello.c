@@ -24,7 +24,7 @@ static void put_ch (char c)        { out_byte(0xE9, (unsigned char)c); }
 static void put_str(const char* s) { while (*s) put_ch(*s++); }
 
 void _start(void) {
-    put_str("HELLO\n");
+    put_str("HELLO WORLD\n");
     out_byte(0xE8, 0);                  /* clean exit, code 0 */
     for (;;) { __asm__ volatile("cli; hlt"); }
 }

@@ -5,6 +5,7 @@
  * Unified color palette prevents inconsistencies
  * State machine ensures complete frames with no trailing
  */
+ 
 #include <cstddef>
 #include <cstdarg>
 #include <cstdint>
@@ -5625,6 +5626,31 @@ static constexpr int TERM_HEIGHT = 35;
 static constexpr int TERM_WIDTH  = 120;
 char prompt_buffer[TERM_WIDTH];
 
+// =============================================================================
+// MATRIX ARRAY STORE + DESKTOP SUITE  (patch — see OS-main-patch/INTEGRATION.md)
+// =============================================================================
+#include "matrix_array.h"
+#include "desktop_suite/launcher.h"
+
+// parse "rwxt" → bitmask of NPA_R/W/RX/TX. Default: r+w+x if empty.
+static uint16_t parse_perms(const char* s) {
+    if (!s || !*s) return NPA_R | NPA_W | NPA_RX;
+    uint16_t p = 0;
+    for (; *s; ++s) {
+        switch (*s) {
+            case 'r': case 'R': p |= NPA_R;  break;
+            case 'w': case 'W': p |= NPA_W;  break;
+            case 'x': case 'X': p |= NPA_RX; break;
+            case 't': case 'T': p |= NPA_TX; break;
+            default: break;
+        }
+    }
+    return p;
+}
+
+// NpaPrint adapter — body defined after TerminalWindow is complete.
+void npa_term_print(void* ctx, const char* s);
+
 class TerminalWindow : public Window {
 private:
     // Terminal state
@@ -6369,7 +6395,11 @@ void handle_command() {
 					  "  compile, rm, cp, mv, formatfs, chkdsk (/r /f), select_disk,\n"
 					  "  setpass, removepass, unlock, busybox, pself, killelf,\n"
 					  "  killexec, killrun, aesenc, aesdec, test,\n"
-					  "  bochs <elf-file> [args]  -- run ELF in Bochs emulator window\n");
+					  "  bochs <elf-file> [args]  -- run ELF in Bochs emulator window\n"
+					  "  hello                   -- shortcut: bochs hello\n"
+					  "  matrix help             -- NumPy-style arrays + blocked GEMM\n"
+					  "  launch <app> | clock | calc | paint | snake | mines\n"
+					  "  monitor | inspector | about   -- open desktop apps\n");
 	}
 	else if (strcmp(command, "test") == 0) {
 		// Activate the Bochs self-test module. This runs the same two-
@@ -6663,108 +6693,6 @@ void handle_command() {
         delete[] args_copy;
     }
 	
-    else if (strcmp(command, "busybox") == 0 || strcmp(command, "bb") == 0) {
-        // Launch BusyBox from the embedded ramdisk using the same
-        // segment-loading and lazy-CPU-init pattern as load_and_execute_elf.
-        // bochs_cpu_init() must NOT be called here — only x86_tick's lazy
-        // path may call it (calling from the command handler context freezes
-        // the kernel before the first tick).
-        uint8_t* elf_src = ramdisk_start;
-        uint32_t elf_sz  = (uint32_t)(ramdisk_end - ramdisk_start);
-
-        if (elf_sz < 52 || elf_sz > 8 * 1024 * 1024) {
-            console_print("BusyBox: ramdisk missing or corrupt\n");
-            return;
-        }
-        if (!(elf_src[0] == 0x7f && elf_src[1] == 'E' &&
-              elf_src[2] == 'L'  && elf_src[3] == 'F')) {
-            console_print("BusyBox: invalid ELF magic\n");
-            return;
-        }
-
-        int slot = -1;
-        for (int i = 0; i < MAXelf_processes; i++)
-            if (!elf_processes[i].active) { slot = i; break; }
-        if (slot < 0) { console_print("No free process slots\n"); return; }
-
-        Elf32_Ehdr* ehdr = (Elf32_Ehdr*)elf_src;
-        Elf32_Phdr* phdr = (Elf32_Phdr*)(elf_src + ehdr->e_phoff);
-        uint32_t min_vaddr = 0xFFFFFFFFu, max_vaddr = 0;
-        for (int i = 0; i < ehdr->e_phnum; i++) {
-            if (phdr[i].p_type != PT_LOAD) continue;
-            if (phdr[i].p_vaddr < min_vaddr) min_vaddr = phdr[i].p_vaddr;
-            uint32_t end = phdr[i].p_vaddr + phdr[i].p_memsz;
-            if (end > max_vaddr) max_vaddr = end;
-        }
-        if (min_vaddr == 0xFFFFFFFFu || max_vaddr <= min_vaddr) {
-            console_print("BusyBox: no PT_LOAD segments\n");
-            return;
-        }
-
-        uint32_t imgsize = max_vaddr - min_vaddr;
-        uint32_t memsize = imgsize + ELFHEAPSIZE;
-        if (memsize > 6 * 1024 * 1024) {
-            console_print("BusyBox: process image too large\n");
-            return;
-        }
-
-        ElfProcess& proc = elf_processes[slot];
-        proc = ElfProcess();
-        proc.memory_base = new uint8_t[memsize];
-        if (!proc.memory_base) { console_print("BusyBox: out of memory\n"); return; }
-        memset(proc.memory_base, 0, memsize);
-        proc.memory_size = memsize;
-
-        for (int i = 0; i < ehdr->e_phnum; i++) {
-            if (phdr[i].p_type != PT_LOAD) continue;
-            uint32_t dst_off = phdr[i].p_vaddr - min_vaddr;
-            if (dst_off + phdr[i].p_filesz > memsize ||
-                phdr[i].p_offset + phdr[i].p_filesz > elf_sz) {
-                delete[] proc.memory_base; proc.memory_base = nullptr;
-                console_print("BusyBox: segment out of bounds\n");
-                return;
-            }
-            memcpy(proc.memory_base + dst_off, elf_src + phdr[i].p_offset,
-                   phdr[i].p_filesz);
-            if (phdr[i].p_memsz > phdr[i].p_filesz)
-                memset(proc.memory_base + dst_off + phdr[i].p_filesz, 0,
-                       phdr[i].p_memsz - phdr[i].p_filesz);
-        }
-
-        proc.stack = new uint8_t[ELFSTACKSIZE];
-        if (!proc.stack) {
-            delete[] proc.memory_base; proc.memory_base = nullptr;
-            console_print("BusyBox: out of stack memory\n");
-            return;
-        }
-        memset(proc.stack, 0, ELFSTACKSIZE);
-
-        bochs_activate_slot(slot);
-        bochs_set_process_memory(proc.memory_base, memsize, min_vaddr);
-        bochs_finalize_process_memory();
-
-        proc.entry_point     = ehdr->e_entry;
-        proc.vaddr_base      = min_vaddr;
-        proc.vaddr_end       = max_vaddr;
-        proc.eip             = proc.entry_point;
-        proc.esp             = min_vaddr + imgsize + ELFHEAPSIZE - 16;
-        proc.active          = true;
-        proc.cpu_initialized = false;  // x86_tick lazy path does CPU init
-        proc.completed       = false;
-        proc.waiting_for_input = false;
-        proc.terminal        = this;
-        if (args && *args)
-            strncpy(proc.cmdline, args, 255);
-        else
-            strncpy(proc.cmdline, "sh", 255);
-
-        captured_elf_slot = slot;
-        console_print("BusyBox started (slot ");
-        char snum[8]; snprintf(snum, 8, "%d", slot);
-        console_print(snum);
-        console_print(")\n");
-    }
-
     else if (strcmp(command, "time") == 0) { 
         RTC_Time t = read_rtc(); 
         char buf[64]; 
@@ -6772,102 +6700,6 @@ void handle_command() {
         console_print(buf); 
     }
     else if (strcmp(command, "version") == 0) { console_print("RTOS++ v1.0 - Robust Parsing\n"); }
-
-    // ── 'hello' command: launch the embedded hello test ELF ───────────────
-    // Uses the same segment-loading and lazy-CPU-init pattern as
-    // load_and_execute_elf and the busybox launcher above.
-    // bochs_cpu_init() is intentionally NOT called here — x86_tick's lazy
-    // path handles it on the first tick.
-    else if (strcmp(command, "hello") == 0) {
-        uint8_t* elf_src = hello_start;
-        uint32_t elf_sz  = (uint32_t)(hello_end - hello_start);
-
-        if (elf_sz < 52) {
-            console_print("hello: embedded blob missing\n");
-            return;
-        }
-        if (!(elf_src[0] == 0x7f && elf_src[1] == 'E' &&
-              elf_src[2] == 'L'  && elf_src[3] == 'F')) {
-            console_print("hello: invalid ELF magic\n");
-            return;
-        }
-
-        int slot = -1;
-        for (int i = 0; i < MAXelf_processes; i++)
-            if (!elf_processes[i].active) { slot = i; break; }
-        if (slot < 0) { console_print("No free process slots\n"); return; }
-
-        Elf32_Ehdr* ehdr = (Elf32_Ehdr*)elf_src;
-        Elf32_Phdr* phdr = (Elf32_Phdr*)(elf_src + ehdr->e_phoff);
-        uint32_t min_vaddr = 0xFFFFFFFFu, max_vaddr = 0;
-        for (int i = 0; i < ehdr->e_phnum; i++) {
-            if (phdr[i].p_type != PT_LOAD) continue;
-            if (phdr[i].p_vaddr < min_vaddr) min_vaddr = phdr[i].p_vaddr;
-            uint32_t end = phdr[i].p_vaddr + phdr[i].p_memsz;
-            if (end > max_vaddr) max_vaddr = end;
-        }
-        if (min_vaddr == 0xFFFFFFFFu || max_vaddr <= min_vaddr) {
-            console_print("hello: no PT_LOAD segments\n");
-            return;
-        }
-
-        uint32_t imgsize = max_vaddr - min_vaddr;
-        uint32_t memsize = imgsize + ELFHEAPSIZE;
-        if (memsize > 2 * 1024 * 1024) {
-            console_print("hello: process image too large\n");
-            return;
-        }
-
-        ElfProcess& proc = elf_processes[slot];
-        proc = ElfProcess();
-        proc.memory_base = new uint8_t[memsize];
-        if (!proc.memory_base) { console_print("hello: out of memory\n"); return; }
-        memset(proc.memory_base, 0, memsize);
-        proc.memory_size = memsize;
-
-        for (int i = 0; i < ehdr->e_phnum; i++) {
-            if (phdr[i].p_type != PT_LOAD) continue;
-            uint32_t dst_off = phdr[i].p_vaddr - min_vaddr;
-            if (dst_off + phdr[i].p_filesz > memsize ||
-                phdr[i].p_offset + phdr[i].p_filesz > elf_sz) {
-                delete[] proc.memory_base; proc.memory_base = nullptr;
-                console_print("hello: segment out of bounds\n");
-                return;
-            }
-            memcpy(proc.memory_base + dst_off, elf_src + phdr[i].p_offset,
-                   phdr[i].p_filesz);
-            if (phdr[i].p_memsz > phdr[i].p_filesz)
-                memset(proc.memory_base + dst_off + phdr[i].p_filesz, 0,
-                       phdr[i].p_memsz - phdr[i].p_filesz);
-        }
-
-        proc.stack = new uint8_t[ELFSTACKSIZE];
-        if (!proc.stack) {
-            delete[] proc.memory_base; proc.memory_base = nullptr;
-            console_print("hello: out of stack memory\n");
-            return;
-        }
-        memset(proc.stack, 0, ELFSTACKSIZE);
-
-        bochs_activate_slot(slot);
-        bochs_set_process_memory(proc.memory_base, memsize, min_vaddr);
-        bochs_finalize_process_memory();
-
-        proc.entry_point     = ehdr->e_entry;
-        proc.vaddr_base      = min_vaddr;
-        proc.vaddr_end       = max_vaddr;
-        proc.eip             = proc.entry_point;
-        proc.esp             = min_vaddr + imgsize + ELFHEAPSIZE - 16;
-        proc.active          = true;
-        proc.cpu_initialized = false;  // x86_tick lazy path does CPU init
-        proc.completed       = false;
-        proc.waiting_for_input = false;
-        proc.terminal        = this;
-        proc.cmdline[0]      = 0;
-
-        captured_elf_slot = slot;
-        console_print("hello started.\n");
-    }
 
     // ── 'bochs <elf>' command ─────────────────────────────────────────────
     // Explicit front-end for running a FAT32 ELF under the Bochs x86
@@ -6943,6 +6775,158 @@ void handle_command() {
             }
         }
     }
+
+    // ===================================================================
+    // PATCH: matrix array store + desktop suite commands
+    // ===================================================================
+
+    // ----- matrix --------------------------------------------------------
+    //   matrix create <name> <rows> <cols> [perms=rwx]
+    //   matrix list                       (alias: matrix ls)
+    //   matrix show <name>
+    //   matrix gemm <A> <B> <C>           (C = A . B, blocked tile=4x4)
+    //   matrix perms <name> <rwxt>
+    //   matrix rm <name>
+    else if (strcmp(command, "matrix") == 0) {
+        TerminalWindow* term = this;
+        char* sub = get_arg(args, 0);
+        if (!sub || strcmp(sub, "help") == 0) {
+            console_print(
+                "matrix: NumPy-style storage arrays + blocked GEMM\n"
+                "  matrix create <name> <rows> <cols> [perms=rwx]\n"
+                "  matrix list\n"
+                "  matrix show   <name>\n"
+                "  matrix gemm   <A> <B> <C>      # C = A . B  (i32, tile 4x4)\n"
+                "  matrix perms  <name> <rwxt>    # set capability bits\n"
+                "  matrix rm     <name>\n"
+                "perms: r=read w=write x=kernel-exec t=transmit\n");
+            return;
+        }
+        // append ".npa" if missing
+        auto with_ext = [](const char* n, char* out, int cap) -> const char* {
+            if (!n || !*n) return nullptr;
+            int len = 0; while (n[len] && len < cap - 5) len++;
+            bool has_ext = false;
+            if (len >= 4 && n[len-4] == '.' &&
+                n[len-3] == 'n' && n[len-2] == 'p' && n[len-1] == 'a') has_ext = true;
+            for (int i = 0; i < len; ++i) out[i] = n[i];
+            if (!has_ext) { out[len++]='.'; out[len++]='n'; out[len++]='p'; out[len++]='a'; }
+            out[len] = '\0';
+            return out;
+        };
+
+        if (strcmp(sub, "create") == 0) {
+            char* name = get_arg(args, 1);
+            char* rs   = get_arg(args, 2);
+            char* cs   = get_arg(args, 3);
+            char* ps   = get_arg(args, 4);
+            if (!name || !rs || !cs) {
+                console_print("Usage: matrix create <name> <rows> <cols> [perms=rwx]\n"); return;
+            }
+            char nbuf[64]; const char* fn = with_ext(name, nbuf, sizeof(nbuf));
+            uint16_t perms = parse_perms(ps);
+            int rc = npa_create(fn, (uint32_t)simple_atoi(rs), (uint32_t)simple_atoi(cs), perms, 0);
+            if (rc == 0) { console_print("matrix: created "); console_print(fn); console_print("\n"); }
+            else { console_print("matrix: create failed (rc=");
+                   char b[8]; int_to_string(rc, b); console_print(b); console_print(")\n"); }
+            return;
+        }
+        if (strcmp(sub, "list") == 0 || strcmp(sub, "ls") == 0) {
+            const char* names[] = { "A.npa", "B.npa", "C.npa", "D.npa", "E.npa", "F.npa", 0 };
+            bool any = false;
+            for (int i = 0; names[i]; ++i) {
+                ArrayHeader h; void* d = nullptr;
+                if (npa_load(names[i], &h, &d) == 0) {
+                    npa_print_header(npa_term_print, term, names[i], h);
+                    delete[] (uint8_t*)d;
+                    any = true;
+                }
+            }
+            if (!any) console_print("matrix: no arrays found (try: matrix create A 8 8)\n");
+            return;
+        }
+        if (strcmp(sub, "show") == 0) {
+            char* name = get_arg(args, 1);
+            if (!name) { console_print("Usage: matrix show <name>\n"); return; }
+            char nbuf[64]; const char* fn = with_ext(name, nbuf, sizeof(nbuf));
+            ArrayHeader h; void* d = nullptr;
+            int rc = npa_load(fn, &h, &d);
+            if (rc != 0) { console_print("matrix: load failed\n"); return; }
+            if (!npa_has(h, NPA_R)) {
+                console_print("matrix: R denied on "); console_print(fn); console_print("\n");
+                delete[] (uint8_t*)d; return;
+            }
+            npa_print_header(npa_term_print, term, fn, h);
+            npa_print_data  (npa_term_print, term, h, d, 8, 8);
+            delete[] (uint8_t*)d;
+            return;
+        }
+        if (strcmp(sub, "gemm") == 0) {
+            char* a = get_arg(args, 1), *b = get_arg(args, 2), *c = get_arg(args, 3);
+            if (!a || !b || !c) { console_print("Usage: matrix gemm <A> <B> <C>\n"); return; }
+            char ab[64], bb[64], cb[64];
+            const char* fa = with_ext(a, ab, sizeof(ab));
+            const char* fb = with_ext(b, bb, sizeof(bb));
+            const char* fc = with_ext(c, cb, sizeof(cb));
+            int rc = npa_gemm(fa, fb, fc);
+            if (rc == 0) { console_print("matrix: gemm OK -> "); console_print(fc); console_print("\n"); }
+            else {
+                console_print("matrix: gemm failed (rc=");
+                char bf[8]; int_to_string(rc, bf); console_print(bf);
+                console_print(")  -20=R-denied -21=shape -22=dtype -23=W-denied -24=C-shape\n");
+            }
+            return;
+        }
+        if (strcmp(sub, "perms") == 0) {
+            char* name = get_arg(args, 1), *ps2 = get_arg(args, 2);
+            if (!name || !ps2) { console_print("Usage: matrix perms <name> <rwxt>\n"); return; }
+            char nbuf[64]; const char* fn = with_ext(name, nbuf, sizeof(nbuf));
+            ArrayHeader h; void* d = nullptr;
+            if (npa_load(fn, &h, &d) != 0) { console_print("matrix: load failed\n"); return; }
+            h.perms = parse_perms(ps2);
+            h.ver_num++;
+            int rc = npa_save(fn, &h, d);
+            delete[] (uint8_t*)d;
+            console_print(rc == 0 ? "matrix: perms updated\n" : "matrix: save failed\n");
+            return;
+        }
+        if (strcmp(sub, "rm") == 0) {
+            char* name = get_arg(args, 1);
+            if (!name) { console_print("Usage: matrix rm <name>\n"); return; }
+            char nbuf[64]; const char* fn = with_ext(name, nbuf, sizeof(nbuf));
+            fat32_remove_file(fn);
+            console_print("matrix: removed "); console_print(fn); console_print("\n");
+            return;
+        }
+        console_print("matrix: unknown subcommand. Try `matrix help`.\n");
+    }
+    // ----- desktop suite launchers --------------------------------------
+    else if (strcmp(command, "launch") == 0 || strcmp(command, "open") == 0) {
+        char* app = get_arg(args, 0);
+        if (!app) {
+            console_print("Usage: launch <app>\nApps:");
+            for (const char** nm = desktop_app_names(); *nm; ++nm) {
+                console_print(" "); console_print(*nm);
+            }
+            console_print("\n");
+            return;
+        }
+        if (!desktop_launch(app, &wm)) {
+            console_print("launch: unknown app '"); console_print(app); console_print("'\n");
+        }
+    }
+    else if (strcmp(command, "clock")      == 0) { desktop_launch("clock",   &wm); }
+    else if (strcmp(command, "calc")       == 0
+          || strcmp(command, "calculator") == 0) { desktop_launch("calc",    &wm); }
+    else if (strcmp(command, "paint")      == 0) { desktop_launch("paint",   &wm); }
+    else if (strcmp(command, "snake")      == 0) { desktop_launch("snake",   &wm); }
+    else if (strcmp(command, "mines")      == 0
+          || strcmp(command, "minesweeper")== 0) { desktop_launch("mines",   &wm); }
+    else if (strcmp(command, "monitor")    == 0
+          || strcmp(command, "sysmon")     == 0
+          || strcmp(command, "top")        == 0) { desktop_launch("monitor", &wm); }
+    else if (strcmp(command, "inspector")  == 0) { desktop_launch("matrix",  &wm); }
+    else if (strcmp(command, "about")      == 0) { desktop_launch("about",   &wm); }
 
     // Fall-through: try to handle 'command' as an ELF file from FAT32.
     // The ELF runs inside the Bochs CPU emulator via x86_tick / cpu_loop.
@@ -7590,6 +7574,13 @@ public:
         update_prompt_display();
     }
 };
+
+// NpaPrint adapter — forwards into a TerminalWindow*. Forward-declared
+// above so the matrix command handler can take its address before
+// TerminalWindow is complete; defined here now that the type is whole.
+void npa_term_print(void* ctx, const char* s) {
+    static_cast<TerminalWindow*>(ctx)->console_print(s);
+}
 
 // TestSink::put_line implementation. Defined here because it needs the
 // complete TerminalWindow type to route text into the window that owns
@@ -8876,6 +8867,7 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
         if (++poll_counter >= 500) {
             poll_counter  = 0;
             g_evt_timer   = true;
+			g_evt_dirty = true;
             g_timer_ticks++;
         }
 
