@@ -338,6 +338,10 @@ extern "C" void bochs_register_io_callbacks(
     void (*write_cb)(int, char),
     void (*exit_cb )(int, int));
 extern "C" bool bochs_process_wants_input(int slot);
+// Heavy "reset everything" — called between ELF runs so each launch
+// starts from the same state as the first one. See the comment block
+// over its definition in bochs_glue.cpp for the full rationale.
+extern "C" void bochs_reset_all_slots();
 
 // Forward declarations for the ELF loader helpers and IO callbacks defined
 // later in this file. busybox/hello use the same lazy-init pattern as
@@ -7098,7 +7102,26 @@ int load_and_execute_elf(const char* filename, const char* args, TerminalWindow*
 
         proc->entry_point = ehdr.e_entry;
         proc->eip = proc->entry_point;
-        proc->esp = proc->vaddr_base + proc->memory_size - ELFHEAPSIZE - 16;
+        // ESP sits at the TOP of the slab, growing down. The previous
+        // formula was `vaddr_base + memory_size - ELFHEAPSIZE - 16`,
+        // which evaluated to `vaddr_base + imgsize - 16` — i.e. just
+        // BELOW the end of the loaded image, INSIDE .rodata/.data.
+        // For a small hello-world that mostly worked because only a
+        // handful of pushes happened before the program exited, but
+        // it was timing/luck dependent: the first push of %ebp at
+        // [esp-4] could clobber whatever was at slab offset
+        // imgsize-20, and a longer or differently-laid-out program
+        // could see the program's own data corrupted by the stack.
+        //
+        // Correct layout (slab grows up; addresses increase →):
+        //     [ image (text/rodata/data/bss) ][ heap/stack arena ]
+        //     ^vaddr_base                    ^brk                ^ESP
+        // The brk grows up from end-of-image; ESP grows down from the
+        // top. They share the ELFHEAPSIZE-byte arena and collide only
+        // if the program both heap-allocates a lot AND nests deep.
+        // The dedicated 64 KB `stack` allocation (proc->stack) is
+        // historical scratch — it is NOT wired to ESP.
+        proc->esp = proc->vaddr_base + proc->memory_size - 16;
         proc->active = true;
         proc->cpu_initialized = false;
         proc->waiting_for_input = false;
@@ -8015,6 +8038,15 @@ static void elf_io_exit (int slot, int code) {
         // earlier output. The diagnostic is disabled by default and the
         // commented-out snprintf is left in case it's useful for hand
         // debugging; do NOT call console_print on uninitialized memory.
+        //
+        // NOTE: we deliberately do NOT free memory_base/stack here.
+        // This callback fires from inside Bochs's cpu_loop (via
+        // bochs_guest_exit), which can still touch the slab on its
+        // way out — TLB writebacks, async event handling, etc.
+        // Freeing here would be a use-after-free. The actual teardown
+        // (free memory, unregister the slot's Bochs mapping, reset
+        // cpu_initialized) happens in tick_elf_processes once
+        // x86_tick has fully unwound.
         (void)code;
         elf_processes[slot].completed = true;
         elf_processes[slot].active    = false;
@@ -8254,8 +8286,31 @@ static bool x86_tick(int slot, int steps) {
     }
 
     x86_breadcrumb(6, 'T');
+
+    // Diagnostic: snapshot EIP BEFORE tick so we can detect an unexpected
+    // jump back to entry after the tick. (Don't enable unconditionally —
+    // gated on the very-recent-restart condition below so normal output
+    // isn't polluted.)
+    uint32_t eip_before = bochs_cpu_get_eip();
+
     bochs_cpu_tick(steps);
     x86_breadcrumb(7, 't');
+
+    // Diagnostic restart detector. If EIP was WELL PAST the entry point
+    // before this tick (i.e. we were mid-execution) and is now back AT
+    // the entry point or within a few bytes of it, something rewound
+    // the CPU. Emit '?' into the output buffer so it's visible in the
+    // terminal at the exact point the restart occurred. This pins down
+    // whether the "8 chars then restart" symptom is the CPU genuinely
+    // re-entering _start or something else (e.g. icache returning a
+    // stale decoded trace that points at the entry).
+    uint32_t eip_after = bochs_cpu_get_eip();
+    if (eip_before > proc.entry_point + 16 &&
+        eip_after  < proc.entry_point + 16 &&
+        eip_after >= proc.entry_point) {
+        push_output(slot, '?');
+    }
+
 
     // ─── FIX: detect clean guest-exit signal ──────────────────────────────
     // bochs_guest_exit() (triggered by an `out %al, $0xE8` from the IDT
@@ -8278,6 +8333,8 @@ static bool x86_tick(int slot, int steps) {
 }
 // And definition without default:
 void tick_elf_processes(int steps) {
+    bool any_exited_this_frame = false;
+
     for (int i = 0; i < MAX_ELF_PROCESSES; ++i) {
         ElfProcess& proc = elf_processes[i];
         // Drain output and step a process that is alive: active and not
@@ -8325,6 +8382,53 @@ void tick_elf_processes(int steps) {
             // A process just finished — the prompt needs to come back and
             // any final output needs to show. Repaint this frame.
             g_evt_dirty = true;
+
+            // ── Per-slot kernel-side teardown ────────────────────────
+            // Free the slab and stack we allocated in load_and_execute_elf,
+            // and clear cpu_initialized so the NEXT process that lands in
+            // this slot re-runs the lazy-init path from scratch.
+            //
+            // We do NOT touch the Bochs glue here. The glue side gets a
+            // single heavy `bochs_reset_all_slots()` call at the end of
+            // this function (see below) — that wipes every per-slot
+            // mapping AND hardware-resets BX_CPU(0), so launch N starts
+            // from the same state as launch 1. Trying to keep the glue
+            // "incrementally consistent" with surgical per-slot updates
+            // had a long history of subtle bugs (the second `bochs hello`
+            // looping "HELLO WOHELLO WO..." because some untracked CPU
+            // field survived across slot reuse). The big-hammer reset
+            // is cheap and unambiguous.
+            if (proc.memory_base) { delete[] proc.memory_base; proc.memory_base = nullptr; }
+            if (proc.stack)       { delete[] proc.stack;       proc.stack       = nullptr; }
+            proc.memory_size     = 0;
+            proc.cpu_initialized = false;
+
+            any_exited_this_frame = true;
+        }
+    }
+
+    // ── Deferred glue-wide reset ────────────────────────────────────
+    // If any process exited this frame AND no other Bochs-emulated
+    // process is still running, wipe Bochs's glue state back to its
+    // post-boot baseline. The next launch will then start from the
+    // same state as launch #1.
+    //
+    // CRITICAL: do NOT reset while another slot is still running.
+    // bochs_reset_all_slots() unmaps every slab and hardware-resets
+    // BX_CPU(0); doing that to a live slot drops its EIP/CRs/segments
+    // back to the post-reset state. On the very next frame, x86_tick
+    // would re-enter the lazy-init path and bochs_cpu_set_eip would
+    // restart the guest from _start. The visible symptom is a runaway
+    // window spamming "HELLO WOHELLO WO..." for as long as another
+    // window is finishing — exactly because every frame's exit on
+    // window B triggered a reset that restarted window A from the top.
+    if (any_exited_this_frame) {
+        bool any_still_active = false;
+        for (int j = 0; j < MAX_ELF_PROCESSES; ++j) {
+            if (elf_processes[j].active) { any_still_active = true; break; }
+        }
+        if (!any_still_active) {
+            bochs_reset_all_slots();
         }
     }
 }

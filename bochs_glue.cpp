@@ -283,21 +283,18 @@ static void mapping_unregister(SlotState& s) {
 //
 // Layout at the start of every slot's slab:
 //
-//   0x000..0x006   exit-trap stub:
-//                    mov $0, %al ; out %al, $0xE8 ; hlt ; jmp .
 //   0x080..0x098   GDT (3 entries: null / flat code / flat data)
+//   0x0E0..0x0E6   exit-trap stub:
+//                    mov $0, %al ; out %al, $0xE8 ; hlt ; jmp .
 //   0x100..0x900   IDT (256 entries, all pointing at the exit stub)
 //
-// The slab base lives at vaddr_base. The guest's program image starts
-// later in the slab (e.g. ELF _start at 0x08048000 with vaddr_base
-// 0x08048000 places _start AT slab offset 0). We inject AFTER the
-// kernel's ELF loader has placed PT_LOAD sections. If a PT_LOAD has
-// already occupied our stub offset, we place the stub at 0x10
-// instead. If even that is taken, we leave the IDT vectors pointing
-// at whatever happens to be at offset 0 — the guest will most likely
-// just continue executing past the fault into program memory, which
-// is what we want (it can't fault out without our cooperation, but
-// it can still exit cleanly via port 0xE8 if it chooses to).
+// The slab base lives at vaddr_base. The kernel-injected band
+// 0x80..0xFF is reserved — any ELF PT_LOAD that overlaps it gets
+// partially overwritten. The stub MUST live inside this band so it
+// can't be clobbered by a PT_LOAD that happens to start at slab
+// offset 0 (which is the common case for ELFs with low-vaddr first
+// segments, e.g. our hello binary whose first PT_LOAD lands the
+// ELF header at slab offset 0).
 
 static void inject_slab_tables(SlotState& s) {
     if (!s.mem_base || s.mem_size < 0x1000) return;
@@ -309,26 +306,29 @@ static void inject_slab_tables(SlotState& s) {
         0xEB, 0xFE,         // jmp  .  (safety: spin if hlt resumes)
     };
 
-    auto bytes_zero = [](const Bit8u* p, unsigned n) {
-        for (unsigned i = 0; i < n; ++i) if (p[i]) return false;
-        return true;
-    };
-
-    // Pick a stub offset. Try 0 first; if occupied, try 0x10.
-    Bit32u stub_off = 0xFFFFFFFFu;
-    if (bytes_zero(s.mem_base, sizeof(stub))) {
-        stub_off = 0x000;
-    } else if (bytes_zero(s.mem_base + 0x10, sizeof(stub))) {
-        stub_off = 0x010;
-    }
-    if (stub_off != 0xFFFFFFFFu) {
-        __builtin_memcpy(s.mem_base + stub_off, stub, sizeof(stub));
-    } else {
-        // No safe spot; leave stub_off at 0 and accept that IDT
-        // vectors will land in program code. Most guests don't
-        // intentionally raise interrupts, so this is rarely reached.
-        stub_off = 0;
-    }
+    // Place the stub at a FIXED offset inside the GDT/IDT injection
+    // band (0x80..0xFF). This band is reserved for kernel-injected
+    // tables — any ELF whose first PT_LOAD reaches into here is
+    // already going to have its 0x80..0x97 trampled by the GDT we
+    // write below, so the existing contract is "the kernel owns
+    // 0x80..0xFF; PT_LOADs that overlap will be partially overwritten."
+    // We extend that contract to also cover 0xE0..0xE6 for the stub.
+    //
+    // Why this matters: the previous logic tried offset 0, then 0x10,
+    // then gave up and left IDT vectors pointing at slab offset 0 —
+    // which for a typical ELF contains the program's loaded header
+    // bytes (e.g. "7F 45 4C 46 ..."). Any guest exception then
+    // vectored to that garbage, the garbage faulted again, and the
+    // guest looped (visible as "HELLO WOHELLO WO..." in the
+    // emulator window when the guest itself started getting
+    // re-entered from the top after a fault). hello.c's comment
+    // header describes this exact failure mode.
+    //
+    // Putting the stub at a fixed offset eliminates the fallback
+    // entirely: the IDT always points somewhere valid, and a fault
+    // always exits the slot cleanly via port 0xE8.
+    Bit32u stub_off = 0xE0;
+    __builtin_memcpy(s.mem_base + stub_off, stub, sizeof(stub));
 
     // ── GDT at slab offset 0x80 ────────────────────────────────────
     // Three descriptors:
@@ -730,6 +730,84 @@ extern "C" void bochs_register_io_callbacks(
     g_slots[slot].read_cb  = read_cb;
     g_slots[slot].write_cb = write_cb;
     g_slots[slot].exit_cb  = exit_cb;
+}
+
+// ── Heavy "reset everything to known state" entry point ──────────────
+//
+// Called by the kernel after a Bochs-emulated process exits. Brings
+// the entire glue layer back to the same state it was in just after
+// boot — every slot unmapped, every per-slot CPU snapshot wiped,
+// BX_CPU(0) hardware-reset, no active slot.
+//
+// Rationale: incremental save/restore across slot relaunches kept
+// surfacing subtle residual-state bugs (the second `bochs hello`
+// would loop printing "HELLO WOHELLO WO..." while the first ran
+// clean). slot_save_cpu / slot_restore_cpu only cover the
+// architectural register set we explicitly track; CPU fields we
+// don't track (FPU/SSE/AVX state, MSR shadows, DR0-7, TR, LDTR,
+// alignment-check shadow, lazy-EFLAGS shadow, hidden segment-
+// descriptor cache bits) survived across launches and at least
+// one of them was poisoning the second guest's execution.
+//
+// Rather than play whack-a-mole, the kernel now treats each ELF
+// launch as a fresh boot from the glue's perspective. The cost is
+// one BX_CPU(0)->reset(BX_RESET_HARDWARE) per launch — small next
+// to ELF loading — and it makes launch N identical to launch 1
+// for every N.
+//
+// What this preserves (intentionally):
+//   • registered I/O callbacks (read_cb/write_cb/exit_cb) — these
+//     belong to the kernel slot, not the guest process. The next
+//     guest in the same slot still wants the same callbacks.
+//   • g_global_init_done — Bochs's one-shot global init must not
+//     be re-run; init_memory and friends are not idempotent on
+//     re-entry.
+//   • the registered slot_id — same reasoning as callbacks.
+extern "C" void bochs_reset_all_slots() {
+    if (!g_global_init_done) return;   // nothing to reset yet
+
+    // Drop every mapping. mapping_unregister is a no-op for slots
+    // that aren't currently mapped, so this is safe to call on all
+    // of them unconditionally.
+    for (int i = 0; i < MAX_BOCHS_SLOTS; ++i) {
+        SlotState& s = g_slots[i];
+        mapping_unregister(s);
+        s.mem_base   = nullptr;
+        s.mem_size   = 0;
+        s.vaddr_base = 0;
+        s.brk_ptr    = 0;
+        s.wants_input = false;
+        s.cpu_primed = false;
+
+        // Wipe the saved CPU snapshot. Setting valid=false is the
+        // signal to bochs_activate_slot that there's nothing to
+        // restore — the next bochs_set_process_memory call will
+        // re-prime it from scratch.
+        __builtin_memset(&s.cpu, 0, sizeof(s.cpu));
+    }
+
+    // Forget which slot was active. The next bochs_activate_slot
+    // call will see "no previous slot" and skip the save path.
+    g_active_slot = -1;
+
+    // Hardware-reset the live CPU. This wipes every CPU field
+    // including the ones we don't explicitly save/restore — FPU,
+    // SSE/AVX, MSRs, debug regs, hidden segment cache bits, etc.
+    // After this, bochs_set_process_memory's slot_prime_cpu +
+    // slot_restore_cpu + flush_after_switch sequence brings the
+    // CPU into the correct flat-32 protected-mode configuration
+    // for the new guest.
+    //
+    // Clear sticky yield flags that reset() may have set, the same
+    // way bochs_global_init() does after its boot-time reset.
+    BX_CPU(0)->reset(BX_RESET_HARDWARE);
+    BX_CPU(0)->async_event          = 0;
+    bx_pc_system.kill_bochs_request = 0;
+    g_exit_pending                  = 0;
+
+    // Flush every Bochs cache that might still reference a slab
+    // mapping or decoded instruction from the previous guest.
+    flushICaches();
 }
 
 // Switch active slot. If a different slot was active before, snapshot
