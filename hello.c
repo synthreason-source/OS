@@ -25,5 +25,5 @@ void _start(void) {
        catches the panic via setjmp and kills the slot cleanly. The
        kernel keeps running. */
     __asm__ volatile("ud2");
-    for (;;) {}
+    //for (;;) {}
 }

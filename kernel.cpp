@@ -7420,8 +7420,18 @@ public:
 		    // BUSYBOX CAPTURE
 			if (captured_elf_slot >= 0) {
 			// Echo + feed
-			char echo[2] = {c, 0};
-			console_print(echo);
+			// Only echo printable bytes + newline/tab. Echoing arbitrary
+			// key codes (modifier-key scancodes, arrow keys, etc.) drops
+			// bytes 0-31 / 127 into the terminal buffer where they render
+			// as blank spaces in font.h — the same mechanism that produced
+			// the "HELL O" rendering bug. The raw byte still goes to the
+			// ELF's stdin via push_input below, so applications that want
+			// to interpret special keys still see them.
+			unsigned char uc = (unsigned char)c;
+			if (uc == '\n' || uc == '\t' || (uc >= 32 && uc < 127)) {
+				char echo[2] = {c, 0};
+				console_print(echo);
+			}
 			push_input(captured_elf_slot, c);
 			if (c == '\n') elf_processes[captured_elf_slot].waiting_for_input = false;
 			return;
@@ -7470,13 +7480,37 @@ public:
     void console_print(const char* s) override {
         if (!s || in_editor) return;
 
+        // ── Sanitize input ────────────────────────────────────────────────
+        // Filter to printable ASCII plus the whitespace we explicitly handle
+        // (\n, \t). Without this, any byte 0-31 or 127 in `s` (uninitialized
+        // stack memory, echoed modifier keys, stray emulator garbage, etc.)
+        // gets stuffed verbatim into the terminal buffer. Those bytes have
+        // empty glyphs in font.h, so they RENDER AS BLANK SPACES — visually
+        // identical to U+0020. This is the root cause of bugs like
+        // "HELLO" displaying as "HELL O": a stray control byte landed in
+        // the buffer between L and O. \r is converted to \n for safety;
+        // \b is intentionally NOT supported here (the legitimate guest
+        // output paths don't emit it, and accepting it would let stray
+        // 0x08 bytes erase real output).
+        char clean[512];
+        int  cn = 0;
+        for (const char* p = s; *p && cn < (int)sizeof(clean) - 1; ++p) {
+            unsigned char c = (unsigned char)*p;
+            if (c == '\n' || c == '\t')             clean[cn++] = (char)c;
+            else if (c == '\r')                     clean[cn++] = '\n';
+            else if (c >= 32 && c < 127)            clean[cn++] = (char)c;
+            // else: drop (would render blank and corrupt the display).
+        }
+        clean[cn] = '\0';
+        if (cn == 0) return;
+
         int saved_prompt_lines = prompt_visual_lines;
         if (saved_prompt_lines > 0) {
             remove_last_n_lines(saved_prompt_lines);
             prompt_visual_lines = 0;
         }
 
-        push_wrapped_text(s, term_cols_cont());
+        push_wrapped_text(clean, term_cols_cont());
         update_prompt_display();
     }
 };
@@ -7907,13 +7941,14 @@ static int  elf_io_read (int slot) { return pop_input(slot); }
 static void elf_io_write(int slot, char c) { push_output(slot, c); }
 static void elf_io_exit (int slot, int code) {
     if (slot >= 0 && slot < MAX_ELF_PROCESSES) {
-        // Print the cause to the terminal before tearing down.
-        ElfProcess& p = elf_processes[slot];
-        if (p.terminal) {
-            char buf[64];
-            //snprintf(buf, sizeof(buf), "[diag] elf_io_exit slot=%d code=%d\n", slot, code);
-            p.terminal->console_print(buf);
-        }
+        // The diagnostic print was using an UNINITIALIZED `buf[64]`. That
+        // shoved whatever stack garbage was sitting there into the
+        // terminal — sometimes empty, sometimes including control bytes
+        // that render as blank spaces in font.h and silently corrupt
+        // earlier output. The diagnostic is disabled by default and the
+        // commented-out snprintf is left in case it's useful for hand
+        // debugging; do NOT call console_print on uninitialized memory.
+        (void)code;
         elf_processes[slot].completed = true;
         elf_processes[slot].active    = false;
     }
