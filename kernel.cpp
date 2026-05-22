@@ -6368,7 +6368,8 @@ void handle_command() {
 		console_print("Commands: help, clear, version, time, ps, ls, edit, run, exec,\n"
 					  "  compile, rm, cp, mv, formatfs, chkdsk (/r /f), select_disk,\n"
 					  "  setpass, removepass, unlock, busybox, pself, killelf,\n"
-					  "  killexec, killrun, aesenc, aesdec, test\n");
+					  "  killexec, killrun, aesenc, aesdec, test,\n"
+					  "  bochs <elf-file> [args]  -- run ELF in Bochs emulator window\n");
 	}
 	else if (strcmp(command, "test") == 0) {
 		// Activate the Bochs self-test module. This runs the same two-
@@ -6866,6 +6867,81 @@ void handle_command() {
 
         captured_elf_slot = slot;
         console_print("hello started.\n");
+    }
+
+    // ── 'bochs <elf>' command ─────────────────────────────────────────────
+    // Explicit front-end for running a FAT32 ELF under the Bochs x86
+    // emulator.  Always spawns a dedicated emulator TerminalWindow (like
+    // the fall-through branch) so the user gets a named window regardless
+    // of whether they typed from a shell or an emulator window.
+    //
+    //   bochs <filename>          — run ELF with no args
+    //   bochs <filename> [args…]  — run ELF and pass remaining tokens as args
+    //
+    // The kernel's Bochs self-test (test_module_run) is NOT re-run here;
+    // the CPU is already initialised by kernel_main.  The new emulator
+    // window picks up from the lazy-init path in x86_tick exactly the same
+    // way as every other ELF launch in this kernel.
+    else if (strcmp(command, "bochs") == 0) {
+        // args currently points at "<filename> [rest…]".  Split off the
+        // filename so we can validate it before spawning the window.
+        char* elf_name = get_arg(args, 0);
+        if (!elf_name || !*elf_name) {
+            console_print("Usage: bochs <elf-file> [args...]\n");
+        } else {
+            // Advance past the filename to collect any trailing arguments
+            // that should be forwarded to the ELF process.
+            char* elf_args = elf_name;
+            while (*elf_args && *elf_args != ' ') elf_args++;
+            if (*elf_args) { *elf_args = '\0'; elf_args++; }
+            while (*elf_args == ' ') elf_args++;
+
+            // Probe FAT32 to confirm the file exists and is an ELF.
+            fat_dir_entry_t entry;
+            uint32_t sec = 0, off = 0;
+            bool found_elf = false;
+            if (fat32_find_entry(elf_name, &entry, &sec, &off) == 0) {
+                char* probe = fat32_read_file_as_string(elf_name);
+                if (probe) {
+                    if (entry.file_size >= 4 &&
+                        (uint8_t)probe[0] == 0x7F &&
+                        probe[1] == 'E' && probe[2] == 'L' && probe[3] == 'F') {
+                        found_elf = true;
+                    }
+                    delete[] probe;
+                }
+            }
+
+            if (!found_elf) {
+                console_print("bochs: '");
+                console_print(elf_name);
+                console_print("': ELF not found on disk\n");
+            } else {
+                // Build the startup command string the new emulator window
+                // will re-execute on its first update(): "<name> [args]"
+                char startup_buf[256];
+                int n = 0;
+                for (const char* p = elf_name; *p && n < 253; ++p)
+                    startup_buf[n++] = *p;
+                if (elf_args && *elf_args) {
+                    if (n < 253) startup_buf[n++] = ' ';
+                    for (const char* p = elf_args; *p && n < 253; ++p)
+                        startup_buf[n++] = *p;
+                }
+                startup_buf[n] = '\0';
+
+                console_print("bochs: launching '");
+                console_print(elf_name);
+                console_print("' in Bochs emulator window...\n");
+
+                static int bochs_win_count = 0;
+                int idx = bochs_win_count++ % 10;
+                int o   = idx * 30;
+                wm.add_window(new TerminalWindow(180 + o, 110 + o,
+                                                 startup_buf,
+                                                 /*emulator_mode=*/true));
+            }
+        }
     }
 
     // Fall-through: try to handle 'command' as an ELF file from FAT32.
@@ -8700,6 +8776,9 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
 
     // ── AHCI disk + FAT32 ─────────────────────────────────────────────────────
     disk_init();
+	const char disk[1] = {'1'};
+	cmd_list_and_select_disk(disk);
+
     if (ahci_base) {
         fat32_init();
         wm.print_to_focused("Disk: AHCI found.\n");
