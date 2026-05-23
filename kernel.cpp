@@ -6410,11 +6410,12 @@ void handle_command() {
 					  "  killexec, killrun, aesenc, aesdec, test,\n"
 					  "  bochs <elf-file> [args]  -- run ELF in Bochs emulator window\n"
 					  "  hello                   -- shortcut: bochs hello\n"
+					  "  reset                   -- shortcut: bochs reset\n"
 					  "  matrix help             -- NumPy-style arrays + blocked GEMM\n"
 					  "  launch <app> | clock | calc | paint | snake | mines\n"
 					  "  monitor | inspector | about   -- open desktop apps\n");
 	}
-	else if (strcmp(command, "test") == 0) {
+	else if (strcmp(command, "reset") == 0) {
 		// Activate the Bochs self-test module. This runs the same two-
 		// phase verification the standalone test_main.cpp performed
 		// (Phase 1: bochs_cpu_init(); Phase 2: load a 23-byte guest and
