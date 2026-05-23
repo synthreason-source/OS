@@ -21,4 +21,8 @@ extern "C" {
     int bochs_process_wants_input(int)                  { return 0;  }
     // Process-exit sentinel — no-op when Bochs is not built in.
     void bochs_guest_exit(int)                                        {}
+    // Lifecycle hooks — no-ops when Bochs is not built in. The real
+    // bochs_glue.cpp implementations are in that file.
+    void bochs_reset_all_slots()                                      {}
+    void bochs_release_slot(int)                                      {}
 }

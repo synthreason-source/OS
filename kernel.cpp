@@ -343,6 +343,15 @@ extern "C" bool bochs_process_wants_input(int slot);
 // over its definition in bochs_glue.cpp for the full rationale.
 extern "C" void bochs_reset_all_slots();
 
+// Surgical per-slot release — called when ONE slot's process exits
+// but other slots are still running. Wipes only that slot's glue
+// state (mapping, mem_base pointer, saved CPU snapshot). Unlike
+// bochs_reset_all_slots(), does NOT touch BX_CPU(0), so peer slots
+// keep executing safely. Must be called BEFORE the kernel frees the
+// slot's backing slab so the mapping_unregister still has a valid
+// vaddr range to look up.
+extern "C" void bochs_release_slot(int slot);
+
 // Forward declarations for the ELF loader helpers and IO callbacks defined
 // later in this file. busybox/hello use the same lazy-init pattern as
 // load_and_execute_elf (cpu_initialized=false, no bochs_cpu_init here).
@@ -7050,6 +7059,33 @@ int load_and_execute_elf(const char* filename, const char* args, TerminalWindow*
         proc = &elf_processes[slot];
         *proc = ElfProcess();
         proc->terminal = terminal;
+        // ── Scrub per-slot I/O ring buffers ──────────────────────────────
+        // `*proc = ElfProcess()` value-initialises POD members, but the
+        // 512-byte inbuf and 4096-byte outbuf char arrays are NOT in the
+        // struct's default initialiser list and therefore retain whatever
+        // bytes the previous run left in them when this slot is reused.
+        // The ring-buffer HEAD/TAIL indices get reset to 0 by the line
+        // above (they have default initialisers), so the stale bytes are
+        // not directly "readable" via pop_input/pop_output — but they
+        // remain reachable through any code path that reads inbuf[]
+        // beyond the wrap (e.g. snprintf-style buffer dumps, or a guest
+        // doing speculative IN-port reads). They are also a forensic
+        // trip-hazard when the head/tail get out of sync due to an
+        // unrelated bug — the "phantom" bytes look like real input.
+        //
+        // Empirically the bug manifested as the third+ in-place run of
+        // `hello` in the same emulator window producing
+        // "HELLO WOHELLO WO..." loops with the user's typed "hello"
+        // prefix concatenated to the guest output. The kernel-side
+        // teardown in tick_elf_processes was freeing memory_base/stack
+        // and calling bochs_reset_all_slots(), but never wiping the
+        // input/output ring buffers — so when the same slot was reused,
+        // it carried forward bytes from the previous run's interaction.
+        // Zero-fill makes slot reuse architecturally identical to
+        // first-time use.
+        for (int _b = 0; _b < INBUFSIZE;  ++_b) proc->inbuf[_b]  = 0;
+        for (int _b = 0; _b < OUTBUFSIZE; ++_b) proc->outbuf[_b] = 0;
+        proc->in_head = proc->in_tail = proc->out_head = proc->out_tail = 0;
         if (args) {
             strncpy(proc->cmdline, args, sizeof(proc->cmdline) - 1);
             proc->cmdline[sizeof(proc->cmdline) - 1] = 0;
@@ -8398,10 +8434,52 @@ void tick_elf_processes(int steps) {
             // looping "HELLO WOHELLO WO..." because some untracked CPU
             // field survived across slot reuse). The big-hammer reset
             // is cheap and unambiguous.
+            //
+            // EXCEPTION (added for concurrent processes): if any OTHER
+            // slot is still active, bochs_reset_all_slots() below will
+            // be SKIPPED (resetting the live CPU would clobber that
+            // peer's mid-execution state). In that case we still need
+            // to clear THIS slot's mapping and dangling mem_base pointer
+            // before freeing the slab — otherwise the glue carries
+            // forward a dangling pointer that could be dereferenced on
+            // a future activate_slot. bochs_release_slot does that
+            // surgically without touching peer slots or BX_CPU(0).
+            // It's safe to call unconditionally: when the all-slots
+            // reset path also fires below, release_slot's wipe is
+            // simply overwritten by the same values via reset_all_slots.
+            bochs_release_slot(i);
             if (proc.memory_base) { delete[] proc.memory_base; proc.memory_base = nullptr; }
             if (proc.stack)       { delete[] proc.stack;       proc.stack       = nullptr; }
             proc.memory_size     = 0;
             proc.cpu_initialized = false;
+
+            // ── Wipe per-slot I/O ring buffers and transient flags ──
+            // Belt-and-braces companion to the scrub in
+            // load_and_execute_elf: cleared HERE on the exit edge so
+            // the slot is left in a strictly-empty state the instant
+            // the process becomes inactive. If any code path on the
+            // next frame reads from inbuf/outbuf before the next
+            // load_and_execute_elf runs (e.g. a stray
+            // tick_elf_processes pass on a slot whose `completed`
+            // flag flipped but whose `active` flag hasn't been
+            // re-set yet), it sees a clean empty queue rather than
+            // stale bytes from the run that just ended.
+            //
+            // Without this, the third in-place run of `hello` in the
+            // same emulator window produced "HELLO WOHELLO WO..."
+            // loops with leftover keystrokes from previous runs
+            // bleeding into the new guest's stdin and the previous
+            // guest's tail-end output bleeding into the new
+            // terminal display.
+            for (int _b = 0; _b < INBUFSIZE;  ++_b) proc.inbuf[_b]  = 0;
+            for (int _b = 0; _b < OUTBUFSIZE; ++_b) proc.outbuf[_b] = 0;
+            proc.in_head           = 0;
+            proc.in_tail           = 0;
+            proc.out_head          = 0;
+            proc.out_tail          = 0;
+            proc.waiting_for_input = false;
+            proc.exit_code         = 0;
+            proc.input_pos         = 0;
 
             any_exited_this_frame = true;
         }

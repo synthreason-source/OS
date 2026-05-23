@@ -394,7 +394,21 @@ static void slot_save_cpu(SlotState& s) {
 
     cs.eip      = cpu->gen_reg[BX_32BIT_REG_EIP].dword.erx;
     cs.prev_rip = (Bit32u)cpu->prev_rip;
-    cs.eflags   = cpu->eflags;
+    // EFLAGS: must use read_eflags() (which calls force_flags()) — NOT
+    // a direct field read. Bochs implements OF/SF/ZF/AF/PF/CF lazily:
+    // each flag-setting instruction writes its result into the oszapc
+    // shadow struct, and the corresponding bits in cpu->eflags are
+    // NOT updated until something explicitly forces them
+    // (PUSHF/LAHF/SAVE/etc). A direct read of cpu->eflags therefore
+    // captures STALE OSZAPC bits for the slot whose tick we're
+    // saving — the lazy shadow may already be one or more
+    // instructions ahead. read_eflags() flushes the lazy shadow into
+    // the eflags field first, then returns the now-consistent value.
+    // Without this, save/restore across slot switches could roll
+    // back arithmetic flags by one instruction, which is exactly
+    // the kind of corruption that makes JCCs branch the wrong way
+    // when concurrent slots are involved.
+    cs.eflags   = cpu->read_eflags();
 
     for (int i = 0; i < 6; ++i) cs.sregs[i] = cpu->sregs[i];
 
@@ -421,7 +435,33 @@ static void slot_restore_cpu(SlotState& s) {
 
     cpu->gen_reg[BX_32BIT_REG_EIP].dword.erx = cs.eip;
     cpu->prev_rip = cs.prev_rip;
+    // EFLAGS: write the saved value into cpu->eflags AND into the
+    // lazy oszapc shadow. The previous direct assignment
+    // `cpu->eflags = cs.eflags` only wrote the eflags field; the
+    // oszapc shadow was left in whatever state the cross-slot
+    // hardware reset (in bochs_activate_slot) had left it
+    // (post-reset SET_FLAGS_OSZAPC_LOGIC_32(1)). The next
+    // conditional-jump instruction of the resumed slot reads from
+    // oszapc, not from cpu->eflags — so it would see post-reset
+    // flag values rather than the slot's actually-saved flags.
+    //
+    // setEFlagsOSZAPC writes the OF/SF/ZF/AF/PF/CF bits from the
+    // saved eflags back into the lazy shadow. We then assign the
+    // FULL eflags into cpu->eflags directly to also catch the
+    // non-OSZAPC bits (IF, DF, TF, IOPL, NT, RF, VM, AC, VIF, VIP,
+    // ID, plus the reserved-1 bit at position 1). We deliberately
+    // do NOT call setEFlags() here because setEFlags has side
+    // effects (invalidate_prefetch_q on RF transitions,
+    // handleInterruptMaskChange on IF transitions,
+    // handleAlignmentCheck on AC, handleCpuModeChange on VM) that
+    // are about to be re-done anyway by the
+    // flush_after_switch -> handleCpuContextChange call. Doing
+    // them twice is wasteful and the IF-mask handler in particular
+    // examines other CPU state that's still mid-restore at this
+    // point. The current direct write + lazy-shadow update is the
+    // minimal correct sequence.
     cpu->eflags   = cs.eflags;
+    cpu->setEFlagsOSZAPC(cs.eflags);
 
     for (int i = 0; i < 6; ++i) cpu->sregs[i] = cs.sregs[i];
 
@@ -763,6 +803,73 @@ extern "C" void bochs_register_io_callbacks(
 //     be re-run; init_memory and friends are not idempotent on
 //     re-entry.
 //   • the registered slot_id — same reasoning as callbacks.
+
+// ── Per-slot release (concurrent-safe partial reset) ──────────────────
+//
+// Called by the kernel from tick_elf_processes when ONE slot's process
+// exits but other slots are still running. Wipes only that slot's
+// glue-side state — its mapping, its saved CPU snapshot, and most
+// importantly its mem_base pointer (which is about to become a
+// dangling pointer because the kernel will free the backing slab
+// right after this returns).
+//
+// Why not just call bochs_reset_all_slots? Because that hardware-
+// resets BX_CPU(0), which would clobber a DIFFERENT slot that's
+// currently mid-execution. Released slots need a surgical wipe;
+// only the global reset is safe when EVERY slot is done.
+//
+// What this preserves:
+//   • g_active_slot stays at its current value (could even be `slot`
+//     itself — that's fine, the next bochs_activate_slot of a
+//     different slot will see the cleared state and behave like
+//     "no previous slot" on the save path).
+//   • Other slots' state is untouched.
+//   • g_global_init_done and the I/O callbacks for this slot stay
+//     (next process in the slot will reuse them, same as for
+//     bochs_reset_all_slots).
+extern "C" void bochs_release_slot(int slot) {
+    if (slot < 0 || slot >= MAX_BOCHS_SLOTS) return;
+    if (!g_global_init_done) return;
+
+    SlotState& s = g_slots[slot];
+
+    // Unregister the mapping BEFORE clearing mem_base, so the
+    // unregister can still address the page-index range via vaddr_base.
+    mapping_unregister(s);
+
+    // Wipe everything that could otherwise dangle. mem_base is the
+    // critical one — kernel is about to delete[] the slab, so this
+    // pointer would otherwise become a use-after-free trap for any
+    // future glue code that touches it (e.g. an accidental
+    // bochs_activate_slot(slot) before bochs_set_process_memory has
+    // re-populated it).
+    s.mem_base    = nullptr;
+    s.mem_size    = 0;
+    s.vaddr_base  = 0;
+    s.brk_ptr     = 0;
+    s.wants_input = false;
+    s.cpu_primed  = false;
+
+    // Drop the saved CPU snapshot. valid=false signals
+    // bochs_activate_slot to skip slot_restore_cpu for this slot
+    // until bochs_set_process_memory re-primes it. It ALSO suppresses
+    // the per-switch hardware-reset between this slot and any future
+    // peer: with cpu.valid=false the "switching between live slots"
+    // branch is skipped (see bochs_activate_slot's `cur.cpu.valid`
+    // guard). That's the correct behaviour — a freshly released slot
+    // is no longer "live", so swapping into it is equivalent to a
+    // first-time activation.
+    __builtin_memset(&s.cpu, 0, sizeof(s.cpu));
+
+    // If this slot happened to be the currently-active one, demote
+    // g_active_slot to "none". The next bochs_activate_slot of a
+    // different slot will then take the no-previous-slot path
+    // (skipping slot_save_cpu of a now-cleared snapshot). If a
+    // peer slot was already active, leave g_active_slot pointing at
+    // it — we must not disturb the peer's state.
+    if (g_active_slot == slot) g_active_slot = -1;
+}
+
 extern "C" void bochs_reset_all_slots() {
     if (!g_global_init_done) return;   // nothing to reset yet
 
@@ -805,32 +912,228 @@ extern "C" void bochs_reset_all_slots() {
     bx_pc_system.kill_bochs_request = 0;
     g_exit_pending                  = 0;
 
+    // Re-zero bx_pc_system's timer/tick counters so the next launch
+    // sees the same "freshly initialised" pc_system state the FIRST
+    // launch did. initialize() resets ticksTotal, currCountdown,
+    // currCountdownPeriod, lastTimeUsec, usecSinceLast, triggeredTimer,
+    // HRQ, kill_bochs_request, and re-sets m_ips. It does NOT touch
+    // a20_mask (good — that stays at 0xffffffff from the boot-time
+    // set_enable_a20(true) call), but we re-assert A20 explicitly
+    // immediately afterwards in case a future Bochs version's
+    // initialize() ever decides to zero a20_mask. This call mirrors
+    // the first two steps of bochs_global_init() so the next launch
+    // starts from the same architectural pc_system snapshot as the
+    // first one did. We do NOT re-call BX_MEM::init_memory() or
+    // BX_CPU::initialize() — those are non-idempotent (they allocate
+    // tables out of the bump pool) and were the explicit reason
+    // bochs_global_init() is one-shot. The post-reset CPU + freshly
+    // re-zeroed pc_system + already-allocated mem tables is the
+    // closest reproducible "just after boot init" state we can
+    // construct without re-running the heavy allocator path.
+    bx_pc_system.initialize(50000000u);
+    bx_pc_system.set_enable_a20(true);
+
+    // Wipe the stale-panic diagnostic buffer so a panic captured
+    // during run N can't be misreported as a panic in run N+1. The
+    // buffer is only ever READ by bochs_guest_exit() and the kernel's
+    // diagnostic dumper; clearing it costs nothing and prevents
+    // ghost panic messages.
+    extern volatile const char* bx_last_panic_fmt;
+    extern volatile char        bx_last_panic_msg[128];
+    bx_last_panic_fmt = nullptr;
+    for (unsigned i = 0; i < sizeof(bx_last_panic_msg); ++i) {
+        bx_last_panic_msg[i] = 0;
+    }
+
     // Flush every Bochs cache that might still reference a slab
     // mapping or decoded instruction from the previous guest.
+    // (BX_CPU::reset() already calls flushICaches() at its end, but
+    // we call it again for clarity / symmetry with bochs_global_init's
+    // contract: "after reset, the CPU's caches are empty.")
     flushICaches();
 }
 
 // Switch active slot. If a different slot was active before, snapshot
 // its CPU state and unregister its mapping; then register the new
 // slot's mapping and restore its CPU state; finally flush caches.
+//
+// IMPORTANT: the post-switch flush_after_switch() is gated on whether
+// we actually touched mapping or CPU state. This matters for the
+// "first activate after bochs_reset_all_slots()" case:
+//
+//   • On the FIRST run after boot, g_global_init_done is false when
+//     bochs_activate_slot is first called from x86_tick. The whole
+//     `if (g_global_init_done)` block below is skipped — no flush.
+//     bochs_set_process_memory then runs global_init AND the full
+//     map+prime+inject+restore+flush sequence itself, so the slot
+//     ends up correctly armed.
+//
+//   • On the SECOND run after bochs_reset_all_slots(), the situation
+//     is different: g_global_init_done is true (preserved across the
+//     reset — see the comment in bochs_reset_all_slots), but the
+//     freshly-reset slot has neither a mapping nor a valid CPU
+//     snapshot yet (bochs_set_process_memory hasn't been called for
+//     this launch). The OLD code would still drop into the
+//     `if (g_global_init_done)` block, skip the mapping_register and
+//     slot_restore_cpu guards, and then unconditionally call
+//     flush_after_switch() — which runs handleCpuContextChange() on
+//     a CPU that's currently in post-reset BIOS state (CS=F000,
+//     real mode, CR0=0x60000010). That extra flush would lock in
+//     cpu_mode=BX_MODE_IA32_REAL and a real-mode fetchModeMask
+//     based on stale derived state, which subsequent
+//     slot_restore_cpu+flush_after_switch inside
+//     bochs_set_process_memory then has to UNDO. That undo path is
+//     where the historical "second run looks subtly wrong" symptoms
+//     leaked in from — a divergence between launch 1 (no extra
+//     flush) and launch N (extra flush, then corrective flush).
+//
+//   • The fix: only call flush_after_switch() when we ACTUALLY did
+//     something material here (registered a mapping OR restored a
+//     CPU snapshot). If both guards skipped, then this call is just
+//     a bookkeeping update of g_active_slot — no Bochs-visible state
+//     changed, no flush needed. This makes launch N follow the EXACT
+//     same code path as launch 1: bochs_activate_slot becomes a
+//     no-op (besides setting g_active_slot), and the real work
+//     happens inside bochs_set_process_memory, identical to the
+//     first launch.
 extern "C" void bochs_activate_slot(int slot) {
     if (slot < 0 || slot >= MAX_BOCHS_SLOTS) return;
     if (slot == g_active_slot) return;
 
+    bool changed_mapping_or_cpu = false;
+    bool switching_between_live_slots = false;
+
     if (g_global_init_done && g_active_slot >= 0 &&
         g_active_slot < MAX_BOCHS_SLOTS) {
         SlotState& prev = g_slots[g_active_slot];
+        // Only meaningful if the previous slot actually had state
+        // worth saving. After bochs_reset_all_slots() this branch
+        // is unreachable (g_active_slot was set to -1), so it does
+        // not affect the "second run after reset" path.
         slot_save_cpu(prev);
         mapping_unregister(prev);
+        changed_mapping_or_cpu = true;
+        // Remember: we're swapping OUT a previously-live slot. If the
+        // slot we're swapping IN is also a previously-live slot (its
+        // cpu.valid flag will tell us shortly), we need to scrub the
+        // BX_CPU between save and restore — see the big comment in
+        // the reset block below.
+        switching_between_live_slots = prev.cpu.valid;
     }
 
     g_active_slot = slot;
 
     if (g_global_init_done) {
         SlotState& cur = g_slots[slot];
-        if (cur.mem_base && cur.mem_size) mapping_register(cur);
-        if (cur.cpu.valid)                slot_restore_cpu(cur);
-        flush_after_switch();
+
+        // ── Scrub untracked CPU state between two live slots ──────────
+        //
+        // slot_save_cpu / slot_restore_cpu only cover the architectural
+        // registers we explicitly enumerate: GPRs, EIP, prev_rip, eflags,
+        // sregs[6], gdtr, idtr, cr0..cr4, activity_state, async_event.
+        //
+        // What they do NOT cover, but which BX_CPU(0) carries forward
+        // across cpu_loop entries and which CAN affect guest execution:
+        //
+        //   • oszapc — the lazy-EFLAGS shadow (struct of {result,auxbits}).
+        //     Each flag-setting instruction writes its operation into
+        //     this struct; lazy decoding of OF/SF/ZF/AF/PF/CF on demand
+        //     reads from it. When we restore cs.eflags directly into
+        //     cpu->eflags without also restoring oszapc, the next
+        //     conditional jump (JNE, JZ, ...) the guest executes reads
+        //     LAZY FLAGS LEFT BEHIND BY THE OTHER SLOT — wrong branch
+        //     taken. For the hello binary, put_str's `test %al,%al ;
+        //     jne` loop on the string terminator is exactly such a
+        //     conditional. With cross-slot flag pollution the loop can
+        //     mis-terminate (cutting "HELLO WORLD\n" off at 8 chars
+        //     producing "HELLO WO") or loop forever and re-vector
+        //     through the IDT exit stub, which is the visible
+        //     "HELLO WOHELLO WO..." symptom under concurrent slots.
+        //
+        //   • Pending-event state: pending_event, event_mask, EXT,
+        //     inhibit_mask, inhibit_icount, last_exception_type,
+        //     debug_trap. A trap or exception that fired during the
+        //     other slot can leave a pending bit set; on the next
+        //     cpu_loop entry of THIS slot Bochs would dispatch it
+        //     against the wrong CR3/segments/EIP.
+        //
+        //   • FPU / SSE / AVX / MMX register file and MXCSR. The hello
+        //     ELFs don't touch FPU/SSE, but some Bochs internal paths
+        //     (e.g. the assertion checks in handleCpuModeChange) do
+        //     read these. Cross-slot pollution is at minimum a
+        //     forensic confound and at worst a real fault source.
+        //
+        //   • Stack-cache and prefetch-queue host pointers. These are
+        //     scrubbed by flush_after_switch's handleCpuContextChange
+        //     call further down, so they're already handled.
+        //
+        //   • DR0-7 / TR / LDTR / MSRs. Unused in this kernel but again
+        //     a forensic risk and unnecessary divergence between
+        //     "first launch" and "Nth concurrent slot resume".
+        //
+        // The PREVIOUS approach was to try to enumerate every one of
+        // these untracked fields and add them to slot_save_cpu /
+        // slot_restore_cpu. That game of whack-a-mole was abandoned
+        // (see the comment above bochs_reset_all_slots): for sequential
+        // reuse we just hardware-reset the CPU between processes so
+        // every untracked field returns to its post-reset value, and
+        // slot_restore_cpu then layers our architectural snapshot on
+        // top. Launch N becomes byte-identical to launch 1.
+        //
+        // That fix only ran in bochs_reset_all_slots — i.e. when the
+        // LAST live slot exits. It did nothing for the concurrent case
+        // where slot A and slot B are both alive and the kernel ticks
+        // them one after the other in the same frame. In that case
+        // the CPU swings back and forth between two halves of dirty
+        // untracked state. Both runs see the OTHER run's untracked
+        // pollution every tick.
+        //
+        // The fix here is the same big-hammer pattern but applied per
+        // SWAP rather than per RESET: when we're swapping FROM a
+        // previously-live slot TO another previously-live slot, do a
+        // BX_RESET_HARDWARE between save and restore. The reset wipes
+        // every untracked field; slot_restore_cpu then re-instates the
+        // architectural snapshot. The new slot resumes from exactly the
+        // same architectural state it would on its first tick. No
+        // bleed-over from the other slot — concurrent runs are now
+        // independent.
+        //
+        // We DO NOT reset when:
+        //   • There was no previous slot (g_active_slot == -1, e.g.
+        //     first activate after boot or after bochs_reset_all_slots).
+        //     The CPU is already in the appropriate clean post-init or
+        //     post-reset state.
+        //   • The incoming slot has cpu.valid == false (a freshly
+        //     primed slot that has never run). slot_restore_cpu will
+        //     install its primed state; no untracked pollution from
+        //     "this slot's previous run" exists to scrub.
+        //
+        // Cost: one BX_RESET_HARDWARE per slot switch when both ends
+        // are live. The reset is a few hundred memory writes — cheap
+        // compared to even one cpu_loop iteration. No allocations are
+        // performed. It's safe to invoke repeatedly.
+        if (switching_between_live_slots && cur.cpu.valid) {
+            BX_CPU(0)->reset(BX_RESET_HARDWARE);
+            BX_CPU(0)->async_event          = 0;
+            bx_pc_system.kill_bochs_request = 0;
+            g_exit_pending                  = 0;
+            changed_mapping_or_cpu = true;
+        }
+
+        if (cur.mem_base && cur.mem_size) {
+            mapping_register(cur);
+            changed_mapping_or_cpu = true;
+        }
+        if (cur.cpu.valid) {
+            slot_restore_cpu(cur);
+            changed_mapping_or_cpu = true;
+        }
+        // Only flush if we actually changed something Bochs-visible.
+        // See block comment above — this is what makes the second
+        // launch's bochs_activate_slot path identical to the first.
+        if (changed_mapping_or_cpu) {
+            flush_after_switch();
+        }
     }
 }
 
