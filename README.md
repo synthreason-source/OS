@@ -1,11 +1,13 @@
 a simple GUI interface OS with terminal windows and bochs emulator.
 
+
 CTRL-Q saves and exits text editor...
+
 
 SATA port selection with 'disk_select'
 
 
-TODO: more GUI features, get busybox working and test elf functionality.
+TODO: more GUI features, get busybox working and test elf functionality(currently most bochs instances needs a 'reset').
 
 
-TODO:and fix bochs multitasking, register keyboard and framebuffer. (test execution available)
+TODO: bochs register keyboard and framebuffer. (test execution available)
