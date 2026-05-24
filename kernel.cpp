@@ -6404,7 +6404,7 @@ void handle_command() {
     }
 
 	if (strcmp(command, "help") == 0) {
-		console_print("Commands: help, clear, version, time, ps, ls, edit, run, exec,\n"
+		console_print("\nCommands: help, clear, version, time, ps, ls, edit, run, exec,\n"
 					  "  compile, rm, cp, mv, formatfs, chkdsk (/r /f), select_disk,\n"
 					  "  setpass, removepass, unlock, busybox, pself, killelf,\n"
 					  "  killexec, killrun, aesenc, aesdec, test,\n"
@@ -7533,7 +7533,7 @@ public:
         // \b is intentionally NOT supported here (the legitimate guest
         // output paths don't emit it, and accepting it would let stray
         // 0x08 bytes erase real output).
-        char clean[512];
+        char clean[8192];
         int  cn = 0;
         for (const char* p = s; *p && cn < (int)sizeof(clean) - 1; ++p) {
             unsigned char c = (unsigned char)*p;
