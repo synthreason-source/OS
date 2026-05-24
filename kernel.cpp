@@ -6415,28 +6415,29 @@ void handle_command() {
 					  "  launch <app> | clock | calc | paint | snake | mines\n"
 					  "  monitor | inspector | about   -- open desktop apps\n");
 	}
+	else if (strcmp(command, "bochs") == 0) {
+		// Enter Bochs emulator mode in this terminal window.
+		// No new window is spawned. Type `reset` to initialise the CPU,
+		// then type an ELF filename to run it here.
+		if (is_emulator_window) {
+			console_print("bochs: already in emulator mode\n");
+		} else {
+			is_emulator_window = true;
+			title = "Bochs Emulator";
+			console_print("=== Bochs i386 CPU emulator ===\n");
+			console_print("Type `reset` to initialise the CPU, then type an ELF name to run it.\n");
+		}
+	}
 	else if (strcmp(command, "reset") == 0) {
-		// Activate the Bochs self-test module. This runs the same two-
-		// phase verification the standalone test_main.cpp performed
-		// (Phase 1: bochs_cpu_init(); Phase 2: load a 23-byte guest and
-		// tick it), but renders test_main.cpp's three-row 0xB8000 VGA
-		// overlay INTO this terminal window via the TestSink.
+		if (bochs_reset_done) {
+			console_print("reset: already done for this window\n");
+		} else {
+		bochs_reset_done = true;
+		// Run the Bochs CPU reset sequence (test_module_run Phase 1+2)
+		// so BX_CPU(0) is fully initialised and the test slab is wiped.
 		test_vga_clear();
 		g_test_overlay_active = false;
-		g_test_overlay_owner  = (void*)this;   // this window shows it
-
-		// The file-scope C++ ctors that construct bx_cpu(0), bx_mem and
-		// the dummy CPUID param objects in bochs_infra.cpp are now run
-		// once by kernel_run_global_ctors_once() in kernel_main, and
-		// test_module_mark_ctors_done() was called there too. So
-		// test_module_run()'s internal run_init_array_once() is a
-		// guaranteed no-op here — the ctors are NOT re-run, which would
-		// otherwise re-construct bx_cpu / bx_mem on top of live state.
-		//
-		// (icache.o's 4 MiB pageWriteStampTable ctor allocates via the
-		// global operator new; that allocation now happens at boot when
-		// the kernel heap is still fresh, and operator new also falls
-		// back to the 48 MiB Bochs bump pool if needed.)
+		g_test_overlay_owner  = (void*)this;
 
 		TestSink sink;
 		sink.put_line = test_sink_put_line;
@@ -6450,22 +6451,21 @@ void handle_command() {
 
 		test_module_run(&sink, &res);
 
-		// test_module_run() replaces slot 0's IO callbacks with its own
-		// internal stubs (test_io_read/write/exit). Restore the real kernel
-		// callbacks for every slot so ELF processes launched after `test`
-		// get proper output routing and elf_io_exit correctly marks them
-		// inactive. Without this, the first ELF on slot 0 after a `test`
-		// run would silently swallow its exit signal and appear to freeze.
+		bochs_reset_all_slots();
+
 		for (int s = 0; s < MAX_ELF_PROCESSES; ++s)
 			bochs_register_io_callbacks(s, elf_io_read, elf_io_write, elf_io_exit);
 
-		// Final one-line verdict in the terminal.
+		g_test_overlay_active = false;
+		g_test_overlay_owner  = nullptr;
+
 		if (res.phase1_ok && res.guest_exit_seen)
-			console_print("test: PASSED (cpu init + guest tick OK)\n");
+			console_print("reset: OK\n");
 		else if (res.phase1_ok)
-			console_print("test: PARTIAL (init OK, guest did not exit)\n");
+			console_print("reset: init OK, guest incomplete\n");
 		else
-			console_print("test: FAILED (cpu init did not return)\n");
+			console_print("reset: FAILED\n");
+		} // end else (not already reset)
 	}
 	else if (strcmp(command, "aesenc") == 0 || strcmp(command, "aesdec") == 0) {
         bool encrypt = strcmp(command, "aesenc") == 0;
@@ -6728,67 +6728,7 @@ void handle_command() {
     // the CPU is already initialised by kernel_main.  The new emulator
     // window picks up from the lazy-init path in x86_tick exactly the same
     // way as every other ELF launch in this kernel.
-    else if (strcmp(command, "bochs") == 0) {
-        // args currently points at "<filename> [rest…]".  Split off the
-        // filename so we can validate it before spawning the window.
-        char* elf_name = get_arg(args, 0);
-        if (!elf_name || !*elf_name) {
-            console_print("Usage: bochs <elf-file> [args...]\n");
-        } else {
-            // Advance past the filename to collect any trailing arguments
-            // that should be forwarded to the ELF process.
-            char* elf_args = elf_name;
-            while (*elf_args && *elf_args != ' ') elf_args++;
-            if (*elf_args) { *elf_args = '\0'; elf_args++; }
-            while (*elf_args == ' ') elf_args++;
-
-            // Probe FAT32 to confirm the file exists and is an ELF.
-            fat_dir_entry_t entry;
-            uint32_t sec = 0, off = 0;
-            bool found_elf = false;
-            if (fat32_find_entry(elf_name, &entry, &sec, &off) == 0) {
-                char* probe = fat32_read_file_as_string(elf_name);
-                if (probe) {
-                    if (entry.file_size >= 4 &&
-                        (uint8_t)probe[0] == 0x7F &&
-                        probe[1] == 'E' && probe[2] == 'L' && probe[3] == 'F') {
-                        found_elf = true;
-                    }
-                    delete[] probe;
-                }
-            }
-
-            if (!found_elf) {
-                console_print("bochs: '");
-                console_print(elf_name);
-                console_print("': ELF not found on disk\n");
-            } else {
-                // Build the startup command string the new emulator window
-                // will re-execute on its first update(): "<name> [args]"
-                char startup_buf[256];
-                int n = 0;
-                for (const char* p = elf_name; *p && n < 253; ++p)
-                    startup_buf[n++] = *p;
-                if (elf_args && *elf_args) {
-                    if (n < 253) startup_buf[n++] = ' ';
-                    for (const char* p = elf_args; *p && n < 253; ++p)
-                        startup_buf[n++] = *p;
-                }
-                startup_buf[n] = '\0';
-
-                console_print("bochs: launching '");
-                console_print(elf_name);
-                console_print("' in Bochs emulator window...\n");
-
-                static int bochs_win_count = 0;
-                int idx = bochs_win_count++ % 10;
-                int o   = idx * 30;
-                wm.add_window(new TerminalWindow(180 + o, 110 + o,
-                                                 startup_buf,
-                                                 /*emulator_mode=*/true));
-            }
-        }
-    }
+    
 
     // ===================================================================
     // PATCH: matrix array store + desktop suite commands
@@ -6959,7 +6899,7 @@ void handle_command() {
     // dedicated window rather than scribbling its output across the
     // shell that launched it.
     else {
-        if (is_emulator_window) {
+        if (is_emulator_window && bochs_reset_done) {
             // (b) We ARE the spawned emulator window — run in-place.
             int s = load_and_execute_elf(command, args, this);
             if (s >= 0) captured_elf_slot = s;
@@ -6987,32 +6927,12 @@ void handle_command() {
                 }
             }
 
+
             if (is_elf) {
-                // Rebuild the original command line ("name args...") so
-                // the spawned window sees the same input the user typed.
-                char buf[256];
-                int n = 0;
-                for (const char* p = command; *p && n < 254; ++p) buf[n++] = *p;
-                if (args && *args) {
-                    if (n < 254) buf[n++] = ' ';
-                    for (const char* p = args; *p && n < 254; ++p) buf[n++] = *p;
-                }
-                buf[n] = 0;
-
-                console_print("Launching '");
+                // ELF found but not in emulator mode.
+                // Direct the user to type `bochs` first.
                 console_print(command);
-                console_print("' in Bochs emulator window...\n");
-
-                // Spawn the emulator window. Same offset cycling as
-                // launch_terminal_with_command(), but with the
-                // emulator_mode flag set so the spawned terminal knows
-                // to run the ELF in-place when its startup-command
-                // fires on first update().
-                static int emu_win_count = 0;
-                int idx = (emu_win_count++ % 10);
-                int o = idx * 30;
-                wm.add_window(new TerminalWindow(180 + o, 110 + o,
-                                                 buf, /*emulator_mode=*/true));
+                console_print(": ELF found - type `bochs` to enter emulator mode, then run it\n");
             } else {
                 // Not a known command and not an ELF on disk.
                 console_print(command);
@@ -7226,6 +7146,7 @@ public:
         update_prompt_display(); // Show the initial prompt
     }
     bool is_emulator_window = false;
+    bool bochs_reset_done   = false;  // reset runs once per window
     int captured_elf_slot = -1;
     int get_elf_slot() const override { return captured_elf_slot; }
 
