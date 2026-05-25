@@ -2389,6 +2389,12 @@ static char* g_ahci_fis_buffer = nullptr;
 static fat32_bpb_t bpb;
 static uint32_t fat_start_sector, data_start_sector;
 static uint32_t current_directory_cluster = 0;
+// Absolute disk LBA of the FAT32 partition's first sector (0 if the disk
+// is a raw FAT32 image with no partition table — e.g. mkfat32.py output).
+// Set by fat32_init when an MBR/GPT FAT32 partition is located; used by
+// fat32_format so a format command on a partitioned bare-metal disk
+// rewrites the partition's BPB instead of clobbering the MBR.
+static uint64_t g_partition_lba = 0;
 
 // --- Aligned Memory Allocator ---
 void* alloc_aligned(size_t size, size_t alignment) {
@@ -2732,19 +2738,42 @@ void disk_init() {
 
     uint32_t ports_implemented = *(volatile uint32_t*)(uintptr_t)(ahci_base + 0x0C);
 
-    // Auto-select the first implemented port that has an active device.
-    // ahci_port_setup() does the per-port command-engine programming so
-    // select_disk can later reuse the exact same path for any port.
-    for (int i = 0; i < 32; i++) {
-        if (!(ports_implemented & (1 << i))) continue;
-        if (ahci_port_setup(i)) {
-            g_ahci_port = i;
-            char msg[64];
-            snprintf(msg, sizeof(msg), "AHCI: port %d active.\n", i);
-            wm.print_to_focused(msg);
-            return;
+    // Auto-select a port. Two passes so a SATA disk on port 1 is preferred
+    // over an ATAPI CD-ROM on port 0 (which is exactly the QEMU layout in
+    // compile.md — `bus=ahci.0` for the CD, `bus=ahci.1` for the HDD).
+    //
+    // PxSIG (port offset 0x24) tells us what kind of device is attached:
+    //   0x00000101 = SATA disk
+    //   0xEB140101 = SATAPI / ATAPI (CD-ROM, DVD, etc.)
+    //   0xC33C0101 = enclosure-management bridge
+    //   0x96690101 = port multiplier
+    //
+    // Pass 1: claim the first SATA disk.
+    // Pass 2: fall back to anything else (so we don't strand a CD-only
+    // configuration with no port selected at all).
+    auto try_select = [&](bool sata_only) -> bool {
+        for (int i = 0; i < 32; i++) {
+            if (!(ports_implemented & (1u << i))) continue;
+            volatile HBA_PORT* p = (volatile HBA_PORT*)(uintptr_t)
+                                    (ahci_base + 0x100 + (i * 0x80));
+            uint32_t sig = p->sig;
+            if (sata_only && sig != 0x00000101u) continue;
+            if (ahci_port_setup(i)) {
+                g_ahci_port = i;
+                char msg[80];
+                const char* kind = (sig == 0x00000101u) ? "SATA disk"
+                                 : (sig == 0xEB140101u) ? "ATAPI (CD/DVD)"
+                                 : "unknown";
+                snprintf(msg, sizeof(msg),
+                         "AHCI: port %d active (%s).\n", i, kind);
+                wm.print_to_focused(msg);
+                return true;
+            }
         }
-    }
+        return false;
+    };
+    if (try_select(true))  return;     // first SATA disk
+    if (try_select(false)) return;     // fall back to anything
     wm.print_to_focused("AHCI: controller found but no active drive on any port.\n");
 }bool fat32_init() {
     if (!ahci_base) return false;
@@ -2910,6 +2939,7 @@ void disk_init() {
     // fat_start_sector / data_start_sector hold ABSOLUTE disk LBAs.
     // partition_lba == 0 for the raw-image case, so QEMU/VMware
     // behaviour is byte-for-byte unchanged.
+    g_partition_lba   = partition_lba;
     fat_start_sector  = partition_lba + bpb.rsvd_sec_cnt;
     data_start_sector = fat_start_sector + (bpb.num_fats * bpb.fat_sz32);
     current_directory_cluster = bpb.root_clus;
@@ -2925,6 +2955,24 @@ void disk_init() {
 }
 uint64_t cluster_to_lba(uint32_t cluster) {
   return (uint64_t)(cluster - 2) * bpb.sec_per_clus + data_start_sector;
+}
+
+// Number of clusters in the FAT32 filesystem, computed entirely from BPB
+// fields so it is independent of where on the disk the partition lives.
+// The old formula `bpb.tot_sec32 - data_start_sector` worked only when
+// data_start_sector was partition-relative; once we support MBR/GPT,
+// data_start_sector holds the absolute disk LBA and the subtraction
+// underflows. This helper sidesteps the issue.
+static inline uint32_t fat32_data_sectors() {
+    uint32_t reserved = bpb.rsvd_sec_cnt;
+    uint32_t fats     = bpb.num_fats * bpb.fat_sz32;
+    uint32_t fs_total = bpb.tot_sec32;
+    if (fs_total <= reserved + fats) return 0;
+    return fs_total - reserved - fats;
+}
+static inline uint32_t fat32_max_clusters() {
+    if (bpb.sec_per_clus == 0) return 0;
+    return fat32_data_sectors() / bpb.sec_per_clus + 2;
 }void to_83_format(const char* filename, char* out) { memset(out, ' ', 11); int i = 0, j = 0; while (filename[i] && filename[i] != '.' && j < 8) { out[j++] = (filename[i] >= 'a' && filename[i] <= 'z') ? (filename[i]-32) : filename[i]; i++; } if(filename[i] == '.') i++; j=8; while(filename[i] && j<11) { out[j++] = (filename[i] >= 'a' && filename[i] <= 'z') ? (filename[i]-32) : filename[i]; i++; } }
 
 void from_83_format(const char* fat_name, char* out) {
@@ -2972,7 +3020,7 @@ bool write_fat_entry(uint32_t cluster, uint32_t value) {
 }
 
 uint32_t find_free_cluster() {
-    uint32_t max_clusters = (bpb.tot_sec32 - data_start_sector) / bpb.sec_per_clus + 2;
+    uint32_t max_clusters = fat32_max_clusters();
     for (uint32_t i = 2; i < max_clusters; i++) if (read_fat_entry(i) == FAT_FREE_CLUSTER) return i;
     return 0;
 }
@@ -2988,15 +3036,36 @@ void free_cluster_chain(uint32_t start_cluster) {
     while(current < FAT_END_OF_CHAIN) { uint32_t next = read_fat_entry(current); write_fat_entry(current, FAT_FREE_CLUSTER); current = next; }
 }
 
+// Hinted free-cluster scan: starts from `start_from` instead of cluster 2.
+// allocate_cluster_chain uses this to avoid the O(N^2) cost of the original
+// "always scan from cluster 2" loop — that read the same FAT sectors over
+// and over (millions of redundant reads for a 1 MB file at 512-byte
+// clusters). Falls back to a full scan if nothing was found above the hint.
+static uint32_t find_free_cluster_hinted(uint32_t start_from) {
+    uint32_t max_clusters = fat32_max_clusters();
+    if (start_from < 2) start_from = 2;
+    for (uint32_t i = start_from; i < max_clusters; i++)
+        if (read_fat_entry(i) == FAT_FREE_CLUSTER) return i;
+    for (uint32_t i = 2; i < start_from && i < max_clusters; i++)
+        if (read_fat_entry(i) == FAT_FREE_CLUSTER) return i;
+    return 0;
+}
+
 uint32_t allocate_cluster_chain(uint32_t num_clusters) {
     if(num_clusters == 0) return 0;
+    // Find the first free cluster (full scan, once).
     uint32_t first = allocate_cluster();
     if(first == 0) return 0;
     uint32_t current = first;
+    // For the rest of the chain, scan FORWARD from the last cluster we
+    // grabbed — on a freshly-formatted disk the next free cluster is
+    // almost always current+1, which costs one FAT read per allocation
+    // instead of (number-allocated-so-far) FAT reads.
     for(uint32_t i = 1; i < num_clusters; i++) {
-        uint32_t next = allocate_cluster();
+        uint32_t next = find_free_cluster_hinted(current + 1);
         if(next == 0) { free_cluster_chain(first); return 0; }
-        write_fat_entry(current, next);
+        write_fat_entry(next,    FAT_END_OF_CHAIN); // mark allocated
+        write_fat_entry(current, next);             // link previous → next
         current = next;
     }
     return first;
@@ -3434,9 +3503,15 @@ void fat32_format() {
     // XOR-encrypt this write, fat32_init() reads it back as plaintext,
     // sees garbage where "FAT32" should be, and reports re-init failure.
     // Force encryption off for just this one write, then restore it.
+    // Where do we write the BPB? On a raw image (g_partition_lba==0)
+    // it's sector 0. On a partitioned disk it's the partition's first
+    // sector; writing to sector 0 there would destroy the MBR/GPT and
+    // brick every other OS on the box.
+    uint64_t bpb_lba = g_partition_lba;
+
     bool boot_sec_was_enc = g_fs_encryption_enabled;
     g_fs_encryption_enabled = false;
-    if (read_write_sectors(g_ahci_port, 0, 1, true, boot_sector_buffer) != 0) {
+    if (read_write_sectors(g_ahci_port, bpb_lba, 1, true, boot_sector_buffer) != 0) {
         // The boot sector carries the BPB. If it could not be written
         // there is no valid filesystem geometry on disk, so abort rather
         // than writing FATs/root-dir onto an unformatted layout. (The
@@ -3451,7 +3526,7 @@ void fat32_format() {
     g_fs_encryption_enabled = boot_sec_was_enc;       // restore
 
     memcpy(&bpb, &new_bpb, sizeof(fat32_bpb_t));
-    fat_start_sector = bpb.rsvd_sec_cnt;
+    fat_start_sector  = (uint32_t)(bpb_lba + bpb.rsvd_sec_cnt);
     data_start_sector = fat_start_sector + (bpb.num_fats * bpb.fat_sz32);
 
     uint8_t* zero_sector = new uint8_t[SECTOR_SIZE];
@@ -3478,13 +3553,14 @@ void fat32_format() {
         wm.print_to_focused("FAT32 FS re-initialized successfully.\n");
     } else {
         wm.print_to_focused("FAT32 FS re-initialization failed.\n");
-        // Diagnostic: read sector 0 back as plaintext and report what is
-        // actually on disk, so a failure is actionable instead of vague.
+        // Diagnostic: read the BPB sector back as plaintext and report what
+        // is actually on disk. On a partitioned bare-metal disk this is
+        // bpb_lba (the partition's first sector), not sector 0 (the MBR).
         char* vb = new char[SECTOR_SIZE];
         if (vb) {
             bool was = g_fs_encryption_enabled;
             g_fs_encryption_enabled = false;
-            int rr = read_write_sectors(g_ahci_port, 0, 1, false, vb);
+            int rr = read_write_sectors(g_ahci_port, bpb_lba, 1, false, vb);
             g_fs_encryption_enabled = was;
             if (rr != 0) {
                 wm.print_to_focused("  diag: boot-sector read-back FAILED.\n");
@@ -3638,7 +3714,7 @@ static uint32_t* cluster_bitmap = nullptr;
 static uint32_t cluster_bitmap_size = 0;
 
 void init_cluster_bitmap() {
-    uint32_t total_clusters = (bpb.tot_sec32 - data_start_sector) / bpb.sec_per_clus + 2;
+    uint32_t total_clusters = fat32_max_clusters();
     cluster_bitmap_size = (total_clusters + 31) / 32;
     
     if (cluster_bitmap) delete[] cluster_bitmap;
@@ -3667,7 +3743,7 @@ bool is_cluster_marked(uint32_t cluster) {
 
 bool is_valid_cluster(uint32_t cluster) {
     if (cluster < 2) return false;
-    uint32_t max_clusters = (bpb.tot_sec32 - data_start_sector) / bpb.sec_per_clus + 2;
+    uint32_t max_clusters = fat32_max_clusters();
     return cluster < max_clusters;
 }
 
@@ -3830,7 +3906,7 @@ bool scan_directory(uint32_t cluster, ChkdskStats& stats, bool fix, int depth = 
 void find_lost_clusters(ChkdskStats& stats, bool fix) {
     wm.print_to_focused("\nScanning for lost clusters...");
     
-    uint32_t max_clusters = (bpb.tot_sec32 - data_start_sector) / bpb.sec_per_clus + 2;
+    uint32_t max_clusters = fat32_max_clusters();
     
     for (uint32_t cluster = 2; cluster < max_clusters; cluster++) {
         uint32_t fat_entry = read_fat_entry(cluster);
@@ -3923,12 +3999,12 @@ void chkdsk(bool fix = false, bool verbose = false) {
         return;
     }
     
-    if (bpb.tot_sec32 <= data_start_sector) {
+    if (bpb.tot_sec32 <= bpb.rsvd_sec_cnt + (uint32_t)bpb.num_fats * bpb.fat_sz32) {
         wm.print_to_focused("ERROR: Invalid disk geometry!");
         return;
     }
     
-    stats.total_clusters = (bpb.tot_sec32 - data_start_sector) / bpb.sec_per_clus;
+    stats.total_clusters = fat32_data_sectors() / bpb.sec_per_clus;
     
     // SAFETY: Prevent division by zero
     if (stats.total_clusters == 0) {
