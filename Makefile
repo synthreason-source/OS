@@ -43,17 +43,26 @@ $(DISK_IMG):
 
 iso: $(MULTIBOOT)
 	mkdir -p iso/boot/grub
-	printf '%s\n'                              \
-	    'set timeout=0'                         \
-	    'set default=0'                         \
-	    'terminal_input console'                \
-	    'terminal_output console'               \
-	    'menuentry "RTOS++" {'                  \
-	    '    multiboot /boot/main.elf'          \
-	    '    boot'                              \
-	    '}'                                     \
+	printf '%s\n'                                                 \
+	    'set timeout=3'                                           \
+	    'set default=0'                                           \
+	    'insmod all_video'                                        \
+	    'insmod vbe'                                              \
+	    'insmod vga'                                              \
+	    'insmod gfxterm'                                          \
+	    'terminal_input  console'                                 \
+	    'terminal_output console'                                 \
+	    'menuentry "RTOS++" {'                                    \
+	    '    multiboot /boot/main.elf'                            \
+	    '    boot'                                                \
+	    '}'                                                       \
+	    'menuentry "RTOS++ (text console only)" {'                \
+	    '    set gfxpayload=text'                                 \
+	    '    multiboot /boot/main.elf'                            \
+	    '    boot'                                                \
+	    '}'                                                       \
 	    > iso/boot/grub/grub.cfg
-	grub-mkrescue -o main.iso iso
+	grub-mkrescue --product-name="RTOS++" -o main.iso iso -- -volid RTOSPP
 	@echo ">>> ISO ready: main.iso"
 
 
@@ -251,20 +260,56 @@ $(MULTIBOOT): boot.o kernel.o ramdisk.o hello_blob.o test_module.o $(BOCHS_OBJ) 
 	    -Wl,--allow-multiple-definition
 
 # ============================================================
-#  ISO image via GRUB
+#  ISO image via GRUB (hybrid BIOS + UEFI)
+# ------------------------------------------------------------
+#  grub-mkrescue auto-detects the GRUB platforms installed on the
+#  build host. With grub-pc-bin installed you get a BIOS-bootable
+#  El Torito image; with grub-efi-amd64-bin / grub-efi-ia32-bin also
+#  installed you get an additional EFI System Partition embedded
+#  in the same ISO, so the output boots on:
+#    * QEMU / Bochs                      (BIOS)
+#    * VMware Workstation / Fusion       (BIOS or UEFI firmware)
+#    * Real bare metal w/ legacy CSM     (BIOS)
+#    * Real bare metal UEFI-only         (UEFI)
+#
+#  See: install with
+#    apt-get install grub-pc-bin grub-efi-amd64-bin grub-efi-ia32-bin \
+#                    xorriso mtools
 # ============================================================
 $(MAIN): $(MULTIBOOT)
 	mkdir -p iso/boot/grub
-	printf '%s\n'                         \
-	    'set timeout=0'                   \
-	    'set default=0'                   \
-	    'menuentry "RTOS++" {'            \
-	    '    multiboot /boot/main.elf'    \
-	    '    boot'                        \
-	    '}'                               \
+	printf '%s\n'                                                 \
+	    'set timeout=3'                                           \
+	    'set default=0'                                           \
+	    'insmod all_video'                                        \
+	    'insmod vbe'                                              \
+	    'insmod vga'                                              \
+	    'insmod gfxterm'                                          \
+	    'terminal_input  console'                                 \
+	    'terminal_output console'                                 \
+	    'menuentry "RTOS++" {'                                    \
+	    '    multiboot /boot/main.elf'                            \
+	    '    boot'                                                \
+	    '}'                                                       \
+	    'menuentry "RTOS++ (text console only)" {'                \
+	    '    set gfxpayload=text'                                 \
+	    '    multiboot /boot/main.elf'                            \
+	    '    boot'                                                \
+	    '}'                                                       \
 	    > iso/boot/grub/grub.cfg
-	grub-mkrescue -o $(MAIN) iso
+	grub-mkrescue                                                 \
+	    --product-name="RTOS++"                                   \
+	    --product-version="1.0"                                   \
+	    -o $(MAIN) iso                                            \
+	    -- -volid RTOSPP
 	@echo ">>> ISO ready: $(MAIN)"
+	@if command -v xorriso >/dev/null 2>&1; then \
+	    echo "--- Boot record summary ---"; \
+	    xorriso -indev $(MAIN) -report_el_torito plain 2>/dev/null \
+	        | sed -n '/Boot record/p;/El Torito/p'; \
+	    xorriso -indev $(MAIN) -report_system_area plain 2>/dev/null \
+	        | sed -n '/System area/p'; \
+	fi
 
 # ============================================================
 #  test_main — standalone Bochs init + cpu_tick verification

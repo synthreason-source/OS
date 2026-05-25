@@ -6,7 +6,8 @@
 
 .set ALIGN,      1<<0
 .set MEMINFO,    1<<1
-.set FLAGS,      ALIGN | MEMINFO
+.set VIDINFO,    1<<2          /* ask GRUB to set up a linear framebuffer */
+.set FLAGS,      ALIGN | MEMINFO | VIDINFO
 .set MAGIC,      0x1BADB002
 .set CHECKSUM,   -(MAGIC + FLAGS)
 
@@ -27,6 +28,28 @@
 .long MAGIC
 .long FLAGS
 .long CHECKSUM
+/* Address fields (bit 16 not set in FLAGS — zero-fill so the video
+   fields below land at the offsets the Multiboot 1 spec requires).
+   header_addr / load_addr / load_end_addr / bss_end_addr / entry_addr. */
+.long 0
+.long 0
+.long 0
+.long 0
+.long 0
+/* Video mode request (FLAGS bit 2):
+     mode_type = 0 (linear graphics — RGB framebuffer; 1 = EGA text)
+     width  = 1024
+     height = 768
+     depth  = 32 bpp
+   GRUB treats 0 as "no preference" for any field; the kernel clamps
+   anything larger anyway. Asking for 1024x768x32 means GRUB-BIOS will
+   pick the closest VBE mode and GRUB-EFI will pick the closest GOP
+   mode, then pass back the live framebuffer address in the multiboot
+   info struct (mbi->flags bit 12, mbi->framebuffer_* fields). */
+.long 0
+.long 1024
+.long 768
+.long 32
 
 /* =========================================================
    BSS

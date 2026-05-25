@@ -8796,6 +8796,17 @@ static SVGAResult vmware_svga_init(uint32_t w, uint32_t h) {
 
 extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
 
+    // ── Verify Multiboot 1 magic FIRST, before any hardware probing ───────────
+    // If GRUB (or whatever bootloader) didn't pass 0x2BADB002, we are running
+    // under something that doesn't honour the contract — bail out cleanly
+    // instead of poking PCI / FB hardware on bad assumptions.
+    if (magic != 0x2BADB002) {
+        volatile uint16_t* vga = (volatile uint16_t*)0xB8000;
+        vga[0] = 0x4F45; // 'E' on red — "bad magic"
+        for (;;)
+            asm volatile("hlt");
+    }
+
     // ── Initialise heap ───────────────────────────────────────────────────────
     g_allocator.init(kernel_heap, sizeof(kernel_heap));
 
@@ -8803,12 +8814,7 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
     // This MUST happen before reading any framebuffer address because the
     // linear FB is not live until ENABLE=1 is written.
     SVGAResult svga = vmware_svga_init(1024, 768);
-    if (magic != 0x2BADB002) {
-        volatile uint16_t* vga = (volatile uint16_t*)0xB8000;
-        vga[0] = 0x4F45; // 'E'
-        for (;;)
-            asm volatile("hlt");
-    }
+
     // ── Step 2: determine framebuffer address ────────────────────────────────
     multiboot_info* mbi = (multiboot_info*)multiboot_addr;
 
@@ -8827,12 +8833,10 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
         uint32_t fb_phys = 0, fb_w = 1024, fb_h = 768, fb_pitch = 1024*4;
 
         if ((mbi->flags & (1u << 12)) && mbi->framebuffer_type != 2) {
-			if (fb_phys == 0) {
-				volatile uint16_t* vga = (volatile uint16_t*)0xB8000;
-				vga[1] = 0x4F46; // 'F'
-				for (;;)
-					asm volatile("hlt");
-			}
+            // GRUB filled the framebuffer fields (because boot.S requested
+            // video mode via Multiboot1 FLAGS bit 2). Take its values
+            // verbatim; this is the normal path on real BIOS + VMware-BIOS
+            // and on UEFI through GRUB-EFI (which sets it up via GOP).
             fb_phys  = (uint32_t)(uintptr_t)mbi->framebuffer_addr;
             fb_w     = mbi->framebuffer_width  ? mbi->framebuffer_width  : 1024;
             fb_h     = mbi->framebuffer_height ? mbi->framebuffer_height : 768;
