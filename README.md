@@ -7,7 +7,7 @@ CTRL-Q saves and exits text editor...
 SATA port selection with 'disk_select'
 
 
-TODO: more GUI features, get busybox working and test elf functionality(currently some bochs instances may need a window refresh due to some type of print conflict).
+TODO: more GUI features, get busybox working and test elf functionality(currently some bochs instances may need a window refresh due to some type of print/memory conflict).
 
 
 TODO: bochs register keyboard and framebuffer. (test execution available)
