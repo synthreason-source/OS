@@ -13,3 +13,5 @@ TODO: more GUI features, get busybox working and test elf functionality(currentl
 TODO: bochs register keyboard and framebuffer. (test execution available)
 
 TODO: add elf pipe arguments & batch commands, ethernet, open source web browser.
+
+TODO: fix FAT32 compatibility
