@@ -2626,11 +2626,100 @@ void start_cmd(HBA_PORT *port) {
     port->cmd |= 0x0001; // Set ST (Start)
 }
 void disk_init() {
-    // Find the AHCI controller's base address (scan 8 buses; skip empty slots)
-    for (uint16_t bus = 0; bus < 8; bus++) for (uint8_t dev = 0; dev < 32; dev++) if ((pci_read_config_dword(bus, dev, 0, 0) & 0xFFFF) != 0xFFFF && (pci_read_config_dword(bus, dev, 0, 0x08) >> 16) == 0x0106) { ahci_base = pci_read_config_dword(bus, dev, 0, 0x24) & 0xFFFFFFF0; goto found; }
-found:
-    if (!ahci_base) return;
+    // ─────────────────────────────────────────────────────────────────────
+    // Find the AHCI controller on PCI.
+    //
+    // Why the previous one-liner missed real hardware:
+    //   1. It only checked function 0. On every Intel chipset the SATA
+    //      controller lives at 00:1F.2 — bus 0, dev 0x1F, function 2.
+    //      QEMU and VMware happened to put theirs on function 0, which
+    //      is why those worked while bare metal never did.
+    //   2. It only matched class/subclass 0x0106 (SATA/AHCI). Many
+    //      consumer machines (Dell, HP, Lenovo) ship with BIOS default
+    //      "RAID On", in which case the same hardware reports 0x0104
+    //      (RAID) while still being AHCI-compatible underneath. Some
+    //      Marvell/ASMedia add-in cards report 0x0180 ("Other").
+    //   3. It scanned only 8 buses. Cheap to widen.
+    // ─────────────────────────────────────────────────────────────────────
+    ahci_base = 0;
+    uint16_t found_bus = 0; uint8_t found_dev = 0; uint8_t found_fn = 0;
+    bool found = false;
 
+    for (uint16_t bus = 0; bus < 256 && !found; bus++) {
+        for (uint8_t dev = 0; dev < 32 && !found; dev++) {
+            for (uint8_t fn = 0; fn < 8 && !found; fn++) {
+                uint32_t vd = pci_read_config_dword(bus, dev, fn, 0x00);
+                if ((vd & 0xFFFFu) == 0xFFFFu) continue;   // empty slot
+
+                uint32_t cc = pci_read_config_dword(bus, dev, fn, 0x08);
+                uint8_t base_class = (cc >> 24) & 0xFFu;
+                uint8_t subclass   = (cc >> 16) & 0xFFu;
+
+                if (base_class != 0x01) continue;          // not mass storage
+                // Accept SATA(6), RAID(4), and Other(0x80).
+                if (subclass != 0x06 && subclass != 0x04 && subclass != 0x80)
+                    continue;
+
+                // BAR5 = ABAR (AHCI Base Memory Register).
+                uint32_t bar5 = pci_read_config_dword(bus, dev, fn, 0x24);
+                if (bar5 & 1u) continue;                    // I/O BAR, not MMIO
+                uint32_t abar = bar5 & 0xFFFFFFF0u;
+                if (abar < 0x1000u) continue;               // empty / unmapped
+
+                ahci_base = abar;
+                found_bus = bus; found_dev = dev; found_fn = fn;
+                found = true;
+            }
+        }
+    }
+
+    if (!ahci_base) {
+        wm.print_to_focused("AHCI: no controller found on any PCI bus.\n");
+        wm.print_to_focused("  On bare metal: set SATA mode to AHCI in BIOS\n");
+        wm.print_to_focused("  (look for 'SATA Operation' / 'SATA Mode Selection').\n");
+        return;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Enable bus-master + memory-space decode in the PCI command register.
+    // Firmware *usually* leaves these on for the boot device, but UEFI
+    // platforms that booted via NVMe/USB sometimes leave the SATA
+    // controller un-enabled.
+    // ─────────────────────────────────────────────────────────────────────
+    {
+        uint32_t cmd = pci_read_config_dword(found_bus, found_dev, found_fn, 0x04);
+        uint32_t addr_reg = 0x80000000u
+                          | ((uint32_t)found_bus << 16)
+                          | ((uint32_t)found_dev << 11)
+                          | ((uint32_t)found_fn  <<  8)
+                          | 0x04u;
+        outl(0xCF8, addr_reg);
+        outl(0xCFC, cmd | 0x06u);    // bit 1 = memory, bit 2 = bus master
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Engage AHCI mode (GHC.AE = bit 31 of Global Host Control at MMIO
+    // offset 0x04). Needed when the HBA came up in legacy / IDE-compat
+    // mode, which is common on Intel chipsets where the firmware didn't
+    // explicitly flip the mode-select bit during POST.
+    // ─────────────────────────────────────────────────────────────────────
+    {
+        volatile uint32_t* ghc = (volatile uint32_t*)(uintptr_t)(ahci_base + 0x04);
+        *ghc |= (1u << 31);                                  // AE
+        // Brief spin so the HBA acknowledges before we read PxSSTS / PI.
+        for (volatile uint32_t i = 0; i < 100000u; i++);
+    }
+
+    {
+        char msg[96];
+        snprintf(msg, sizeof(msg),
+                 "AHCI: found at %02x:%02x.%x  ABAR=0x%08x\n",
+                 (unsigned)found_bus, (unsigned)found_dev, (unsigned)found_fn,
+                 (unsigned)ahci_base);
+        wm.print_to_focused(msg);
+    }
+
+    // ── Allocate command list / FIS / cmd-table buffers ─────────────────
     cmd_list = (HBA_CMD_HEADER*)alloc_aligned(32 * sizeof(HBA_CMD_HEADER), 1024);
     cmd_table_buffer = (char*)alloc_aligned(32 * 256, 128);
     g_ahci_fis_buffer = (char*)alloc_aligned(256, 256);
@@ -2641,7 +2730,7 @@ found:
         cmd_list[k].ctba = (uint64_t)(uintptr_t)(cmd_table_buffer + (k * 256));
     }
 
-    uint32_t ports_implemented = *(volatile uint32_t*)(ahci_base + 0x0C);
+    uint32_t ports_implemented = *(volatile uint32_t*)(uintptr_t)(ahci_base + 0x0C);
 
     // Auto-select the first implemented port that has an active device.
     // ahci_port_setup() does the per-port command-engine programming so
@@ -2650,29 +2739,188 @@ found:
         if (!(ports_implemented & (1 << i))) continue;
         if (ahci_port_setup(i)) {
             g_ahci_port = i;
+            char msg[64];
+            snprintf(msg, sizeof(msg), "AHCI: port %d active.\n", i);
+            wm.print_to_focused(msg);
             return;
         }
     }
+    wm.print_to_focused("AHCI: controller found but no active drive on any port.\n");
 }bool fat32_init() {
     if (!ahci_base) return false;
-    char* buffer = new char[SECTOR_SIZE];
 
     // Boot sector is always plaintext — read it raw regardless of crypto state
     bool was_enabled = g_fs_encryption_enabled;
     g_fs_encryption_enabled = false;
-    int result = read_write_sectors(g_ahci_port, 0, 1, false, buffer);
+
+    char* buffer = new char[SECTOR_SIZE];
+    if (!buffer) {
+        g_fs_encryption_enabled = was_enabled;
+        return false;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Sector 0 can be one of three things on a real disk:
+    //   (a) Raw FAT32 boot sector — what mkfat32.py produces for QEMU/VMware.
+    //       Identifiable by "FAT32   " string at offset 82.
+    //   (b) Classic MBR — first 446 bytes are bootstrap, then a 4-entry
+    //       partition table at offset 446, then signature 0x55 0xAA at 510.
+    //       FAT32 partition types are 0x0B, 0x0C, 0x1B, 0x1C.
+    //   (c) GPT protective MBR — signature 0x55 0xAA at 510, but the
+    //       partition table contains exactly one entry of type 0xEE
+    //       spanning the disk; the real GPT header lives at LBA 1, with
+    //       128-byte entries starting at LBA 2 (or wherever the header
+    //       says).
+    //
+    // We resolve the FAT32 partition's start LBA into partition_lba.
+    // fat_start_sector / data_start_sector then carry absolute disk LBAs,
+    // so cluster_to_lba and read_fat_entry keep working unchanged.
+    // ─────────────────────────────────────────────────────────────────────
+    if (read_write_sectors(g_ahci_port, 0, 1, false, buffer) != 0) {
+        g_fs_encryption_enabled = was_enabled;
+        delete[] buffer;
+        return false;
+    }
+
+    uint64_t partition_lba = 0;
+    bool     found_fat32   = false;
+    bool     sector0_is_fat32 = (strncmp(buffer + 82, "FAT32", 5) == 0);
+    bool     has_mbr_sig =
+        ((uint8_t)buffer[510] == 0x55 && (uint8_t)buffer[511] == 0xAA);
+
+    if (sector0_is_fat32) {
+        // (a) Raw image. Sector 0 itself is the BPB. partition_lba stays 0.
+        found_fat32 = true;
+    } else if (has_mbr_sig) {
+        // Detect GPT protective MBR vs classic MBR.
+        bool is_protective_mbr = false;
+        for (int i = 0; i < 4; i++) {
+            if ((uint8_t)buffer[446 + i*16 + 4] == 0xEE) {
+                is_protective_mbr = true;
+                break;
+            }
+        }
+
+        if (is_protective_mbr) {
+            // ───── (c) GPT path ────────────────────────────────────────
+            // Read GPT header at LBA 1. Header layout (only the fields
+            // we need): signature "EFI PART" at offset 0, partition-
+            // entry LBA at offset 72 (8 bytes), num_entries at offset 80
+            // (4 bytes), entry_size at offset 84 (4 bytes).
+            char* gpt_hdr = new char[SECTOR_SIZE];
+            if (gpt_hdr &&
+                read_write_sectors(g_ahci_port, 1, 1, false, gpt_hdr) == 0 &&
+                strncmp(gpt_hdr, "EFI PART", 8) == 0)
+            {
+                uint64_t pe_lba   = *(uint64_t*)(gpt_hdr + 72);
+                uint32_t pe_count = *(uint32_t*)(gpt_hdr + 80);
+                uint32_t pe_size  = *(uint32_t*)(gpt_hdr + 84);
+
+                // Sanity-cap; GPT spec mandates >= 128 entries, 128-byte size.
+                if (pe_count > 256) pe_count = 256;
+                if (pe_size  < 128 || pe_size > SECTOR_SIZE) pe_size = 128;
+
+                uint32_t entries_per_sector = SECTOR_SIZE / pe_size;
+                uint32_t sectors_to_read    =
+                    (pe_count + entries_per_sector - 1) / entries_per_sector;
+
+                char* entries = new char[SECTOR_SIZE];
+                for (uint32_t s = 0;
+                     entries && s < sectors_to_read && !found_fat32; s++)
+                {
+                    if (read_write_sectors(g_ahci_port, pe_lba + s, 1,
+                                           false, entries) != 0) break;
+                    for (uint32_t e = 0;
+                         e < entries_per_sector && !found_fat32; e++)
+                    {
+                        char*    ent       = entries + e * pe_size;
+                        uint64_t first_lba = *(uint64_t*)(ent + 32);
+                        if (first_lba == 0) continue;   // empty slot
+
+                        // Don't filter on type-GUID — just probe each
+                        // partition's first sector for the FAT32 string.
+                        // Avoids hard-coding the Microsoft Basic Data
+                        // GUID (which most FAT32 ESP/data partitions
+                        // use, but some installers vary).
+                        if (read_write_sectors(g_ahci_port, first_lba, 1,
+                                               false, buffer) != 0) continue;
+                        if (strncmp(buffer + 82, "FAT32", 5) == 0) {
+                            partition_lba = first_lba;
+                            found_fat32   = true;
+                        }
+                    }
+                }
+                delete[] entries;
+            }
+            delete[] gpt_hdr;
+        } else {
+            // ───── (b) Classic MBR path ────────────────────────────────
+            // Walk the 4-entry partition table. Take the first FAT32
+            // partition whose boot sector verifies.
+            for (int i = 0; i < 4 && !found_fat32; i++) {
+                uint8_t* part = (uint8_t*)(buffer + 446 + i * 16);
+                uint8_t  type = part[4];
+                if (type != 0x0B && type != 0x0C &&
+                    type != 0x1B && type != 0x1C) continue;
+
+                uint64_t lba = (uint64_t) part[8]         |
+                               ((uint64_t)part[9]  <<  8) |
+                               ((uint64_t)part[10] << 16) |
+                               ((uint64_t)part[11] << 24);
+                if (lba == 0) continue;
+
+                if (read_write_sectors(g_ahci_port, lba, 1, false, buffer) == 0
+                    && strncmp(buffer + 82, "FAT32", 5) == 0)
+                {
+                    partition_lba = lba;
+                    found_fat32   = true;
+                }
+            }
+        }
+    }
+
     g_fs_encryption_enabled = was_enabled;
 
-    if (result != 0) { delete[] buffer; return false; }
+    if (!found_fat32) {
+        delete[] buffer;
+        current_directory_cluster = 0;
+        if (sector0_is_fat32) {
+            // Shouldn't happen — we already set found_fat32 above.
+        } else if (has_mbr_sig) {
+            wm.print_to_focused("FAT32: partition table present, but no FAT32 partition.\n");
+            wm.print_to_focused("  Create one (MBR type 0x0C, or GPT 'Microsoft Basic Data').\n");
+        } else {
+            wm.print_to_focused("FAT32: disk has no partition table and no FAT32 BPB.\n");
+            wm.print_to_focused("  Either format the disk or write a raw FAT32 image.\n");
+        }
+        return false;
+    }
+
+    // `buffer` now holds the FAT32 BPB (sector 0 directly, or the
+    // partition's first sector via MBR/GPT lookup).
     memcpy(&bpb, buffer, sizeof(bpb));
     delete[] buffer;
+
     if (strncmp(bpb.fil_sys_type, "FAT32", 5) != 0) {
+        // Defensive: shouldn't trigger because we verified above.
         current_directory_cluster = 0;
         return false;
     }
-    fat_start_sector = bpb.rsvd_sec_cnt;
+
+    // fat_start_sector / data_start_sector hold ABSOLUTE disk LBAs.
+    // partition_lba == 0 for the raw-image case, so QEMU/VMware
+    // behaviour is byte-for-byte unchanged.
+    fat_start_sector  = partition_lba + bpb.rsvd_sec_cnt;
     data_start_sector = fat_start_sector + (bpb.num_fats * bpb.fat_sz32);
     current_directory_cluster = bpb.root_clus;
+
+    if (partition_lba) {
+        char msg[96];
+        snprintf(msg, sizeof(msg),
+                 "FAT32: partition @ LBA %u, root_clus %u\n",
+                 (unsigned)partition_lba, (unsigned)current_directory_cluster);
+        wm.print_to_focused(msg);
+    }
     return true;
 }
 uint64_t cluster_to_lba(uint32_t cluster) {
@@ -8875,8 +9123,13 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
 
     // ── AHCI disk + FAT32 ─────────────────────────────────────────────────────
     disk_init();
-	const char disk[1] = {'1'};
-	cmd_list_and_select_disk(disk);
+    // Don't hardcode a port selection here — disk_init() already
+    // auto-selected the first port with an attached device. Hardcoding
+    // "1" only worked on the QEMU command line in compile.md (which puts
+    // the hard disk on ahci.1); bare-metal and VMware almost always have
+    // the boot disk on port 0 and would have silently fallen back to no
+    // selection. Pass "" to just list the detected ports for the user.
+    cmd_list_and_select_disk("");
 
     if (ahci_base) {
         fat32_init();
