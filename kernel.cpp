@@ -3011,10 +3011,33 @@ uint32_t read_fat_entry(uint32_t cluster) {
 bool write_fat_entry(uint32_t cluster, uint32_t value) {
     uint8_t* fat_sector = new uint8_t[SECTOR_SIZE];
     uint32_t fat_offset = cluster * 4;
-    uint32_t sector_num = fat_start_sector + (fat_offset / SECTOR_SIZE);
+    uint32_t fat_sector_index = fat_offset / SECTOR_SIZE;
+    uint32_t sector_num = fat_start_sector + fat_sector_index;
+
     read_write_sectors(g_ahci_port, sector_num, 1, false, fat_sector);
-    *(uint32_t*)(fat_sector + (fat_offset % SECTOR_SIZE)) = (*(uint32_t*)(fat_sector + (fat_offset % SECTOR_SIZE)) & 0xF0000000) | (value & 0x0FFFFFFF);
+    *(uint32_t*)(fat_sector + (fat_offset % SECTOR_SIZE)) =
+        (*(uint32_t*)(fat_sector + (fat_offset % SECTOR_SIZE)) & 0xF0000000) |
+        (value & 0x0FFFFFFF);
+
     bool success = read_write_sectors(g_ahci_port, sector_num, 1, true, fat_sector) == 0;
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Mirror to FAT2. The FAT32 spec says: if BPB_ExtFlags bit 7 is clear
+    // (the default), the FAT is mirrored — every update must hit FAT1 AND
+    // FAT2. Windows CHKDSK and Linux dosfsck both treat FAT1/FAT2 mismatch
+    // as filesystem corruption and may "repair" by overwriting the live
+    // FAT from the stale one. The old code wrote only FAT1, guaranteeing
+    // every file created by this OS looked corrupted to any other OS.
+    //
+    // If ext_flags bit 7 is set, only the FAT specified by bits 0-3 is
+    // active; honour that and skip the mirror.
+    // ─────────────────────────────────────────────────────────────────────
+    bool mirror_fats = (bpb.ext_flags & 0x0080) == 0;
+    if (success && mirror_fats && bpb.num_fats >= 2) {
+        uint32_t fat2_sector_num = fat_start_sector + bpb.fat_sz32 + fat_sector_index;
+        success = read_write_sectors(g_ahci_port, fat2_sector_num, 1, true, fat_sector) == 0;
+    }
+
     delete[] fat_sector;
     return success;
 }
@@ -3457,77 +3480,151 @@ void fat32_format() {
     fat32_bpb_t new_bpb;
     memset(&new_bpb, 0, sizeof(fat32_bpb_t));
     new_bpb.jmp[0] = 0xEB; new_bpb.jmp[1] = 0x58; new_bpb.jmp[2] = 0x90;
-    memcpy(new_bpb.oem, "MYOS    ", 8);
+    memcpy(new_bpb.oem, "MSWIN4.1", 8);   // canonical OEM string — what
+                                          // mkfs.vfat and Windows write;
+                                          // some tools key off this exact
+                                          // string when probing.
     new_bpb.bytes_per_sec = 512;
-    new_bpb.sec_per_clus = 8;
     new_bpb.rsvd_sec_cnt = 32;
     new_bpb.num_fats = 2;
     new_bpb.media = 0xF8;
     new_bpb.sec_per_trk = 32;
     new_bpb.num_heads = 64;
+
     uint32_t total_sectors = (128 * 1024 * 1024) / 512;
     new_bpb.tot_sec32 = total_sectors;
-    // Microsoft FAT32 FAT size formula (from FAT spec section 3.5):
-    // TmpVal1 = DskSize - BPB_RsvdSecCnt
-    // TmpVal2 = (256 * BPB_SecPerClus + BPB_NumFATs) / 2
-    // FATSz   = ceil(TmpVal1 / TmpVal2)
+
+    // ─────────────────────────────────────────────────────────────────────
+    // sec_per_clus selection per Microsoft FAT spec ("Determining FAT
+    // Type") plus the FAT32 cluster-count minimum.
+    //
+    // FAT32 is only legitimate when the data-area cluster count is
+    // >= 65525. With sec_per_clus = 8 (4 KB clusters) on a 128 MB volume
+    // we'd get ~32k clusters and the volume falls into the FAT32
+    // exclusion zone — most strict validators (Windows fastfat, dosfstools
+    // > 4.0) reject this as "ambiguous / probably FAT16".
+    //
+    // Pick the smallest sec_per_clus that yields >= 65525 clusters; for a
+    // 128 MB volume that's 1 sector per cluster (≈262k clusters), which
+    // is exactly what mkfs.vfat -F 32 also chooses for this size.
+    // ─────────────────────────────────────────────────────────────────────
+    {
+        uint8_t spc_candidates[] = { 1, 2, 4, 8, 16, 32, 64, 128 };
+        uint8_t chosen = 1;
+        for (uint32_t k = 0; k < sizeof(spc_candidates); k++) {
+            uint8_t spc = spc_candidates[k];
+            // Microsoft FAT size formula (FAT spec section 3.5).
+            uint32_t tmp1 = total_sectors - new_bpb.rsvd_sec_cnt;
+            uint32_t tmp2 = (256u * spc + new_bpb.num_fats) / 2u;
+            uint32_t fat_sz = (tmp1 + tmp2 - 1u) / tmp2;
+            uint32_t data_sec = total_sectors -
+                                new_bpb.rsvd_sec_cnt -
+                                new_bpb.num_fats * fat_sz;
+            uint32_t clusters = data_sec / spc;
+            if (clusters >= 65525u) { chosen = spc; break; }
+        }
+        new_bpb.sec_per_clus = chosen;
+    }
+
     {
         uint32_t tmp1 = total_sectors - new_bpb.rsvd_sec_cnt;
         uint32_t tmp2 = (256u * new_bpb.sec_per_clus + new_bpb.num_fats) / 2u;
-        new_bpb.fat_sz32 = (tmp1 + tmp2 - 1u) / tmp2; // = 256 for 128MB/8sec-clus
+        new_bpb.fat_sz32 = (tmp1 + tmp2 - 1u) / tmp2;
     }
     new_bpb.root_clus = 2;
-    new_bpb.fs_info = 1;
-    new_bpb.bk_boot_sec = 6;
+    new_bpb.fs_info = 1;        // FSInfo sector lives at partition + 1
+    new_bpb.bk_boot_sec = 6;    // backup boot sector at partition + 6
+    new_bpb.ext_flags = 0;      // 0 = mirror FATs (default, matches write_fat_entry)
     new_bpb.drv_num = 0x80;
     new_bpb.boot_sig = 0x29;
-    new_bpb.vol_id = 0x12345678; // Example volume ID
+    new_bpb.vol_id = 0x12345678;
     memcpy(new_bpb.vol_lab, "MYOS VOL   ", 11);
     memcpy(new_bpb.fil_sys_type, "FAT32   ", 8);
-    
+
     wm.print_to_focused("Writing new boot sector...\n");
     char* boot_sector_buffer = new char[SECTOR_SIZE];
     memset(boot_sector_buffer, 0, SECTOR_SIZE);
     memcpy(boot_sector_buffer, &new_bpb, sizeof(fat32_bpb_t));
-    // Boot-sector signature required by the FAT spec: the last two bytes
-    // of sector 0 must be 0x55 0xAA. The old code zeroed them (despite a
-    // comment saying the opposite), leaving an invalid boot sector that
-    // disk tools and firmware reject.
+    // Boot-sector signature required by the FAT spec: last two bytes of
+    // sector 0 MUST be 0x55 0xAA. Without it Windows refuses to mount
+    // ("drive needs to be formatted") and Linux returns -EINVAL from
+    // mount(2). The old code wrote 0x55/0xAA then immediately overwrote
+    // both with zero in the next two statements.
     boot_sector_buffer[510] = (char)0x55;
     boot_sector_buffer[511] = (char)0xAA;
-    boot_sector_buffer[510] = (char)0x00;
-    boot_sector_buffer[511] = (char)0x00;
-    // The boot sector must be stored PLAINTEXT. fat32_init() always reads
-    // sector 0 with encryption forced off ("boot sector is always
-    // plaintext"). If encryption is armed and we let read_write_sectors
-    // XOR-encrypt this write, fat32_init() reads it back as plaintext,
-    // sees garbage where "FAT32" should be, and reports re-init failure.
-    // Force encryption off for just this one write, then restore it.
+
     // Where do we write the BPB? On a raw image (g_partition_lba==0)
     // it's sector 0. On a partitioned disk it's the partition's first
     // sector; writing to sector 0 there would destroy the MBR/GPT and
     // brick every other OS on the box.
     uint64_t bpb_lba = g_partition_lba;
 
+    // ── Plaintext window: BPB / FSInfo / backup BPB are spec-defined
+    //    structures every other OS reads with byte-exact validators, so
+    //    they MUST go to disk un-encrypted regardless of FS-encryption.
     bool boot_sec_was_enc = g_fs_encryption_enabled;
     g_fs_encryption_enabled = false;
+
     if (read_write_sectors(g_ahci_port, bpb_lba, 1, true, boot_sector_buffer) != 0) {
-        // The boot sector carries the BPB. If it could not be written
-        // there is no valid filesystem geometry on disk, so abort rather
-        // than writing FATs/root-dir onto an unformatted layout. (The
-        // old code both left this return commented out AND deleted the
-        // buffer twice — once here, once after the block.)
         wm.print_to_focused("Error: Failed to write new boot sector.\n");
         delete[] boot_sector_buffer;
-        g_fs_encryption_enabled = boot_sec_was_enc;   // restore
-        //return;
+        g_fs_encryption_enabled = boot_sec_was_enc;
+        return;
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Backup boot sector at bk_boot_sec (=6). Required by the FAT spec.
+    // Linux dosfsck -a will detect a mismatched/missing backup and
+    // "repair" the primary from the backup; if the backup is absent
+    // (= sector full of zeros) it can corrupt the live boot sector.
+    // ─────────────────────────────────────────────────────────────────────
+    wm.print_to_focused("Writing backup boot sector...\n");
+    if (read_write_sectors(g_ahci_port, bpb_lba + new_bpb.bk_boot_sec, 1,
+                           true, boot_sector_buffer) != 0)
+    {
+        wm.print_to_focused("Warning: backup boot sector write failed.\n");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // FSInfo sector at bpb_lba + fs_info (=1). Spec layout (sector
+    // pretty-much entirely zero except four fixed signatures and two
+    // values):
+    //   offset   0   uint32   LeadSig   = 0x41615252  ("RRaA")
+    //   offset 484   uint32   StrucSig  = 0x61417272  ("rrAa")
+    //   offset 488   uint32   FreeCount = 0xFFFFFFFF  (unknown → recompute)
+    //   offset 492   uint32   NextFree  = 0xFFFFFFFF  (unknown → search)
+    //   offset 508   uint32   TrailSig  = 0xAA550000
+    // Setting FreeCount/NextFree to 0xFFFFFFFF is the spec-blessed
+    // "values not maintained" sentinel, so Windows / Linux will recompute
+    // on first mount and we never have to keep them in sync during write.
+    // ─────────────────────────────────────────────────────────────────────
+    wm.print_to_focused("Writing FSInfo sector...\n");
+    memset(boot_sector_buffer, 0, SECTOR_SIZE);
+    *(uint32_t*)(boot_sector_buffer +   0) = 0x41615252u;
+    *(uint32_t*)(boot_sector_buffer + 484) = 0x61417272u;
+    *(uint32_t*)(boot_sector_buffer + 488) = 0xFFFFFFFFu;
+    *(uint32_t*)(boot_sector_buffer + 492) = 0xFFFFFFFFu;
+    *(uint32_t*)(boot_sector_buffer + 508) = 0xAA550000u;
+    if (read_write_sectors(g_ahci_port, bpb_lba + new_bpb.fs_info, 1,
+                           true, boot_sector_buffer) != 0)
+    {
+        wm.print_to_focused("Warning: FSInfo sector write failed.\n");
+    }
+
+    // Most distributions also keep a backup FSInfo at bk_boot_sec + 1.
+    if (read_write_sectors(g_ahci_port, bpb_lba + new_bpb.bk_boot_sec + 1, 1,
+                           true, boot_sector_buffer) != 0)
+    {
+        // Non-fatal — backup FSInfo is recommended but not required.
+    }
+
     delete[] boot_sector_buffer;
-    g_fs_encryption_enabled = boot_sec_was_enc;       // restore
+    g_fs_encryption_enabled = boot_sec_was_enc;
 
     memcpy(&bpb, &new_bpb, sizeof(fat32_bpb_t));
     fat_start_sector  = (uint32_t)(bpb_lba + bpb.rsvd_sec_cnt);
     data_start_sector = fat_start_sector + (bpb.num_fats * bpb.fat_sz32);
+    g_partition_lba = bpb_lba;
 
     uint8_t* zero_sector = new uint8_t[SECTOR_SIZE];
     memset(zero_sector, 0, SECTOR_SIZE);
