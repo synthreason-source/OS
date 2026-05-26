@@ -232,7 +232,7 @@ $(LYNX_DIR)/.extracted: $(LYNX_ARCHIVE)
 # whenever new patches are added. Make compares timestamps, not recipe
 # contents, so a renamed stamp is the cleanest way to force re-application
 # on a tree that already has an older stamp from a previous build round.
-$(LYNX_DIR)/.patched-r4: $(LYNX_DIR)/.extracted
+$(LYNX_DIR)/.patched-r6: $(LYNX_DIR)/.extracted
 	@echo ">>> Patching Lynx source for modern glibc/gcc/ncurses..."
 	# (1) Drop Lynx's local putenv() prototype — it declares the arg as
 	#     `const char *`, glibc's stdlib.h declares it as `char *`, and
@@ -260,10 +260,17 @@ $(LYNX_DIR)/.patched-r4: $(LYNX_DIR)/.extracted
 	sed -i 's|^int remove(char \*name)$$|int remove(const char *name)|' $(LYNX_DIR)/src/LYUtils.c
 	# (5) glibc 2.34+ removed the `sys_nerr` and `sys_errlist` globals
 	#     (they were deprecated in 2.32). Lynx 2.9.2's HTTCP.c still
-	#     references them. Replace `sys_errlist[X]` with `strerror(X)`
-	#     and `sys_nerr` with `INT_MAX` (the bound check `errno<sys_nerr`
-	#     becomes a tautology, which is fine because strerror handles
-	#     out-of-range errno values itself by returning a fallback).
+	#     references them, possibly with its own `extern` declarations
+	#     guarded by `#ifdef DECL_SYS_ERRLIST`. Two-step fix:
+	#       (5a) Delete any local `extern` declarations of these symbols
+	#            so they can't survive into the compile and confuse the
+	#            substitution sed below.
+	#       (5b) Rewrite `sys_errlist[X]` to `strerror(X)` and `sys_nerr`
+	#            to `INT_MAX`. The bound check `errno<sys_nerr` becomes
+	#            a tautology, which is fine because strerror() handles
+	#            out-of-range errno itself by returning a fallback.
+	sed -i '/^[[:space:]]*extern[^;]*\bsys_nerr\b[^;]*;/d' $(LYNX_DIR)/WWW/Library/Implementation/HTTCP.c
+	sed -i '/^[[:space:]]*extern[^;]*\bsys_errlist\b[^;]*;/d' $(LYNX_DIR)/WWW/Library/Implementation/HTTCP.c
 	sed -i 's|sys_errlist\[\([^]]*\)\]|strerror(\1)|g' $(LYNX_DIR)/WWW/Library/Implementation/HTTCP.c
 	sed -i 's|\bsys_nerr\b|INT_MAX|g' $(LYNX_DIR)/WWW/Library/Implementation/HTTCP.c
 	# Make sure HTTCP.c has the headers for strerror() and INT_MAX.
@@ -281,19 +288,34 @@ $(LYNX_DIR)/.patched-r4: $(LYNX_DIR)/.extracted
 	#     compiled+linked) so the link can complete. Each stub is a
 	#     functional no-op — lynx still runs, it just skips the
 	#     corresponding optional feature.
-	@if ! grep -q "LYNX_MODERN_STUBS" $(LYNX_DIR)/src/LYUtils.c; then \
-	    echo ">>> Appending modern-toolchain stubs to LYUtils.c..."; \
+	#
+	#     Type notes: LYuseCursesPads / LYShowScrollbar / LYsb_arrow /
+	#     LYwideLines are declared `BOOLEAN` (alias for `char`) in
+	#     Lynx headers — the stubs MUST use BOOLEAN to avoid type
+	#     conflicts. LYExtSignal is NOT stubbed because Lynx's source
+	#     does define it (with a 2-arg signature); the original link
+	#     error for it was a cascade from earlier failures, not a
+	#     genuine missing symbol.
+	#
+	#     The marker is _R3 so any older _R1/_R2 block left over from
+	#     an earlier patched-r4/r5 attempt gets surgically removed
+	#     before the new block is appended.
+	@if grep -q "LYNX_MODERN_STUBS\b\|LYNX_MODERN_STUBS_R2" $(LYNX_DIR)/src/LYUtils.c; then \
+	    echo ">>> Removing previous-iteration stub block from LYUtils.c..."; \
+	    sed -i '/\/\* === LYNX_MODERN_STUBS\(_R[0-9]\)\{0,1\}:/,/\/\* === end LYNX_MODERN_STUBS\(_R[0-9]\)\{0,1\}/d' $(LYNX_DIR)/src/LYUtils.c; \
+	fi
+	@if ! grep -q "LYNX_MODERN_STUBS_R3" $(LYNX_DIR)/src/LYUtils.c; then \
+	    echo ">>> Appending modern-toolchain stubs (R3) to LYUtils.c..."; \
 	    printf '\n%s\n' \
-	        '/* === LYNX_MODERN_STUBS: appended by OS-main Makefile === */' \
+	        '/* === LYNX_MODERN_STUBS_R3: appended by OS-main Makefile === */' \
 	        '#include <stdlib.h>' \
-	        'int  LYuseCursesPads = 0;' \
-	        'int  LYShowScrollbar = 0;' \
-	        'int  LYsb_arrow      = 0;' \
-	        'int  LYwideLines     = 0;' \
+	        'BOOLEAN LYuseCursesPads = 0;' \
+	        'BOOLEAN LYShowScrollbar = 0;' \
+	        'BOOLEAN LYsb_arrow      = 0;' \
+	        'int     LYwideLines     = 0;' \
 	        'void lynx_setup_colors(void) {}' \
-	        'void LYExtSignal(int sig) { (void)sig; }' \
 	        'long long LYatoll(const char *s) { return atoll(s); }' \
-	        '/* === end LYNX_MODERN_STUBS === */' \
+	        '/* === end LYNX_MODERN_STUBS_R3 === */' \
 	        >> $(LYNX_DIR)/src/LYUtils.c; \
 	fi
 	touch $@
@@ -301,7 +323,7 @@ $(LYNX_DIR)/.patched-r4: $(LYNX_DIR)/.extracted
 # Configure + build a minimal static 32-bit lynx. SSL is disabled because
 # the kernel has no TCP/IP stack; lynx is still useful for local HTML.
 # A few rarely-used protocols are disabled to shrink the binary.
-$(LYNX_BIN): $(LYNX_DIR)/.patched-r4
+$(LYNX_BIN): $(LYNX_DIR)/.patched-r6
 	@echo ">>> Configuring Lynx (static, 32-bit, no SSL)..."
 	cd $(LYNX_DIR) && ./configure \
 	    --host=i686-linux-gnu \
