@@ -27,6 +27,17 @@ BOCHS_CPU_LIB   := $(BOCHS_DIR)/cpu/libcpu.a
 BUSYBOX_URL := https://busybox.net/downloads/binaries/1.35.0-i686-linux-musl/busybox
 BUSYBOX_BIN := busybox
 
+# ── Lynx text-mode web browser ───────────────────────────────
+# Built from source (no canonical prebuilt static i686 binary exists).
+# Run `make setup` once to download + extract + build a static 32-bit
+# binary; subsequent `make` invocations pick up $(LYNX_BIN) automatically
+# via lynx_blob.o's wildcard dependency.
+LYNX_VERSION := 2.9.2
+LYNX_DIR     := lynx2-9-2
+LYNX_ARCHIVE := lynx$(LYNX_VERSION).tar.bz2
+LYNX_URL     := https://invisible-mirror.net/archives/lynx/tarballs/$(LYNX_ARCHIVE)
+LYNX_BIN     := $(LYNX_DIR)/lynx
+
 # ============================================================
 #  Top-level targets
 # ============================================================
@@ -67,7 +78,7 @@ iso: $(MULTIBOOT)
 
 
 clean:
-	rm -rf *.o main.iso iso hello hello_blob.o
+	rm -rf *.o main.iso iso hello hello_blob.o lynx_payload
 
 # distclean removes build artifacts and the disk image, but KEEPS the
 # prebuilt bochs-2.7/ tree (see note in recipe).
@@ -75,9 +86,12 @@ distclean: clean
 	# NOTE: the prebuilt bochs-2.7/ tree is intentionally NOT removed,
 	#       so the offline bundle stays buildable. Remove it by hand to
 	#       force a fresh download + configure on the next build.
-	rm -rf $(BOCHS_ARCHIVE) ramdisk.o $(DISK_IMG)
+	# The lynx tree IS removed here because, unlike Bochs, it has no
+	# "prebuilt offline bundle" status — it's purely opt-in via setup.
+	rm -rf $(BOCHS_ARCHIVE) ramdisk.o $(DISK_IMG) \
+	       $(LYNX_ARCHIVE) $(LYNX_DIR)
 
-.PHONY: all clean distclean iso test_main run-test
+.PHONY: all clean distclean iso test_main run-test setup lynx
 
 # ============================================================
 #  Bochs CPU/FPU/cpudb/memory static libraries
@@ -174,6 +188,189 @@ hello_blob.o: hello
 	@echo ">>> hello_blob.o created."
 
 # ============================================================
+#  Lynx text web browser
+# ------------------------------------------------------------
+#  Lynx is built from source because no canonical prebuilt
+#  static-i686 binary exists. The build chain is opt-in:
+#
+#    make setup          # download + extract + build static lynx
+#    make                # picks up $(LYNX_BIN) and re-embeds it
+#
+#  On a fresh checkout where setup hasn't been run, lynx_blob.o
+#  embeds a tiny "NOLYNX" stub instead — the kernel's
+#  extract_lynx_to_filesystem() rejects it (size + ELF magic
+#  check) and the `lynx` command prints a friendly "run make
+#  setup" message. This keeps the default build offline-safe.
+#
+#  Build deps (in addition to the compile.md list):
+#    libncurses-dev        # ncurses with static archives
+#  On a 64-bit host targeting 32-bit, you may also need:
+#    libncurses-dev:i386   # multi-arch static ncurses for i386
+#  installed via `dpkg --add-architecture i386 && apt update`.
+# ============================================================
+$(LYNX_ARCHIVE):
+	@echo ">>> Downloading Lynx $(LYNX_VERSION) source..."
+	wget -O $@ "$(LYNX_URL)" || curl -L -o $@ "$(LYNX_URL)"
+
+$(LYNX_DIR)/.extracted: $(LYNX_ARCHIVE)
+	@echo ">>> Extracting Lynx source into $(LYNX_DIR)/..."
+	# Don't assume what the tarball's top-level directory is called
+	# (e.g. lynx2.9.2/ vs lynx-2.9.2/ vs lynx2-9-2/). Create our own
+	# destination directory and use --strip-components=1 to flatten
+	# whatever's inside into it. Works for any inner naming convention.
+	mkdir -p $(LYNX_DIR)
+	tar -xjf $(LYNX_ARCHIVE) -C $(LYNX_DIR) --strip-components=1
+	touch $@
+
+# Patch Lynx 2.9.2 source for modern toolchains (gcc 13+, glibc 2.36+,
+# ncurses 6.x with opaque WINDOW). Each sed is idempotent (no-op if the
+# offending line is already gone), so re-running `make setup` after a
+# fresh `rm -rf $(LYNX_DIR)` is safe, and so is running it on a tree
+# that was already half-patched.
+#
+# Stamp-name convention: bump the suffix (.patched-r2, .patched-r3, ...)
+# whenever new patches are added. Make compares timestamps, not recipe
+# contents, so a renamed stamp is the cleanest way to force re-application
+# on a tree that already has an older stamp from a previous build round.
+$(LYNX_DIR)/.patched-r4: $(LYNX_DIR)/.extracted
+	@echo ">>> Patching Lynx source for modern glibc/gcc/ncurses..."
+	# (1) Drop Lynx's local putenv() prototype — it declares the arg as
+	#     `const char *`, glibc's stdlib.h declares it as `char *`, and
+	#     modern gcc treats the mismatch as a hard error (not a warning).
+	#     The system header already provides the correct declaration.
+	sed -i '/extern int putenv(const char \*string);/d' $(LYNX_DIR)/src/LYUtils.h
+	# (2) Drop Lynx's broken fallback macros in LYCurses.h that poke at
+	#     WINDOW internals (e.g. `#define getbegx(win) ((win)->_begx)`).
+	#     Modern ncurses keeps WINDOW opaque, so those struct accesses
+	#     don't compile. Removing the lines lets ncurses's own
+	#     getbegx/getbegy/getmaxx/getmaxy/getparx/getpary functions take
+	#     effect (libncurses always provides them as real symbols).
+	sed -i '/^#define[ \t][ \t]*get[a-z]*(win)[ \t][ \t]*((win)->_[a-z]*)$$/d' $(LYNX_DIR)/src/LYCurses.h
+	# (3) Realign Lynx's putenv() compat shim definition in LYUtils.c to
+	#     match glibc's signature (`char *` instead of `const char *`).
+	#     The shim is supposed to be skipped when HAVE_PUTENV is set, but
+	#     autoconf's detection sometimes fails on modern toolchains and
+	#     the shim ends up compiled. Matching glibc's signature lets it
+	#     coexist instead of erroring out.
+	sed -i 's|^int putenv(const char \*string)$$|int putenv(char *string)|' $(LYNX_DIR)/src/LYUtils.c
+	# (4) Same treatment for Lynx's remove() compat shim — change the
+	#     parameter to `const char *` to match glibc's signature.
+	#     Lynx's shim body only calls unlink/rmdir (both already take
+	#     const char *), so adding const is safe.
+	sed -i 's|^int remove(char \*name)$$|int remove(const char *name)|' $(LYNX_DIR)/src/LYUtils.c
+	# (5) glibc 2.34+ removed the `sys_nerr` and `sys_errlist` globals
+	#     (they were deprecated in 2.32). Lynx 2.9.2's HTTCP.c still
+	#     references them. Replace `sys_errlist[X]` with `strerror(X)`
+	#     and `sys_nerr` with `INT_MAX` (the bound check `errno<sys_nerr`
+	#     becomes a tautology, which is fine because strerror handles
+	#     out-of-range errno values itself by returning a fallback).
+	sed -i 's|sys_errlist\[\([^]]*\)\]|strerror(\1)|g' $(LYNX_DIR)/WWW/Library/Implementation/HTTCP.c
+	sed -i 's|\bsys_nerr\b|INT_MAX|g' $(LYNX_DIR)/WWW/Library/Implementation/HTTCP.c
+	# Make sure HTTCP.c has the headers for strerror() and INT_MAX.
+	# (The grep guards keep these idempotent on repeat runs.)
+	grep -q '#include <limits.h>' $(LYNX_DIR)/WWW/Library/Implementation/HTTCP.c \
+	    || sed -i '1i#include <limits.h>' $(LYNX_DIR)/WWW/Library/Implementation/HTTCP.c
+	grep -q '#include <string.h>' $(LYNX_DIR)/WWW/Library/Implementation/HTTCP.c \
+	    || sed -i '1i#include <string.h>' $(LYNX_DIR)/WWW/Library/Implementation/HTTCP.c
+	# (6) Lynx 2.9.2 has source-level inconsistencies where some
+	#     `#ifdef USE_FOO` guards a symbol's DEFINITION but not its
+	#     references in other files. With --disable-color-style and
+	#     friends (which we need to pass to get past configure on this
+	#     toolchain), the references go unresolved at link time. Provide
+	#     zero / no-op stubs at the end of LYUtils.c (which is always
+	#     compiled+linked) so the link can complete. Each stub is a
+	#     functional no-op — lynx still runs, it just skips the
+	#     corresponding optional feature.
+	@if ! grep -q "LYNX_MODERN_STUBS" $(LYNX_DIR)/src/LYUtils.c; then \
+	    echo ">>> Appending modern-toolchain stubs to LYUtils.c..."; \
+	    printf '\n%s\n' \
+	        '/* === LYNX_MODERN_STUBS: appended by OS-main Makefile === */' \
+	        '#include <stdlib.h>' \
+	        'int  LYuseCursesPads = 0;' \
+	        'int  LYShowScrollbar = 0;' \
+	        'int  LYsb_arrow      = 0;' \
+	        'int  LYwideLines     = 0;' \
+	        'void lynx_setup_colors(void) {}' \
+	        'void LYExtSignal(int sig) { (void)sig; }' \
+	        'long long LYatoll(const char *s) { return atoll(s); }' \
+	        '/* === end LYNX_MODERN_STUBS === */' \
+	        >> $(LYNX_DIR)/src/LYUtils.c; \
+	fi
+	touch $@
+
+# Configure + build a minimal static 32-bit lynx. SSL is disabled because
+# the kernel has no TCP/IP stack; lynx is still useful for local HTML.
+# A few rarely-used protocols are disabled to shrink the binary.
+$(LYNX_BIN): $(LYNX_DIR)/.patched-r3
+	@echo ">>> Configuring Lynx (static, 32-bit, no SSL)..."
+	cd $(LYNX_DIR) && ./configure \
+	    --host=i686-linux-gnu \
+	    --with-screen=ncurses \
+	    --without-ssl \
+	    --without-zlib \
+	    --without-bzlib \
+	    --disable-color-style \
+	    --disable-finger \
+	    --disable-gopher \
+	    --disable-news \
+	    --disable-ftp \
+	    --disable-nls \
+	    CC="gcc -m32" \
+	    CFLAGS="-m32 -O2 -fno-pie \
+	            -Wno-error=incompatible-pointer-types \
+	            -Wno-error=implicit-function-declaration \
+	            -Wno-error=int-conversion" \
+	    LDFLAGS="-m32 -static -no-pie -Wl,--allow-multiple-definition"
+	@echo ">>> Building Lynx..."
+	$(MAKE) -C $(LYNX_DIR)
+	-strip $(LYNX_BIN)
+	@echo ">>> Lynx built: $(LYNX_BIN)"
+
+# Embed lynx as a kernel blob. The wildcard dep means:
+#   - if $(LYNX_BIN) exists at parse time, lynx_payload depends on it
+#     and re-embeds whenever the binary is rebuilt;
+#   - if not (default state on a fresh checkout), the recipe writes a
+#     6-byte "NOLYNX" stub instead, which the kernel-side extractor
+#     silently rejects via its ELF-magic + size check.
+# Using a fixed intermediate name (lynx_payload) keeps the objcopy
+# --redefine-sym arguments stable regardless of where the real binary
+# lives in the tree.
+lynx_payload: $(wildcard $(LYNX_BIN))
+	@if [ -f "$(LYNX_BIN)" ]; then \
+	    echo ">>> Lynx binary found — staging as payload..."; \
+	    cp "$(LYNX_BIN)" $@; \
+	else \
+	    echo ">>> Lynx not built yet — embedding stub payload."; \
+	    echo ">>> Run 'make setup' to build the real lynx, then rerun make."; \
+	    printf 'NOLYNX' > $@; \
+	fi
+
+lynx_blob.o: lynx_payload
+	@echo ">>> Embedding lynx_payload into lynx_blob.o..."
+	objcopy \
+	    -I binary \
+	    -O elf32-i386 \
+	    -B i386 \
+	    --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	    --redefine-sym _binary_lynx_payload_start=lynx_start \
+	    --redefine-sym _binary_lynx_payload_end=lynx_end   \
+	    --redefine-sym _binary_lynx_payload_size=lynx_size  \
+	    lynx_payload $@
+	@echo ">>> lynx_blob.o created."
+
+# ── One-shot bootstrap: fetch everything needed offline ──────
+# Idempotent: re-running `make setup` after a successful run is a no-op
+# (or only re-builds what's missing). Run this once on a fresh clone,
+# then `make` from then on can build without network access.
+setup: $(BUSYBOX_BIN) $(BOCHS_CPU_LIB) $(LYNX_BIN)
+	@echo ">>> setup: BusyBox, Bochs libs, and Lynx are all ready."
+	@echo ">>> Now run: make"
+
+# Convenience alias: download/build the lynx binary only.
+lynx: $(LYNX_BIN)
+	@echo ">>> lynx: $(LYNX_BIN) ready. Run 'make' to re-embed and relink."
+
+# ============================================================
 #  Bochs CPU emulation: ON by default (set BOCHS=0 to disable)
 #  bochs_infra.o provides all Bochs infrastructure globals
 #  (logfunctions, SIM, bx_cpu, bx_mem, bx_devices, etc.)
@@ -250,11 +447,11 @@ test_module.o: test_module.cpp
 # ============================================================
 #  Link
 # ============================================================
-$(MULTIBOOT): boot.o kernel.o ramdisk.o hello_blob.o test_module.o $(BOCHS_OBJ) $(BOCHS_DEP)
+$(MULTIBOOT): boot.o kernel.o ramdisk.o hello_blob.o lynx_blob.o test_module.o $(BOCHS_OBJ) $(BOCHS_DEP)
 	mkdir -p iso/boot
 	g++ -m32 -T linker.ld -nostdlib -no-pie -static \
 	    -o $(MULTIBOOT)              \
-	    boot.o kernel.o ramdisk.o hello_blob.o $(BOCHS_OBJ) \
+	    boot.o kernel.o ramdisk.o hello_blob.o lynx_blob.o $(BOCHS_OBJ) \
 	    $(BOCHS_LIBS)                \
 	    -lgcc $(LIBGCC_EH)           \
 	    -Wl,--allow-multiple-definition

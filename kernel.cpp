@@ -146,6 +146,13 @@ extern "C" uint8_t ramdisk_start[];
 extern "C" uint8_t ramdisk_end[];
 extern "C" uint8_t hello_start[];
 extern "C" uint8_t hello_end[];
+// Lynx text-mode web browser blob (embedded via lynx_blob.o). When the
+// Makefile has not been run with `make setup`, this is a tiny stub
+// payload and extract_lynx_to_filesystem() skips writing it (size + ELF
+// magic check fail). Once `make setup` has produced a real 32-bit
+// static lynx binary, lynx_blob.o re-embeds the real ELF here.
+extern "C" uint8_t lynx_start[];
+extern "C" uint8_t lynx_end[];
 
 bool extract_busybox_to_filesystem() {
     uint8_t* start = ramdisk_start;
@@ -189,6 +196,33 @@ bool extract_hello_to_filesystem() {
         if (existing.file_size == size) return true;
     }
     int result = fat32_write_file("hello", start, size);
+    return (result == 0);
+}
+
+// Write the embedded lynx ELF to FAT32 as "lynx".
+// Same shape as extract_busybox_to_filesystem, but with a larger size
+// cap because a static lynx binary is typically 1.5–3 MB. When the
+// Makefile has not been run with `make setup`, lynx_blob.o contains a
+// 6-byte "NOLYNX" stub instead of a real ELF — the size and magic
+// checks below silently fail in that case and no "lynx" file is
+// written, so typing `lynx` reports the binary is missing rather than
+// trying to run a stub.
+bool extract_lynx_to_filesystem() {
+    uint8_t* start = lynx_start;
+    uint8_t* end   = lynx_end;
+    if (end <= start) return false;
+    uint32_t size  = (uint32_t)(end - start);
+    // Real static lynx is multi-MB; cap at 16 MB to be safe.
+    if (size < 52 || size > 16 * 1024 * 1024) return false;
+    if (start[0] != 0x7f || start[1] != 'E' ||
+        start[2] != 'L'  || start[3] != 'F') return false;
+
+    fat_dir_entry_t existing;
+    uint32_t esec = 0, eoff = 0;
+    if (fat32_find_entry("lynx", &existing, &esec, &eoff) == 0) {
+        if (existing.file_size == size) return true;
+    }
+    int result = fat32_write_file("lynx", start, size);
     return (result == 0);
 }
 // --- Global Clipboard ---
@@ -6832,6 +6866,7 @@ void handle_command() {
 					  "  bochs <elf-file> [args]  -- run ELF in Bochs emulator window\n"
 					  "  hello                   -- shortcut: bochs hello\n"
 					  "  reset                   -- shortcut: bochs reset\n"
+					  "  lynx [url|file]         -- run embedded lynx text web browser\n"
 					  "  matrix help             -- NumPy-style arrays + blocked GEMM\n"
 					  "  launch <app> | clock | calc | paint | snake | mines\n"
 					  "  monitor | inspector | about   -- open desktop apps\n");
@@ -7302,6 +7337,58 @@ void handle_command() {
           || strcmp(command, "top")        == 0) { desktop_launch("monitor", &wm); }
     else if (strcmp(command, "inspector")  == 0) { desktop_launch("matrix",  &wm); }
     else if (strcmp(command, "about")      == 0) { desktop_launch("about",   &wm); }
+
+    // ----- lynx ----------------------------------------------------------
+    //   lynx                    -- usage / status
+    //   lynx help               -- richer usage
+    //   lynx <url|file>         -- run the embedded lynx ELF inside the
+    //                              current Bochs emulator window.
+    //
+    // The lynx ELF is written to FAT32 at boot by
+    // extract_lynx_to_filesystem(). If the Makefile was not built with
+    // `make setup`, lynx_blob.o holds a 6-byte stub, the extractor
+    // skips it, and `lynx` reports the binary is missing.
+    //
+    // NOTE: this OS does not yet have a TCP/IP stack, so lynx cannot
+    // fetch remote URLs. It is still useful for browsing local HTML
+    // files copied to the FAT32 disk; pass the filename as an argument
+    // (e.g. `lynx index.html`).
+    else if (strcmp(command, "lynx") == 0) {
+        char* sub = get_arg(args, 0);
+        if (sub && strcmp(sub, "help") == 0) {
+            console_print(
+                "lynx: embedded text-mode web browser (runs as a Bochs ELF)\n"
+                "  Usage:\n"
+                "    bochs                   # enter Bochs emulator mode\n"
+                "    reset                   # initialise the Bochs CPU\n"
+                "    lynx <url|file>         # run lynx on a URL or local HTML file\n"
+                "  Notes:\n"
+                "    * If you see 'binary not on disk', run `make setup`\n"
+                "      on the host, then rebuild with `make` and reboot.\n"
+                "    * This kernel has no network stack, so http(s):// URLs\n"
+                "      will not resolve; use local files on the FAT32 disk.\n");
+            return;
+        }
+
+        fat_dir_entry_t entry;
+        uint32_t sec = 0, off = 0;
+        if (fat32_find_entry("lynx", &entry, &sec, &off) != 0) {
+            console_print("lynx: binary not on disk.\n"
+                          "      The build embedded a stub instead of a real lynx ELF.\n"
+                          "      On the host, run: `make setup` then `make` and reboot.\n");
+        } else if (!is_emulator_window) {
+            console_print("lynx: type `bochs` first to enter emulator mode,\n"
+                          "      then `reset`, then `lynx <url|file>`.\n");
+        } else if (!bochs_reset_done) {
+            console_print("lynx: type `reset` first to initialise the Bochs CPU.\n");
+        } else {
+            // In emulator mode with reset done — run the lynx ELF in
+            // this window. args (if any) get passed through as argv to
+            // the guest, the same way bochs <elf> <args> works.
+            int s = load_and_execute_elf("lynx", args, this);
+            if (s >= 0) captured_elf_slot = s;
+        }
+    }
 
     // Fall-through: try to handle 'command' as an ELF file from FAT32.
     // The ELF runs inside the Bochs CPU emulator via x86_tick / cpu_loop.
@@ -9318,6 +9405,8 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
             wm.print_to_focused("BusyBox: ramdisk empty or write failed.\n");
         if (extract_hello_to_filesystem())
             wm.print_to_focused("hello: saved to FAT32.\n");
+        if (extract_lynx_to_filesystem())
+            wm.print_to_focused("lynx: saved to FAT32.\n");
     } else {
         wm.print_to_focused("FAT32: not initialised.\n");
     }
