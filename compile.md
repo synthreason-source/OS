@@ -2,7 +2,9 @@ sudo apt update
 
 sudo apt install make gcc-multilib gcc-13-multilib gcc gcc-13 binutils grub-common xorriso qemu-system-x86 build-essential nasm gcc binutils qemu-system-x86 xorriso grub-pc-bin mtools g++-multilib libncurses-dev bison flex git bc libssl-dev xorg-dev libx11-dev
 
-
+sudo dpkg --add-architecture i386
+sudo apt update
+sudo apt install libncurses-dev:i386
 
 
 # 1 Bochs test
@@ -13,6 +15,8 @@ qemu-system-i386 -cdrom test_main.iso -m 256 -debugcon stdio -no-reboot -no-shut
 
 # 1 Kernel Build
 sudo make clean
+
+sudo make setup
 
 make clean && make BOCHS=1
 
