@@ -301,7 +301,7 @@ $(LYNX_DIR)/.patched-r4: $(LYNX_DIR)/.extracted
 # Configure + build a minimal static 32-bit lynx. SSL is disabled because
 # the kernel has no TCP/IP stack; lynx is still useful for local HTML.
 # A few rarely-used protocols are disabled to shrink the binary.
-$(LYNX_BIN): $(LYNX_DIR)/.patched-r3
+$(LYNX_BIN): $(LYNX_DIR)/.patched-r4
 	@echo ">>> Configuring Lynx (static, 32-bit, no SSL)..."
 	cd $(LYNX_DIR) && ./configure \
 	    --host=i686-linux-gnu \
