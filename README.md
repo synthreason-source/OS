@@ -13,5 +13,3 @@ TODO: add TCC compiler
 TODO: bochs register keyboard and framebuffer. (test execution available)
 
 TODO: add elf pipe arguments & batch commands, ethernet, Lynx_(web_browser)
-
-TODO: fix FAT32 compatibility
