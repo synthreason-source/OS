@@ -1,50 +1,53 @@
-# 1. Dynamically gather active wmiprvse PIDs to block WMI actions
-$WmiPids = (Get-WmiObject -Class Win32_Process -Filter "Name = 'wmiprvse.exe'").ProcessId
-$ParentMatch = @()
-foreach ($WmiId in $WmiPids) { $ParentMatch += "ParentProcessId = $WmiId" }
-if ($ParentMatch.Count -eq 0) { $ParentMatch += "ParentProcessId = 0" }
-$WmiQueryPiece = $ParentMatch -join " OR "
+# 1. Get the PID of THIS exact PowerShell window so we don't kill ourselves
+$CurrentPID = $PID
 
-# 2. Build the precise Win32_ProcessStartTrace query
+# 2. Grab all active WMI Provider Host (wmiprvse) PIDs dynamically
+$WmiPids = @(Get-CimInstance -ClassName Win32_Process -Filter "Name = 'wmiprvse.exe'" | Select-Object -ExpandProperty ProcessId)
+$ParentMatch = @()
+foreach ($WmiId in $WmiPids) { 
+    if ($WmiId -and $WmiId -ne $CurrentPID) { $ParentMatch += "ParentProcessId = $WmiId" } 
+}
+$WmiQueryPiece = if ($ParentMatch.Count -gt 0) { $ParentMatch -join " OR " } else { "ParentProcessId = 0" }
+
+# 3. Build the query but EXCLUDE our current running process ID
 $Query = @"
 SELECT * FROM Win32_ProcessStartTrace 
-WHERE ProcessName = 'cmd.exe' 
-OR ProcessName = 'powershell.exe' 
-OR ProcessName = 'wscript.exe' 
-OR ProcessName = 'cscript.exe' 
-OR $WmiQueryPiece
+WHERE (
+    ProcessName = 'cmd.exe' 
+    OR ProcessName = 'powershell.exe' 
+    OR ProcessName = 'wscript.exe' 
+    OR ProcessName = 'cscript.exe' 
+    OR $WmiQueryPiece
+) AND ProcessId <> $CurrentPID
 "@
 
-$Identifier = "NativeKernelBlocker"
+$Identifier = "InstantKernelBlocker"
 
-# Clean out any conflicting event registrations in the legacy engine
-Get-EventSubscriber -SourceIdentifier $Identifier -ErrorAction SilentlyContinue | Unregister-Event
+# Clean up any stuck background events
+Unregister-Event -SourceIdentifier $Identifier -ErrorAction SilentlyContinue
 
-Write-Host "[+] Hooking Kernel Event Pipeline via Native COM..." -ForegroundColor Cyan
+Write-Host "[+] Hooking Kernel Process Engine (Excluding Current PID: $CurrentPID)..." -ForegroundColor Cyan
 
-# 3. Use Register-WmiEvent instead of CimIndication to avoid the 'Call Cancelled' block
-Register-WmiEvent -Query $Query -SourceIdentifier $Identifier -Action {
-    # Extract the target process data directly from the native WMI event properties
-    $TargetPID  = $Event.SourceEventArgs.NewEvent.ProcessId
-    $TargetName = $Event.SourceEventArgs.NewEvent.ProcessName
-    
-    # Instant enforcement drop
-    Stop-Process -Id $TargetPID -Force -ErrorAction SilentlyContinue
-    
-    Write-Host "[BLOCKED] Kernel instantly dropped unauthorized execution: $TargetName (PID: $TargetPID)" -ForegroundColor Red
-}
-
-Write-Host "[SUCCESS] Active Blocker is officially armed and listening!" -ForegroundColor Green
-Write-Host "[IMPORTANT] Keep this PowerShell script running to enforce the policy." -ForegroundColor Yellow
-Write-Host "Press Ctrl+C to terminate the monitor." -ForegroundColor White
-
-# 4. Stay Alive loop keeping the execution scope locked
+# 4. Register the event safely
 try {
-    while ($true) {
-        Start-Sleep -Seconds 1
-    }
+    Register-CimIndicationEvent -Namespace "root\cimv2" -Query $Query -SourceIdentifier $Identifier -Action {
+        $TargetPID  = $Event.SourceEventArgs.NewEvent.ProcessId
+        $TargetName = $Event.SourceEventArgs.NewEvent.ProcessName
+        
+        # Kill the target unauthorized spawn
+        Stop-Process -Id $TargetPID -Force -ErrorAction SilentlyContinue
+        
+        Write-Host "[KILLED INSTANTLY] Blocked unauthorized spawn: $TargetName (PID: $TargetPID)" -ForegroundColor Red
+    } -ErrorAction Stop
+    
+    Write-Host "[SUCCESS] Active WMI Kernel Blocker Armed!" -ForegroundColor Green
+    Write-Host "[IMPORTANT] Keep this window open. Press Ctrl+C to deactivate." -ForegroundColor Yellow
 }
 catch {
-    Write-Host "`n[-] Cleaning up native kernel event hooks..." -ForegroundColor Yellow
-    Get-EventSubscriber -SourceIdentifier $Identifier -ErrorAction SilentlyContinue | Unregister-Event
+    Write-Host "[ERROR] Registration failed: $_" -ForegroundColor Red
+}
+
+# 5. Stable, non-crashing keep-alive loop
+while ($true) {
+    [System.Threading.Thread]::Sleep(1000)
 }
