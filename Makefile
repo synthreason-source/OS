@@ -1,361 +1,343 @@
-# ============================================================
-#  Makefile – Bare-metal OS with Bochs CPU emulation + BusyBox
-# ============================================================
-
-ISODIR   := iso
-MULTIBOOT := $(ISODIR)/boot/main.elf
-MAIN     := main.iso
-DISK_IMG := disk.img
-
-# ── Compiler flags ───────────────────────────────────────────
-CXXFLAGS := -ffreestanding -O2 -Wall -Wextra \
-            -fno-use-cxa-atexit -std=c++17    \
-            -fno-exceptions -fno-rtti -m32    \
-            -fno-stack-protector              \
-            -fno-pie -fno-pic                 \
-            -include fixes.h                  \
-            -include instrument_stub.h
-
-# ── Bochs 2.7 ────────────────────────────────────────────────
-BOCHS_VERSION   := 2.7
-BOCHS_DIR       := bochs-$(BOCHS_VERSION)
-BOCHS_ARCHIVE   := $(BOCHS_DIR).tar.gz
-BOCHS_URL       := https://downloads.sourceforge.net/project/bochs/bochs/$(BOCHS_VERSION)/$(BOCHS_ARCHIVE)
-BOCHS_CPU_LIB   := $(BOCHS_DIR)/cpu/libcpu.a
-
-# ── BusyBox 32-bit static (musl) ─────────────────────────────
-BUSYBOX_URL := https://busybox.net/downloads/binaries/1.35.0-i686-linux-musl/busybox
-BUSYBOX_BIN := busybox
-
-# ============================================================
-#  Top-level targets
-# ============================================================
-all: $(MAIN) $(DISK_IMG)
-
-# ── Disk image ────────────────────────────────────────────────
-# 128 MB FAT32 image, 8 sectors/cluster, 32 reserved sectors.
-# Built by mkfat32.py (pure Python, no dosfstools package needed).
-# Created once; preserved across builds so filesystem state survives reboots.
-$(DISK_IMG):
-	@echo ">>> Creating 128 MB FAT32 disk image (no external tools needed)..."
-	python3 mkfat32.py $(DISK_IMG) 128
-	@echo ">>> $(DISK_IMG) ready."
-
-iso: $(MULTIBOOT)
-	mkdir -p iso/boot/grub
-	printf '%s\n'                                                 \
-	    'set timeout=3'                                           \
-	    'set default=0'                                           \
-	    'insmod all_video'                                        \
-	    'insmod vbe'                                              \
-	    'insmod vga'                                              \
-	    'insmod gfxterm'                                          \
-	    'terminal_input  console'                                 \
-	    'terminal_output console'                                 \
-	    'menuentry "RTOS++" {'                                    \
-	    '    multiboot /boot/main.elf'                            \
-	    '    boot'                                                \
-	    '}'                                                       \
-	    'menuentry "RTOS++ (text console only)" {'                \
-	    '    set gfxpayload=text'                                 \
-	    '    multiboot /boot/main.elf'                            \
-	    '    boot'                                                \
-	    '}'                                                       \
-	    > iso/boot/grub/grub.cfg
-	grub-mkrescue --product-name="RTOS++" -o main.iso iso -- -volid RTOSPP
-	@echo ">>> ISO ready: main.iso"
-
-
-clean:
-	rm -rf *.o main.iso iso hello hello_blob.o
-
-# distclean removes build artifacts and the disk image, but KEEPS the
-# prebuilt bochs-2.7/ tree (see note in recipe).
-distclean: clean
-	# NOTE: the prebuilt bochs-2.7/ tree is intentionally NOT removed,
-	#       so the offline bundle stays buildable. Remove it by hand to
-	#       force a fresh download + configure on the next build.
-	rm -rf $(BOCHS_ARCHIVE) ramdisk.o $(DISK_IMG)
-
-.PHONY: all clean distclean iso test_main run-test
-
-# ============================================================
-#  Bochs CPU/FPU/cpudb/memory static libraries
-# ------------------------------------------------------------
-#  OFFLINE BUNDLE: this tree ships with bochs-2.7/ already
-#  configured and with the four static libs prebuilt
-#  (cpu/libcpu.a, cpu/fpu/libfpu.a, cpu/cpudb/libcpudb.a,
-#  memory/libmemory.a). When those libs are present "make"
-#  uses them directly and performs NO download / configure.
+# =============================================================================
+# Makefile — Freestanding kernel with optional Bochs + TCC integration.
 #
-#  If the prebuilt libs are absent, the rule falls back to the
-#  original behaviour: download the tarball, extract, configure
-#  --with-nogui, and build the four libs.
-# ============================================================
-$(BOCHS_ARCHIVE):
-	wget -O $@ "$(BOCHS_URL)" || curl -L -o $@ "$(BOCHS_URL)"
+# Uses the HOST g++ with -m32 — no i686-elf cross-compiler needed.
+# Install prerequisites on Ubuntu/Debian:
+#   sudo apt install gcc g++ gcc-multilib g++-multilib binutils \
+#                    nasm mtools wget make
+#
+# Quick start:
+#   make              — build kernel (TCC stub, no download needed)
+#   make TCC=1        — build kernel with real TCC glue; downloads and builds
+#                       TCC 0.9.27 automatically if libtcc.so is missing.
+#   make fat TCC=1    — copy libtcc.so into the FAT32 disk image
+#   make all TCC=1    — build kernel AND copy libtcc.so to disk image
+# =============================================================================
 
-$(BOCHS_DIR)/.extracted: $(BOCHS_ARCHIVE)
-	tar -xzf $(BOCHS_ARCHIVE)
-	touch $@
+# ── Toolchain — host gcc/g++ with -m32, no cross-compiler needed ─────────────
+#
+# Override on the command line if you DO have a cross-compiler:
+#   make CXX=i686-elf-g++ CC=i686-elf-gcc LD=i686-elf-ld CROSS=1
+#
+CXX     := g++
+CC      := gcc
+LD      := ld
+NASM    := nasm
+OBJCOPY := objcopy
+STRIP   := strip
 
-# libcpu.a is prebuilt in the offline bundle. The download+configure
-# +build recipe only runs if the file is genuinely missing.
-$(BOCHS_CPU_LIB):
-	@if [ -f "$(BOCHS_CPU_LIB)" ]; then \
-	    echo ">>> Using prebuilt Bochs libs in $(BOCHS_DIR) (offline bundle)."; \
-	else \
-	    echo ">>> Prebuilt Bochs libs not found - downloading and building..."; \
-	    $(MAKE) $(BOCHS_DIR)/.extracted; \
-	    cd $(BOCHS_DIR) && ./configure \
-	        --enable-cpu-level=6 --enable-fpu --with-nogui \
-	        --host=i686-linux-gnu --enable-x86-64 \
-	        CXXFLAGS="-O2 -m32 -fno-stack-protector -fno-pie" \
-	        CFLAGS="-O2 -m32 -fno-stack-protector -fno-pie" && cd ..; \
-	    $(MAKE) -C $(BOCHS_DIR)/cpu; \
-	    $(MAKE) -C $(BOCHS_DIR)/cpu/fpu; \
-	    $(MAKE) -C $(BOCHS_DIR)/cpu/cpudb; \
-	    $(MAKE) -C $(BOCHS_DIR)/memory; \
+# ── Build flags ───────────────────────────────────────────────────────────────
+#
+# Key decisions:
+#
+#  -m32
+#      Emit i386 (32-bit) code.  Critical: makes sizeof(void*)==4, which
+#      matches the kernel's own  typedef unsigned int uintptr_t;  and all
+#      the pointer<->int casts throughout the code.  Without -m32 those
+#      casts produce "loses precision" hard errors.
+#
+#  -ffreestanding
+#      Do not assume a hosted C library.  The kernel supplies its own
+#      strlen, memcpy, new, etc.
+#
+#  -nostdlib
+#      Don't link CRT start files or libgcc automatically.
+#      (We pass our own kernel.ld linker script.)
+#
+#  NOTE: we do NOT pass -nostdinc.
+#      The kernel #includes <cstdarg> / <cstddef> / <cstdint> for va_list
+#      and NULL.  Those headers are part of the compiler's freestanding
+#      support (they live under $(gcc -print-file-name=include)) and work
+#      fine with -ffreestanding.  Blocking them with -nostdinc just breaks
+#      va_list without any benefit, because the kernel already re-typedefs
+#      every integer type itself.
+#
+#  -fpermissive
+#      The kernel intentionally casts string/function pointers to int
+#      (e.g. TCompiler::emit4((int)p)) because it targets i386 where
+#      pointers ARE 32-bit ints.  -m32 makes those casts safe; -fpermissive
+#      silences the remaining front-end complaints about them.
+#      Note: -Wno-pointer-to-int-cast and -Wno-int-to-pointer-cast are
+#      C/ObjC-only flags; g++ rejects them with a warning.  -fpermissive
+#      is the correct C++ equivalent for suppressing these diagnostics.
+#
+M32      := -m32
+
+CXXFLAGS := $(M32) -std=c++17 -O2 \
+            -ffreestanding -fno-exceptions -fno-rtti \
+            -fno-stack-protector -nostdlib \
+            -fpermissive \
+            -Wall -Wextra -Wno-unused-parameter \
+            -Wno-ignored-qualifiers
+
+CFLAGS   := $(M32) -std=c11 -O2 \
+            -ffreestanding -fno-stack-protector -nostdlib \
+            -Wall -Wextra -Wno-unused-parameter
+
+# ld on an x86_64 host: -melf_i386 selects the i386 ELF emulation.
+# If using i686-elf-ld, drop -melf_i386 (it is the default for that target).
+LDFLAGS  := -T kernel.ld --oformat=elf32-i386 -melf_i386 \
+            --allow-multiple-definition
+
+# ── Output ────────────────────────────────────────────────────────────────────
+KERNEL_ELF := kernel.elf
+DISK_IMG   := disk.img          # FAT32 disk image (for mcopy / Bochs)
+
+# =============================================================================
+# TCC integration — select glue vs stub at build time.
+#
+#   make TCC=0   (default) — link tcc_stub.o; no libtcc needed at all.
+#   make TCC=1             — link tcc_glue.o; downloads + builds TCC if needed.
+# =============================================================================
+TCC ?= 0
+
+TCC_VERSION   := 0.9.27
+TCC_TARBALL   := tcc-$(TCC_VERSION).tar.bz2
+TCC_URL       := https://download.savannah.gnu.org/releases/tinycc/$(TCC_TARBALL)
+TCC_SRC_DIR   := tcc-$(TCC_VERSION)
+TCC_BUILD_DIR := tcc-build-i386
+LIBTCC_SO     := $(TCC_BUILD_DIR)/libtcc.so
+
+ifeq ($(TCC),1)
+  TCC_OBJ    := tcc_glue.o
+  TCCFLAGS   := -DTCC_GLUE
+  # tcc_glue.o does NOT link against libtcc at kernel-link time.
+  # libtcc.so is loaded manually from FAT32 at runtime by tcc_module_init().
+  # libtcc_embed.o provides libtcc_start/libtcc_end via objcopy.
+  TCC_EXTRA  := libtcc_embed.o
+else
+  TCC_OBJ    := tcc_stub.o
+  TCCFLAGS   :=
+  TCC_EXTRA  :=
+endif
+
+# =============================================================================
+# Bochs integration (same pattern — keeps the existing build working)
+# =============================================================================
+BOCHS ?= 0
+
+ifeq ($(BOCHS),1)
+  BOCHS_OBJ  := bochs_glue.o
+  BOCHSFLAGS := -DBOCHS_GLUE
+else
+  BOCHS_OBJ  := bochs_stub.o
+  BOCHSFLAGS :=
+endif
+
+# ── Object files ──────────────────────────────────────────────────────────────
+KERNEL_OBJS := kernel.o       \
+               test_module_stub.o \
+               $(BOCHS_OBJ)   \
+               bochs_cstubs.o \
+               $(TCC_OBJ)     \
+               $(TCC_EXTRA)
+
+# =============================================================================
+# Phony targets
+# =============================================================================
+.PHONY: all clean clean_tcc fat fatcp tcc_download tcc_build help check_m32
+
+all: $(KERNEL_ELF)
+
+help:
+	@echo "Usage:"
+	@echo "  make              Build kernel with TCC stub (default, no download)"
+	@echo "  make TCC=1        Build with TCC glue (auto-downloads TCC 0.9.27)"
+	@echo "  make fat TCC=1    Copy libtcc.so into \$(DISK_IMG) via mtools"
+	@echo "  make all TCC=1    Build kernel + copy libtcc.so to disk"
+	@echo "  make clean        Remove build artifacts"
+	@echo "  make clean_tcc    Also remove TCC source tree and tarball"
+	@echo ""
+	@echo "Prerequisites (Ubuntu/Debian):"
+	@echo "  sudo apt install gcc g++ gcc-multilib g++-multilib binutils nasm mtools wget"
+
+# Sanity-check: ensure -m32 works (needs gcc-multilib / g++-multilib).
+check_m32:
+	@printf 'int main(){return 0;}' | \
+	  $(CXX) $(M32) -ffreestanding -nostdlib -x c++ - -o /dev/null 2>/dev/null || \
+	  { echo ""; \
+	    echo "ERROR: $(CXX) cannot produce 32-bit (-m32) output."; \
+	    echo "Fix with:  sudo apt install gcc-multilib g++-multilib"; \
+	    echo ""; \
+	    exit 1; }
+	@echo "[OK]  $(CXX) -m32 works"
+
+# =============================================================================
+# Kernel link
+# =============================================================================
+$(KERNEL_ELF): $(KERNEL_OBJS)
+	$(LD) $(LDFLAGS) -o $@ $^
+	@echo "[LD]  $@"
+
+# =============================================================================
+# Kernel compilation
+# =============================================================================
+kernel.o: kernel.cpp tcc_glue.h | check_m32
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+	@echo "[CXX] $< -> $@"
+
+# =============================================================================
+# Bochs objects
+# =============================================================================
+bochs_glue.o: bochs_glue.cpp | check_m32
+	$(CXX) $(CXXFLAGS) $(BOCHSFLAGS) -c $< -o $@
+	@echo "[CXX] $< -> $@  (BOCHS=1)"
+
+bochs_stub.o: bochs_stub.cpp | check_m32
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+	@echo "[CXX] $< -> $@  (BOCHS=0 stub)"
+
+bochs_cstubs.o: bochs_cstubs.c | check_m32
+	$(CC) $(CFLAGS) -c $< -o $@
+	@echo "[CC]  $< -> $@"
+
+# =============================================================================
+# test_module stub
+# =============================================================================
+test_module_stub.o: test_module_stub.cpp test_module.h | check_m32
+	$(CXX) $(CXXFLAGS) -c test_module_stub.cpp -o $@
+	@echo "[CXX] test_module_stub.cpp -> $@"
+
+# =============================================================================
+# TCC objects
+# =============================================================================
+
+# Real glue — libtcc.so is needed at *runtime* on FAT32, not at link time.
+tcc_glue.o: tcc_glue.cpp tcc_glue.h | tcc_build check_m32
+	$(CXX) $(CXXFLAGS) $(TCCFLAGS) -c tcc_glue.cpp -o $@
+	@echo "[CXX] tcc_glue.cpp -> $@  (TCC=1)"
+
+# Embed libtcc.so as a raw binary section so tcc_glue.cpp can access it via
+# the linker symbols libtcc_start / libtcc_end at runtime.
+# objcopy --input-target binary names the symbols after the filename:
+#   _binary_<name>_start / _binary_<name>_end / _binary_<name>_size
+# We rename them to the plain names expected by tcc_glue.cpp.
+libtcc_embed.o: $(LIBTCC_SO)
+	@# cd into the SO's directory so objcopy sees only "libtcc.so" (no path
+	@# separators), ensuring the generated symbols are named:
+	@#   _binary_libtcc_so_start / _binary_libtcc_so_end / _binary_libtcc_so_size
+	@# rather than _binary_tcc_build_i386_libtcc_so_start etc.
+	cd $(TCC_BUILD_DIR) && $(OBJCOPY) \
+	  --input-target  binary \
+	  --output-target elf32-i386 \
+	  --binary-architecture i386 \
+	  --rename-section .data=.rodata.libtcc,alloc,load,readonly,data,contents \
+	  libtcc.so $(CURDIR)/$@
+	$(OBJCOPY) \
+	  --redefine-sym _binary_libtcc_so_start=libtcc_start \
+	  --redefine-sym _binary_libtcc_so_end=libtcc_end     \
+	  --redefine-sym _binary_libtcc_so_size=libtcc_size   \
+	  $@ $@
+	@# Suppress "missing .note.GNU-stack implies executable stack" linker warning.
+	$(OBJCOPY) --add-section .note.GNU-stack=/dev/null $@ $@
+	@echo "[EMB] $(LIBTCC_SO) -> $@  (libtcc_start/libtcc_end defined)"
+
+# No-op stub — used when TCC=0.
+tcc_stub.o: tcc_stub.cpp tcc_glue.h | check_m32
+	$(CXX) $(CXXFLAGS) -c tcc_stub.cpp -o $@
+	@echo "[CXX] tcc_stub.cpp -> $@  (TCC=0 stub)"
+
+# =============================================================================
+# TCC 0.9.27 — auto-download and build libtcc.so (i386, stripped).
+# Only runs when TCC=1 and $(LIBTCC_SO) doesn't exist yet.
+# =============================================================================
+
+tcc_download: $(TCC_TARBALL)
+
+$(TCC_TARBALL):
+	@echo "[GET] Downloading TCC $(TCC_VERSION)..."
+	wget -q --show-progress -O $(TCC_TARBALL) $(TCC_URL) || \
+	  { rm -f $(TCC_TARBALL); \
+	    echo "wget failed — check your internet connection"; exit 1; }
+
+tcc_build: $(LIBTCC_SO)
+
+$(LIBTCC_SO): $(TCC_TARBALL)
+	@echo "[TAR] Unpacking $(TCC_TARBALL)..."
+	tar -xjf $(TCC_TARBALL)
+	@echo "[CFG] Configuring TCC for i386 ELF output..."
+	cd $(TCC_SRC_DIR) && \
+	  ./configure \
+	    --prefix=/tmp/tcc-i386-install \
+	    --cpu=i386                      \
+	    --enable-static                 \
+	    --disable-nls                   \
+	    --extra-cflags="-m32 -O2"       \
+	    --extra-ldflags="-m32"
+	@echo "[BLD] Building libtcc.so (i386, ~30 s)..."
+	$(MAKE) -C $(TCC_SRC_DIR) libtcc.so
+	mkdir -p $(TCC_BUILD_DIR)
+	cp $(TCC_SRC_DIR)/libtcc.so $(LIBTCC_SO)
+	$(STRIP) --strip-unneeded $(LIBTCC_SO)
+	@echo "[OK]  libtcc.so ready: $$(du -sh $(LIBTCC_SO) | cut -f1)"
+	@echo "      Copy to FAT32 disk:  make fat"
+
+# =============================================================================
+# Copy libtcc.so into the FAT32 disk image so the kernel can load it.
+# Requires mtools (mcopy) and a valid FAT32 image at $(DISK_IMG).
+# =============================================================================
+# Automatically build the disk image if it's missing, then copy libtcc.so
+fat: $(LIBTCC_SO)
+	@if [ ! -f "$(DISK_IMG)" ]; then \
+		echo "[IMG] $(DISK_IMG) not found. Creating a fresh 40MB FAT32 image..."; \
+		dd if=/dev/zero of=$(DISK_IMG) bs=1M count=40 2>/dev/null; \
+		mkfs.vfat -F 32 $(DISK_IMG) >/dev/null; \
 	fi
+	@echo "[FAT] Copying $(LIBTCC_SO) -> $(DISK_IMG)::libtcc.so"
+	mcopy -i $(DISK_IMG) -o $(LIBTCC_SO) ::libtcc.so
+	@echo "[FAT] Done. Boot the kernel and run: tcc hello.c"
 
+# Convenience: copy any file onto the disk (make fatcp SRC=hello.c)
+fatcp:
+	@test -n "$(SRC)" || { echo "Usage: make fatcp SRC=<file>"; exit 1; }
+	@test -f "$(DISK_IMG)" || \
+	  { echo "ERROR: $(DISK_IMG) not found. Set DISK_IMG=<path>."; exit 1; }
+	mcopy -i $(DISK_IMG) -o $(SRC) ::$(notdir $(SRC))
+	@echo "[FAT] Copied $(SRC) -> $(DISK_IMG)::$(notdir $(SRC))"
+# ── ISO Output Configuration ──────────────────────────────────────────────────
+ISO_OUT   := kernel.iso
+ISO_DIR   := iso_root
 
-
-# Bochs instrument stub header (required by bochs_glue.cpp).
-# Prebuilt bundle already contains it; re-copying is harmless.
-$(BOCHS_DIR)/instrument.h:
-	cp instrument_stub.h $@
-
-# ============================================================
-#  BusyBox ramdisk
-# ============================================================
-$(BUSYBOX_BIN):
-	@echo ">>> Downloading BusyBox i686 static binary..."
-	wget -O $@ "$(BUSYBOX_URL)" || curl -L -o $@ "$(BUSYBOX_URL)"
-	chmod +x $@
-	@echo ">>> BusyBox downloaded."
-
-# Embed BusyBox as read-only data in the kernel ELF.
-# IMPORTANT: -B i386 (not i386:x86-64) for a 32-bit kernel binary.
-ramdisk.o: $(BUSYBOX_BIN)
-	@echo ">>> Embedding BusyBox into ramdisk.o..."
-	objcopy \
-	    -I binary \
-	    -O elf32-i386 \
-	    -B i386 \
-	    --rename-section .data=.rodata,alloc,load,readonly,data,contents \
-	    --redefine-sym _binary_busybox_start=ramdisk_start \
-	    --redefine-sym _binary_busybox_end=ramdisk_end   \
-	    --redefine-sym _binary_busybox_size=ramdisk_size  \
-	    $(BUSYBOX_BIN) $@
-	@echo ">>> ramdisk.o created."
-
-# Tiny test ELF that prints "HELLO\n" via port 0xE9 and halts.
-# Used to verify the GDT/IDT/port-IO chain end-to-end without dragging
-# in busybox's full Linux ABI requirements.
-hello: hello.c
-	@echo ">>> Building hello test ELF..."
-	gcc -m32 -nostdlib -nostartfiles -static -fno-pie -no-pie \
-	    -Wl,-Ttext=0x08048000 \
-	    -o $@ hello.c
-	@echo ">>> hello built."
-
-# Embed the hello ELF as a second blob with its own symbols.
-hello_blob.o: hello
-	@echo ">>> Embedding hello into hello_blob.o..."
-	objcopy \
-	    -I binary \
-	    -O elf32-i386 \
-	    -B i386 \
-	    --rename-section .data=.rodata,alloc,load,readonly,data,contents \
-	    --redefine-sym _binary_hello_start=hello_start \
-	    --redefine-sym _binary_hello_end=hello_end   \
-	    --redefine-sym _binary_hello_size=hello_size  \
-	    hello $@
-	@echo ">>> hello_blob.o created."
-
-# ============================================================
-#  Bochs CPU emulation: ON by default (set BOCHS=0 to disable)
-#  bochs_infra.o provides all Bochs infrastructure globals
-#  (logfunctions, SIM, bx_cpu, bx_mem, bx_devices, etc.)
-# ============================================================
-
-
-
-BOCHS_OBJ    := bochs_glue.o bochs_infra.o bochs_paramtree.o bochs_pc_system.o bochs_cstubs.o setjmp.o test_module.o
-BOCHS_LIBS   := $(BOCHS_DIR)/cpu/libcpu.a \
-                $(BOCHS_DIR)/cpu/fpu/libfpu.a \
-                $(BOCHS_DIR)/cpu/cpudb/libcpudb.a \
-                $(BOCHS_DIR)/memory/libmemory.a
-BOCHS_IFLAGS := -I$(BOCHS_DIR) -I$(BOCHS_DIR)/cpu \
-                -I$(BOCHS_DIR)/iodev -I$(BOCHS_DIR)/gui
-BOCHS_DEP    := $(BOCHS_CPU_LIB)
-BOCHS_CDEF   := -DBOCHS_ENABLED=1
-LIBGCC_EH    := /usr/lib/gcc/x86_64-linux-gnu/13/32/libgcc_eh.a
-
-
-# ============================================================
-#  Kernel object files
-# ============================================================
-boot.o: boot.S
-	as --32 boot.S -o boot.o
-
-kernel.o: kernel.cpp $(BOCHS_DEP)
-	g++ -m32 -O2 $(BOCHS_IFLAGS) $(CXXFLAGS) $(BOCHS_CDEF) -c kernel.cpp -o kernel.o
-
-bochs_stub.o: bochs_stub.cpp
-	g++ -m32 -O2 $(CXXFLAGS) -c bochs_stub.cpp -o bochs_stub.o
-
-bochs_glue.o: bochs_glue.cpp $(BOCHS_DIR)/instrument.h $(BOCHS_CPU_LIB)
-	g++ -m32 -O2 $(BOCHS_IFLAGS) $(CXXFLAGS) -DBOCHS_GLUE -c bochs_glue.cpp -o bochs_glue.o
-
-# bochs_infra.cpp needs system headers (not freestanding) because bochs.h
-# pulls in <stdio.h> etc. for its own types. Compiled as a normal 32-bit object.
-bochs_infra.o: bochs_infra.cpp $(BOCHS_DIR)/instrument.h $(BOCHS_CPU_LIB)
-	g++ -m32 -O2 $(BOCHS_IFLAGS) \
-	    -fno-exceptions -fno-rtti -fno-pie -fno-pic \
-	    -std=c++17 \
-	    -include instrument_stub.h \
-	    -c bochs_infra.cpp -o bochs_infra.o
-
-# bochs_paramtree.o — provides bx_list_c, bx_shadow_num_c, bx_param_num_c etc.
-bochs_paramtree.o: $(BOCHS_DIR)/gui/paramtree.cc $(BOCHS_CPU_LIB)
-	g++ -m32 -O2 $(BOCHS_IFLAGS) \
-	    -fno-exceptions -fno-rtti -fno-pie -fno-pic \
-	    -std=c++17 \
-	    -include instrument_stub.h \
-	    -c $(BOCHS_DIR)/gui/paramtree.cc -o bochs_paramtree.o
-
-# bochs_pc_system.o — provides bx_pc_system_c constructor and timer methods
-bochs_pc_system.o: $(BOCHS_DIR)/pc_system.cc $(BOCHS_CPU_LIB)
-	g++ -m32 -O2 $(BOCHS_IFLAGS) \
-	    -fno-exceptions -fno-rtti -fno-pie -fno-pic \
-	    -std=c++17 \
-	    -include instrument_stub.h \
-	    -c $(BOCHS_DIR)/pc_system.cc -o bochs_pc_system.o
-
-# bochs_cstubs.o — freestanding C stdlib stubs (no system headers)
-bochs_cstubs.o: bochs_cstubs.c
-	gcc -m32 -O2 -ffreestanding -fno-pie -fno-pic \
-	    -c bochs_cstubs.c -o bochs_cstubs.o
-
-# setjmp.o — pure-asm i386 setjmp/longjmp/__longjmp_chk matching glibc layout.
-# Required by libcpu.a (Bochs' internal exception unwinding) and by
-# bochs_glue.cpp's rescue path.
-setjmp.o: setjmp.S
-	as --32 setjmp.S -o setjmp.o
+# Generates a bootable GRUB-based ISO containing your kernel and libtcc.so
+iso: $(KERNEL_ELF) $(LIBTCC_SO)
+	@echo "[ISO] Setting up ISO staging directory..."
+	@mkdir -p $(ISO_DIR)/boot/grub
 	
-test_module.o: test_module.cpp
-	g++ -m32 -O2 $(BOCHS_IFLAGS) $(CXXFLAGS) -c test_module.cpp -o test_module.o
-
-# ============================================================
-#  Link
-# ============================================================
-$(MULTIBOOT): boot.o kernel.o ramdisk.o hello_blob.o test_module.o $(BOCHS_OBJ) $(BOCHS_DEP)
-	mkdir -p iso/boot
-	g++ -m32 -T linker.ld -nostdlib -no-pie -static \
-	    -o $(MULTIBOOT)              \
-	    boot.o kernel.o ramdisk.o hello_blob.o $(BOCHS_OBJ) \
-	    $(BOCHS_LIBS)                \
-	    -lgcc $(LIBGCC_EH)           \
-	    -Wl,--allow-multiple-definition
-
-# ============================================================
-#  ISO image via GRUB (hybrid BIOS + UEFI)
-# ------------------------------------------------------------
-#  grub-mkrescue auto-detects the GRUB platforms installed on the
-#  build host. With grub-pc-bin installed you get a BIOS-bootable
-#  El Torito image; with grub-efi-amd64-bin / grub-efi-ia32-bin also
-#  installed you get an additional EFI System Partition embedded
-#  in the same ISO, so the output boots on:
-#    * QEMU / Bochs                      (BIOS)
-#    * VMware Workstation / Fusion       (BIOS or UEFI firmware)
-#    * Real bare metal w/ legacy CSM     (BIOS)
-#    * Real bare metal UEFI-only         (UEFI)
-#
-#  See: install with
-#    apt-get install grub-pc-bin grub-efi-amd64-bin grub-efi-ia32-bin \
-#                    xorriso mtools
-# ============================================================
-$(MAIN): $(MULTIBOOT)
-	mkdir -p iso/boot/grub
-	printf '%s\n'                                                 \
-	    'set timeout=3'                                           \
-	    'set default=0'                                           \
-	    'insmod all_video'                                        \
-	    'insmod vbe'                                              \
-	    'insmod vga'                                              \
-	    'insmod gfxterm'                                          \
-	    'terminal_input  console'                                 \
-	    'terminal_output console'                                 \
-	    'menuentry "RTOS++" {'                                    \
-	    '    multiboot /boot/main.elf'                            \
-	    '    boot'                                                \
-	    '}'                                                       \
-	    'menuentry "RTOS++ (text console only)" {'                \
-	    '    set gfxpayload=text'                                 \
-	    '    multiboot /boot/main.elf'                            \
-	    '    boot'                                                \
-	    '}'                                                       \
-	    > iso/boot/grub/grub.cfg
-	grub-mkrescue                                                 \
-	    --product-name="RTOS++"                                   \
-	    --product-version="1.0"                                   \
-	    -o $(MAIN) iso                                            \
-	    -- -volid RTOSPP
-	@echo ">>> ISO ready: $(MAIN)"
-	@if command -v xorriso >/dev/null 2>&1; then \
-	    echo "--- Boot record summary ---"; \
-	    xorriso -indev $(MAIN) -report_el_torito plain 2>/dev/null \
-	        | sed -n '/Boot record/p;/El Torito/p'; \
-	    xorriso -indev $(MAIN) -report_system_area plain 2>/dev/null \
-	        | sed -n '/System area/p'; \
+	@# 1. Copy the core kernel binary into the boot directory
+	@cp $(KERNEL_ELF) $(ISO_DIR)/boot/$(KERNEL_ELF)
+	
+	@# 2. Copy libtcc.so into the root of the ISO image so your kernel can find it
+	@if [ -f "$(LIBTCC_SO)" ]; then \
+		cp $(LIBTCC_SO) $(ISO_DIR)/libtcc.so; \
+		echo "[ISO] Embedded $(LIBTCC_SO) -> /libtcc.so"; \
 	fi
+	
+	@# 3. Dynamically generate a minimal grub.cfg configuration file
+	@echo "set default=0"                  > $(ISO_DIR)/boot/grub/grub.cfg
+	@echo "set timeout=0"                 >> $(ISO_DIR)/boot/grub/grub.cfg
+	@echo "menuentry \"My Freestanding Kernel\" {" >> $(ISO_DIR)/boot/grub/grub.cfg
+	@echo "    multiboot /boot/$(KERNEL_ELF)"   >> $(ISO_DIR)/boot/grub/grub.cfg
+	@echo "    boot"                      >> $(ISO_DIR)/boot/grub/grub.cfg
+	@echo "}"                             >> $(ISO_DIR)/boot/grub/grub.cfg
+	
+	@# 4. Compile everything into a bootable El Torito ISO
+	@echo "[ISO] Mastering $(ISO_OUT) via grub-mkrescue..."
+	@grub-mkrescue -o $(ISO_OUT) $(ISO_DIR) 2>/dev/null || \
+	  mkisofs -R -b boot/grub/stage2_eltorito -no-emul-boot -boot-load-size 4 -boot-info-table -o $(ISO_OUT) $(ISO_DIR)
+	
+	@# 5. Clean up the temporary staging directory
+	@rm -rf $(ISO_DIR)
+	@echo "[OK]  ISO generation complete: $(ISO_OUT)"
+# =============================================================================
+# Clean
+# =============================================================================
+clean:
+	rm -f $(KERNEL_ELF) $(KERNEL_OBJS) $(ISO_OUT)
+	rm -rf $(ISO_DIR)
+	rm -f kernel.o tcc_glue.o tcc_stub.o libtcc_embed.o test_module_stub.o \
+	      bochs_glue.o bochs_stub.o bochs_cstubs.o
+	@echo "[CLN] Build artifacts and ISO removed."
 
-# ============================================================
-#  test_main — standalone Bochs init + cpu_tick verification
-# ------------------------------------------------------------
-#  Builds test_main.cpp (which provides its own kernel_main and a
-#  two-phase self-test) instead of the full kernel.cpp. Produces a
-#  bootable test_main.iso. This is the smallest end-to-end check
-#  that the Bochs glue works: Phase 1 runs BX_CPU(0)->initialize()
-#  + reset(); Phase 2 loads a tiny guest and ticks it, expecting
-#  "HI\n" on the guest port-0xE9 console.
-#
-#  Run it headless and watch the port-0xE9 trace:
-#    make test_main
-#    qemu-system-i386 -M q35 -cdrom test_main.iso -boot d \
-#        -m 512M -display none -debugcon stdio -no-reboot
-#  A passing run prints:  === TEST PASSED (init + tick) ===
-#
-#  `make run-test` does both steps in one go.
-# ============================================================
-TEST_ISO   := test_main.iso
-TEST_ELF   := iso/boot/main.elf
-
-test_main.o: test_main.cpp $(BOCHS_DEP)
-	g++ -m32 -O2 $(BOCHS_IFLAGS) $(CXXFLAGS) $(BOCHS_CDEF) -c test_main.cpp -o test_main.o
-
-# test_main links WITHOUT ramdisk.o / hello_blob.o — the harness
-# references none of the busybox/hello blob symbols.
-test_main: boot.o test_main.o $(BOCHS_OBJ) $(BOCHS_DEP)
-	mkdir -p iso/boot/grub
-	g++ -m32 -T linker.ld -nostdlib -no-pie -static \
-	    -o $(TEST_ELF) \
-	    boot.o test_main.o $(BOCHS_OBJ) \
-	    $(BOCHS_LIBS) \
-	    -lgcc $(LIBGCC_EH) \
-	    -Wl,--allow-multiple-definition
-	printf '%s\n' \
-	    'set timeout=0' \
-	    'set default=0' \
-	    'menuentry "RTOS++ test_main" {' \
-	    '    multiboot /boot/main.elf' \
-	    '    boot' \
-	    '}' \
-	    > iso/boot/grub/grub.cfg
-	grub-mkrescue -o $(TEST_ISO) iso
-	@echo ">>> $(TEST_ISO) ready. Boot it with -debugcon stdio to see the trace."
-
-run-test: test_main
-	qemu-system-i386 -M q35 -cdrom $(TEST_ISO) -boot d \
-	    -m 512M -display none -debugcon stdio -no-reboot
+clean_tcc: clean
+	rm -rf $(TCC_SRC_DIR) $(TCC_BUILD_DIR) $(TCC_TARBALL)
+	@echo "[CLN] TCC source, build dir, and tarball removed."

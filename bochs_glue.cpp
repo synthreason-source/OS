@@ -1190,6 +1190,81 @@ extern "C" void bochs_guest_putc(char c) {
     BX_CPU(0)->async_event = 1;
 }
 
+// ─── Keyboard input sentinel (port 0xEA) ──────────────────────────────────
+//
+// Called by bx_devices_c::inp in bochs_infra.cpp when the guest executes
+// an `IN AL, 0xEA` (or `IN AX, 0xEA`) instruction.
+//
+// Two outcomes:
+//
+//   (a) read_cb returns a valid byte (≥ 0):
+//       Store the byte in AL and return it directly. cpu_loop
+//       continues normally after the IN instruction.
+//
+//   (b) read_cb returns -1 (no byte queued yet):
+//       • Set wants_input = true so the kernel knows to feed a char.
+//       • Rewind EIP by 2 bytes — the size of the `IN AL, imm8`
+//         encoding (E4 EA). Bochs decoded and retired the instruction
+//         before calling inp(), so EIP already points one instruction
+//         past it. By stepping EIP back, the NEXT cpu_loop entry will
+//         fetch and execute the same IN again. From the guest's
+//         perspective the call simply blocks.
+//       • Set kill_bochs_request + async_event to yield cpu_loop so
+//         the kernel main loop gets control, can repaint, poll
+//         hardware, and call the slot's read_cb when a key arrives.
+//       • Return 0xFFFF (the "nothing here" sentinel that inp() passes
+//         through). The value is irrelevant because EIP was rewound —
+//         the guest never sees it as the result of this execution.
+//
+// The IN instruction size assumption (2 bytes) is valid for every form
+// the guest will realistically use:
+//   `IN AL, imm8`   →  E4 EA    (2 bytes) ← what hello.c emits
+//   `IN AX, imm8`   →  66 E5 EA  — 3 bytes; rare, but wrong rewind.
+//   `IN EAX, imm8`  →  E5 EA    (2 bytes)
+// hello.c uses `inb %1, %0` which the compiler always encodes as
+// E4 EA for an 8-bit port read. If wider reads are needed, the
+// constant below can be parameterised.
+//
+// Thread safety: the glue is single-threaded (the kernel ticks one
+// slot at a time inside cpu_loop), so no locking is required.
+
+extern "C" Bit32u bochs_guest_getc() {
+    if (g_active_slot < 0 || g_active_slot >= MAX_BOCHS_SLOTS)
+        return 0xFFFF;
+
+    SlotState& s = g_slots[g_active_slot];
+    int ch = s.read_cb ? s.read_cb(g_active_slot) : -1;
+
+    if (ch >= 0) {
+        // Byte is available — return it. cpu_loop moves on normally.
+        return (Bit32u)(unsigned char)ch;
+    }
+
+    // No byte ready. Rewind EIP so the IN re-executes on the next tick.
+    BX_CPU_C* cpu = BX_CPU(0);
+    Bit32u cur_eip = cpu->gen_reg[BX_32BIT_REG_EIP].dword.erx;
+    Bit32u new_eip = cur_eip - 2u;          // `IN AL, imm8` is 2 bytes
+
+    cpu->gen_reg[BX_32BIT_REG_EIP].dword.erx = new_eip;
+    cpu->prev_rip = new_eip;
+    cpu->invalidate_prefetch_q();
+
+    // Also update the slot's saved-state view so the rewind persists
+    // across a slot switch that might happen while we wait.
+    s.cpu.eip      = new_eip;
+    s.cpu.prev_rip = new_eip;
+
+    // Signal the kernel that this slot needs keyboard input before
+    // its next tick will make forward progress.
+    s.wants_input = true;
+
+    // Yield cpu_loop.
+    bx_pc_system.kill_bochs_request = 1;
+    BX_CPU(0)->async_event = 1;
+
+    return 0xFFFF;   // placeholder — guest won't see this value
+}
+
 extern "C" void bochs_guest_exit(int code) {
     // During bochs_global_init() there is no active slot. If a Bochs
     // internal panic path lands here in that window, the old behaviour

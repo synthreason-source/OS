@@ -355,7 +355,7 @@ static void show_guest_program(void) {
 /* ── test_module_run — the activation entry point ───────────────────────
  * This is the "test execution code" the kernel copies in and activates.
  * It performs the same two-phase verification test_main.cpp did. */
-extern "C" void test_module_run(const TestSink* sink, TestResult* out) {
+void test_module_run(const TestSink* sink, TestResult* out) {
     g_sink        = sink;
     g_test_active = 1;          /* breadcrumb/fault hooks now forward */
 
