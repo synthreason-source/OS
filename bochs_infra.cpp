@@ -260,19 +260,7 @@ void bx_devices_c::init_stubs() {}
 extern "C" void bochs_guest_putc(char c);
 // bochs_guest_exit already forward-declared at top.
 
-// bochs_guest_getc: defined in bochs_glue.cpp. Returns the next queued
-// keyboard byte for the active slot, or rewinds EIP and yields if none
-// is ready. See the detailed comment in bochs_glue.cpp.
-extern "C" Bit32u bochs_guest_getc();
-
-Bit32u bx_devices_c::inp(Bit16u port, unsigned) {
-    // Port 0xEA — keyboard input. Reads a byte from the active slot's
-    // read_cb. If no byte is ready, bochs_guest_getc rewinds the guest
-    // EIP by 2 (the size of `IN AL, imm8`) and yields cpu_loop so the
-    // kernel can supply a character before re-ticking.
-    if (port == 0xEA) return bochs_guest_getc();
-    return 0xFFFF;   // all other ports: "nothing here"
-}
+Bit32u bx_devices_c::inp(Bit16u, unsigned) { return 0xFFFF; }
 void   bx_devices_c::outp(Bit16u port, Bit32u val, unsigned) {
     // Port 0xE9 — Bochs "debug console" port. We route to the active
     // slot's write callback (-> kernel terminal).

@@ -154,7 +154,9 @@ ramdisk.o: $(BUSYBOX_BIN)
 # in busybox's full Linux ABI requirements.
 hello: hello.c
 	@echo ">>> Building hello test ELF..."
-	gcc -m32 -nostdlib -nostartfiles -static -fno-pie -no-pie -o $@ hello.c
+	gcc -m32 -nostdlib -nostartfiles -static -fno-pie -no-pie \
+	    -Wl,-Ttext=0x08048000 \
+	    -o $@ hello.c
 	@echo ">>> hello built."
 
 # Embed the hello ELF as a second blob with its own symbols.
