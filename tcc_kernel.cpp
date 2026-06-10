@@ -729,15 +729,18 @@ extern "C" void tcc_kernel_cmd_cc(void* terminal_opaque,
     if (!s) { free(full); console_print("cc: tcc_new failed\n"); return; }
 
     tcc_set_error_func(s, nullptr, tcc_err_cb);
-    tcc_set_output_type(s, TCC_OUTPUT_EXE);     // fully linked ELF
-    tcc_set_options(s, "-nostdlib");
-    tcc_set_options(s, "-nostdinc");
-    tcc_set_options(s, "-static");
-    // Load address 0x08002000 (past Bochs GDT/IDT stub zone at 0x08001000)
-    tcc_set_options(s, "-Wl,-Ttext,0x08002000");
-    tcc_set_options(s, "-e _start");
-    // No crt or libtcc1.a
-    tcc_set_lib_path(s, "/dev/null");
+
+    // IMPORTANT: -nostdlib must come BEFORE tcc_set_output_type so that
+    // tccelf_add_crtbegin() is skipped (it checks s->nostdlib before adding crt1.o).
+    tcc_set_options(s, "-nostdlib -nostdinc -static");
+    tcc_set_lib_path(s, "/nonexistent");
+
+    tcc_set_output_type(s, TCC_OUTPUT_EXE);
+
+    // Entry point and load address 0x08002000 (past Bochs GDT/IDT stub zone).
+    // TCC native linker syntax: -Wl,-e=name and -Wl,-Ttext=addr (with = not space).
+    tcc_set_options(s, "-Wl,-e=_start");
+    tcc_set_options(s, "-Wl,-Ttext=0x08002000");
 
     // Compile
     int rc = tcc_compile_string(s, full);
