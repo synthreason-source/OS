@@ -14,8 +14,8 @@ CXXFLAGS := -ffreestanding -O2 -Wall -Wextra \
             -fno-stack-protector              \
             -fno-pie -fno-pic                 \
             -include fixes.h                  \
-            -include instrument_stub.h
-
+            -include instrument_stub.h	      \
+	    -Wl,--unresolved-symbols=ignore-all
 # ── Bochs 2.7 ────────────────────────────────────────────────
 BOCHS_VERSION   := 2.7
 BOCHS_DIR       := bochs-$(BOCHS_VERSION)
@@ -67,17 +67,188 @@ iso: $(MULTIBOOT)
 
 
 clean:
-	rm -rf *.o main.iso iso hello hello_blob.o
+	rm -rf *.o main.iso iso hello hello_blob.o tcc_tool libtcc_glue.so
 
 # distclean removes build artifacts and the disk image, but KEEPS the
-# prebuilt bochs-2.7/ tree (see note in recipe).
+# prebuilt bochs-2.7/ tree and the local TCC build.
 distclean: clean
-	# NOTE: the prebuilt bochs-2.7/ tree is intentionally NOT removed,
-	#       so the offline bundle stays buildable. Remove it by hand to
-	#       force a fresh download + configure on the next build.
+	# NOTE: bochs-2.7/ is intentionally NOT removed (offline bundle).
+	# NOTE: tcc-local/ and tcc-src/ are also kept so `make cc` works
+	#       without re-downloading. Remove them by hand if needed:
+	#         rm -rf tcc-local tcc-src tcc-mob.tar.gz
 	rm -rf $(BOCHS_ARCHIVE) ramdisk.o $(DISK_IMG)
 
-.PHONY: all clean distclean iso test_main run-test
+# Remove the local TCC build completely (forces re-download on next setup-tcc).
+tcc-clean:
+	rm -rf $(TCC_LOCAL) $(TCC_SRC_DIR) $(TCC_ARCHIVE)
+
+.PHONY: all clean distclean tcc-clean iso test_main run-test cc tcc setup-tcc download-tcc
+
+# ============================================================
+#  TCC glue — host-side C compiler for guest ELFs
+# ------------------------------------------------------------
+#  Mirrors the bochs_glue pattern: tcc_glue.cpp wraps libtcc
+#  into a CLI tool (tcc_tool) and a shared library
+#  (libtcc_glue.so).  The kernel links tcc_stub.cpp (no-ops)
+#  so the kernel binary does not depend on TCC at run time.
+#
+#  TCC is built from source automatically — no apt required.
+#  Run once before first use:
+#    make setup-tcc          # download + build TCC into tcc-local/
+#
+#  Then compile guest programs normally:
+#    make cc SRC=prog.c      # OUT defaults to stem of SRC
+#    make cc SRC=prog.c OUT=prog
+#
+#  The compiled 32-bit ELF is written to disk.img.  Boot the OS
+#  and type the ELF name in a terminal to run it.
+#
+#  Under the hood:
+#    1. i386-tcc -c prog.c → prog.o  (relocatable 32-bit i386 object)
+#    2. ld -m elf_i386 -T tcc_guest.ld → ELF32 (code at 0x08002000,
+#       safely past the Bochs slot GDT/IDT/stub injection zone)
+#    3. mtools mcopy prog → disk.img::/prog
+# ============================================================
+
+# ── Local TCC build paths ────────────────────────────────────────────────────
+# TCC is built from source into tcc-local/ so we get:
+#   tcc-local/bin/i386-tcc   — cross-compiler targeting i386
+#   tcc-local/lib/libtcc.a   — embedded-compiler library
+#   tcc-local/include/libtcc.h
+#
+# TCC source: GitHub mirror of the official mob (development) branch.
+TCC_LOCAL     := tcc-local
+TCC_SRC_DIR   := tcc-src
+TCC_REPO      := https://github.com/TinyCC/tinycc/archive/refs/heads/mob.tar.gz
+TCC_ARCHIVE   := tcc-mob.tar.gz
+TCC_I386      := $(TCC_LOCAL)/bin/i386-tcc
+TCC_LIB       := $(TCC_LOCAL)/lib/libtcc.a
+TCC_INC       := $(TCC_LOCAL)/include/libtcc.h
+
+# ── Auto-detect: use system TCC/libtcc if present, else fall back to local ──
+# If the local build exists it takes priority (consistent cross-compiler).
+# The shell function runs at parse time so it only queries what is installed.
+TCC_TOOL   := tcc_tool
+TCC_SO     := libtcc_glue.so
+
+# Include / link flags — prefer local build, then system.
+TCC_IFLAGS := $(shell \
+    if [ -f $(TCC_INC) ]; then echo "-I$(TCC_LOCAL)/include"; \
+    elif pkg-config --exists libtcc 2>/dev/null; then pkg-config --cflags libtcc; \
+    fi)
+TCC_LIBS   := $(shell \
+    if [ -f $(TCC_LIB) ]; then echo "$(TCC_LOCAL)/lib/libtcc.a"; \
+    elif pkg-config --exists libtcc 2>/dev/null; then pkg-config --libs libtcc; \
+    else echo "-ltcc"; \
+    fi)
+TCC_CFLAGS := -O2 -Wall -std=c++17 $(TCC_IFLAGS)
+
+# ── setup-tcc / download-tcc ─────────────────────────────────────────────────
+# Downloads TCC source from GitHub and builds:
+#   • i386-tcc  (cross-compiler: host=x86-64, target=i386)
+#   • libtcc.a  (embedded compiler library, position-independent)
+#   • libtcc.h  (API header)
+#
+# Requires on the build host: gcc make (already needed for the kernel build).
+# binutils-multiarch is needed for ld -m elf_i386; install it once:
+#   sudo apt install binutils-multiarch
+#
+# Everything else is self-contained in tcc-local/.
+
+$(TCC_ARCHIVE):
+	@echo ">>> Downloading TCC source (mob branch) from GitHub ..."
+	wget -O $@ "$(TCC_REPO)" || curl -L -o $@ "$(TCC_REPO)"
+	@echo ">>> Download complete: $@"
+
+$(TCC_SRC_DIR)/.extracted: $(TCC_ARCHIVE)
+	@echo ">>> Extracting TCC source ..."
+	mkdir -p $(TCC_SRC_DIR)
+	tar -xzf $(TCC_ARCHIVE) --strip-components=1 -C $(TCC_SRC_DIR)
+	touch $@
+
+# Build i386-tcc cross-compiler + libtcc into tcc-local/.
+# Flags used:
+#   --prefix        install into tcc-local/ (no root needed)
+#   --enable-cross  build cross-compilers for all TCC targets (includes i386-tcc)
+#   --extra-cflags  -fPIC so libtcc.a is position-independent and linkable into .so
+$(TCC_I386) $(TCC_LIB) $(TCC_INC) &: $(TCC_SRC_DIR)/.extracted
+	@echo ">>> Configuring TCC for cross-compilation (target: i386) ..."
+	cd $(TCC_SRC_DIR) && ./configure \
+	    --prefix="$(CURDIR)/$(TCC_LOCAL)" \
+	    --enable-cross \
+	    --extra-cflags="-fPIC -O2"
+	@echo ">>> Building TCC ..."
+	$(MAKE) -C $(TCC_SRC_DIR)
+	@echo ">>> Installing TCC into $(TCC_LOCAL)/ ..."
+	$(MAKE) -C $(TCC_SRC_DIR) install
+	@echo ">>> TCC ready."
+	@echo "    cross-compiler : $(TCC_I386)"
+	@echo "    libtcc         : $(TCC_LIB)"
+	@echo "    header         : $(TCC_INC)"
+
+# Friendly aliases.
+setup-tcc download-tcc: $(TCC_I386)
+	@echo ">>> setup-tcc complete.  You can now run: make cc SRC=hello_tcc.c"
+
+# ── Host shared library ──────────────────────────────────────────────────────
+# Note: libtcc.a built above is -fPIC, so we can link it into the .so.
+$(TCC_SO): tcc_glue.cpp $(TCC_LIB)
+	@echo ">>> Building $(TCC_SO) ..."
+	g++ $(TCC_CFLAGS) -fPIC -shared \
+	    -o $@ $< \
+	    $(TCC_LIBS) -ldl
+	@echo ">>> $(TCC_SO) ready."
+
+# ── Standalone CLI tool ───────────────────────────────────────────────────────
+$(TCC_TOOL): tcc_glue.cpp $(TCC_LIB)
+	@echo ">>> Building $(TCC_TOOL) ..."
+	g++ $(TCC_CFLAGS) \
+	    -DHAVE_LIBTCC \
+	    -o $@ $< \
+	    $(TCC_LIBS) -ldl
+	@echo ">>> $(TCC_TOOL) ready."
+
+# ── cc / tcc targets ────────────────────────────────────────────────────────
+# Compile a C source file → 32-bit ELF → inject into disk.img.
+#
+#   make cc SRC=foo.c
+#   make cc SRC=foo.c OUT=foo
+#   make tcc SRC=foo.c            (alias)
+#
+# SRC may be:
+#   - A host-filesystem path  (e.g. hello_tcc.c)
+#   - A filename that already exists on disk.img (mtools reads it out)
+#
+# The ELF is linked with tcc_guest.ld: code lands at 0x08002000,
+# safely past the Bochs slab GDT/IDT/stub injection zone.
+
+ifndef SRC
+SRC :=
+endif
+ifndef OUT
+OUT :=
+endif
+
+# Ensure i386-tcc is on PATH from the local build.
+export PATH := $(CURDIR)/$(TCC_LOCAL)/bin:$(PATH)
+
+cc tcc: $(TCC_TOOL) $(DISK_IMG) tcc_guest.ld
+	@if [ ! -x "$(TCC_I386)" ] && ! command -v i386-tcc >/dev/null 2>&1; then \
+	    echo ""; \
+	    echo "ERROR: i386-tcc not found."; \
+	    echo "Run  make setup-tcc  to download and build TCC automatically,"; \
+	    echo "then retry:  make cc SRC=$(SRC)"; \
+	    echo ""; \
+	    exit 1; \
+	fi
+ifndef SRC
+	@echo "Usage: make cc SRC=<file.c> [OUT=<name>]"
+	@echo "  Compiles SRC to a 32-bit ELF and writes it to $(DISK_IMG)."
+	@exit 1
+endif
+	@echo ">>> Compiling $(SRC) → $(or $(OUT),$(basename $(notdir $(SRC)))) in $(DISK_IMG) ..."
+	./$(TCC_TOOL) "$(DISK_IMG)" "$(SRC)" "$(OUT)" "tcc_guest.ld"
+	@echo ">>> Done. Boot the OS and type '$(or $(OUT),$(basename $(notdir $(SRC))))' to run it."
 
 # ============================================================
 #  Bochs CPU/FPU/cpudb/memory static libraries
@@ -181,7 +352,7 @@ hello_blob.o: hello
 
 
 
-BOCHS_OBJ    := bochs_glue.o bochs_infra.o bochs_paramtree.o bochs_pc_system.o bochs_cstubs.o setjmp.o test_module.o
+BOCHS_OBJ    := bochs_glue.o bochs_infra.o bochs_paramtree.o bochs_pc_system.o bochs_cstubs.o setjmp.o test_module.o tcc_stub.o
 BOCHS_LIBS   := $(BOCHS_DIR)/cpu/libcpu.a \
                 $(BOCHS_DIR)/cpu/fpu/libfpu.a \
                 $(BOCHS_DIR)/cpu/cpudb/libcpudb.a \
@@ -237,6 +408,13 @@ bochs_pc_system.o: $(BOCHS_DIR)/pc_system.cc $(BOCHS_CPU_LIB)
 bochs_cstubs.o: bochs_cstubs.c
 	gcc -m32 -O2 -ffreestanding -fno-pie -fno-pic \
 	    -c bochs_cstubs.c -o bochs_cstubs.o
+
+# tcc_stub.o — kernel-side no-op stubs for TCC glue.
+# Compiled as freestanding i386 so it links into the kernel binary.
+# The real work (compilation) happens on the host via tcc_tool / libtcc_glue.so.
+tcc_stub.o: tcc_stub.cpp
+	g++ -m32 -O2 -ffreestanding -fno-pie -fno-pic -fno-exceptions -fno-rtti \
+	    -std=c++17 -c tcc_stub.cpp -o tcc_stub.o
 
 # setjmp.o — pure-asm i386 setjmp/longjmp/__longjmp_chk matching glibc layout.
 # Required by libcpu.a (Bochs' internal exception unwinding) and by
