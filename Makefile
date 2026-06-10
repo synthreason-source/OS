@@ -14,8 +14,8 @@ CXXFLAGS := -ffreestanding -O2 -Wall -Wextra \
             -fno-stack-protector              \
             -fno-pie -fno-pic                 \
             -include fixes.h                  \
-            -include instrument_stub.h	      \
-	    -Wl,--unresolved-symbols=ignore-all
+            -include instrument_stub.h
+
 # ── Bochs 2.7 ────────────────────────────────────────────────
 BOCHS_VERSION   := 2.7
 BOCHS_DIR       := bochs-$(BOCHS_VERSION)
@@ -67,7 +67,7 @@ iso: $(MULTIBOOT)
 
 
 clean:
-	rm -rf *.o main.iso iso hello hello_blob.o tcc_tool libtcc_glue.so
+	rm -rf *.o main.iso iso hello hello_blob.o tcc_tool libtcc_glue.so i386-libtcc-kern.a
 
 # distclean removes build artifacts and the disk image, but KEEPS the
 # prebuilt bochs-2.7/ tree and the local TCC build.
@@ -187,8 +187,12 @@ $(TCC_I386) $(TCC_LIB) $(TCC_INC) &: $(TCC_SRC_DIR)/.extracted
 	@echo "    header         : $(TCC_INC)"
 
 # Friendly aliases.
-setup-tcc download-tcc: $(TCC_I386)
-	@echo ">>> setup-tcc complete.  You can now run: make cc SRC=hello_tcc.c"
+setup-tcc download-tcc: $(TCC_I386) $(TCC_KERN_LIB)
+	@echo ">>> setup-tcc complete."
+	@echo "    host cross-compiler : $(TCC_I386)"
+	@echo "    kernel TCC library  : $(TCC_KERN_LIB)"
+	@echo "    Now run: make BOCHS=1  to rebuild the kernel with in-kernel TCC."
+	@echo "    Inside the OS:  cc hello_tcc.c"
 
 # ── Host shared library ──────────────────────────────────────────────────────
 # Note: libtcc.a built above is -fPIC, so we can link it into the .so.
@@ -352,7 +356,7 @@ hello_blob.o: hello
 
 
 
-BOCHS_OBJ    := bochs_glue.o bochs_infra.o bochs_paramtree.o bochs_pc_system.o bochs_cstubs.o setjmp.o test_module.o tcc_stub.o
+BOCHS_OBJ    := bochs_glue.o bochs_infra.o bochs_paramtree.o bochs_pc_system.o bochs_cstubs.o setjmp.o test_module.o tcc_kernel.o
 BOCHS_LIBS   := $(BOCHS_DIR)/cpu/libcpu.a \
                 $(BOCHS_DIR)/cpu/fpu/libfpu.a \
                 $(BOCHS_DIR)/cpu/cpudb/libcpudb.a \
@@ -409,12 +413,36 @@ bochs_cstubs.o: bochs_cstubs.c
 	gcc -m32 -O2 -ffreestanding -fno-pie -fno-pic \
 	    -c bochs_cstubs.c -o bochs_cstubs.o
 
-# tcc_stub.o — kernel-side no-op stubs for TCC glue.
-# Compiled as freestanding i386 so it links into the kernel binary.
-# The real work (compilation) happens on the host via tcc_tool / libtcc_glue.so.
-tcc_stub.o: tcc_stub.cpp
+# ── i386-libtcc-kern.a — TCC compiled to target i386, linked into the kernel ──
+# Built by setup-tcc from TCC's libtcc.c with:
+#   -DTCC_TARGET_I386 -DONE_SOURCE=1 -DCONFIG_TCC_SEMLOCK=0
+# so tcc_kernel.cpp can call tcc_new/tcc_compile_string/tcc_output_file in-kernel.
+TCC_KERN_LIB := i386-libtcc-kern.a
+
+$(TCC_KERN_LIB): $(TCC_I386)
+	@echo ">>> Building i386-targeting libtcc for kernel ..."
+	cd $(TCC_SRC_DIR) && gcc -m32 -c libtcc.c \
+	    -DTCC_TARGET_I386 -DONE_SOURCE=1 -DCONFIG_TCC_SEMLOCK=0 \
+	    "-DCONFIG_TCC_CROSSPREFIX=\"i386-\"" \
+	    "-DCONFIG_TCCDIR=\"/tcc\"" \
+	    "-DCONFIG_TCC_SYSROOTDIR=\"\"" \
+	    "-DCONFIG_TCC_LIBPATHS=\"{B}\"" \
+	    "-DCONFIG_TCC_CRTPREFIX=\"{B}\"" \
+	    '-DCONFIG_TCC_ELFINTERP="/lib/ld-linux.so.2"' \
+	    -DTCC_IS_NATIVE=0 \
+	    -I. -O2 -w -fno-stack-protector -U_FORTIFY_SOURCE -fno-builtin \
+	    -o i386-libtcc-kern.o
+	ar rcs $(CURDIR)/$(TCC_KERN_LIB) $(TCC_SRC_DIR)/i386-libtcc-kern.o
+	@echo ">>> $(TCC_KERN_LIB) ready."
+
+# tcc_kernel.o — real in-kernel TCC glue (replaces tcc_stub.o).
+# Compiled freestanding i386; provides all POSIX shims libtcc.a needs.
+# Depends on $(TCC_KERN_LIB) existing so libtcc.h is available.
+tcc_kernel.o: tcc_kernel.cpp $(TCC_KERN_LIB)
 	g++ -m32 -O2 -ffreestanding -fno-pie -fno-pic -fno-exceptions -fno-rtti \
-	    -std=c++17 -c tcc_stub.cpp -o tcc_stub.o
+	    -fno-stack-protector -std=c++17 \
+	    -I$(TCC_SRC_DIR) \
+	    -c tcc_kernel.cpp -o tcc_kernel.o
 
 # setjmp.o — pure-asm i386 setjmp/longjmp/__longjmp_chk matching glibc layout.
 # Required by libcpu.a (Bochs' internal exception unwinding) and by
@@ -428,13 +456,17 @@ test_module.o: test_module.cpp
 # ============================================================
 #  Link
 # ============================================================
-$(MULTIBOOT): boot.o kernel.o ramdisk.o hello_blob.o test_module.o $(BOCHS_OBJ) $(BOCHS_DEP)
+$(MULTIBOOT): boot.o kernel.o ramdisk.o hello_blob.o test_module.o $(BOCHS_OBJ) $(TCC_KERN_LIB) $(BOCHS_DEP)
 	mkdir -p iso/boot
 	g++ -m32 -T linker.ld -nostdlib -no-pie -static \
 	    -o $(MULTIBOOT)              \
-	    boot.o kernel.o ramdisk.o hello_blob.o $(BOCHS_OBJ) \
-	    $(BOCHS_LIBS)                \
-	    -lgcc $(LIBGCC_EH)           \
+	    -Wl,--start-group             \
+	    boot.o kernel.o ramdisk.o hello_blob.o \
+	    $(BOCHS_OBJ)                  \
+	    $(TCC_KERN_LIB)               \
+	    $(BOCHS_LIBS)                 \
+	    -lgcc $(LIBGCC_EH)            \
+	    -Wl,--end-group               \
 	    -Wl,--allow-multiple-definition
 
 # ============================================================
@@ -515,13 +547,17 @@ test_main.o: test_main.cpp $(BOCHS_DEP)
 
 # test_main links WITHOUT ramdisk.o / hello_blob.o — the harness
 # references none of the busybox/hello blob symbols.
-test_main: boot.o test_main.o $(BOCHS_OBJ) $(BOCHS_DEP)
+test_main: boot.o test_main.o $(BOCHS_OBJ) $(TCC_KERN_LIB) $(BOCHS_DEP)
 	mkdir -p iso/boot/grub
 	g++ -m32 -T linker.ld -nostdlib -no-pie -static \
 	    -o $(TEST_ELF) \
-	    boot.o test_main.o $(BOCHS_OBJ) \
-	    $(BOCHS_LIBS) \
-	    -lgcc $(LIBGCC_EH) \
+	    -Wl,--start-group             \
+	    boot.o test_main.o            \
+	    $(BOCHS_OBJ)                  \
+	    $(TCC_KERN_LIB)               \
+	    $(BOCHS_LIBS)                 \
+	    -lgcc $(LIBGCC_EH)            \
+	    -Wl,--end-group               \
 	    -Wl,--allow-multiple-definition
 	printf '%s\n' \
 	    'set timeout=0' \

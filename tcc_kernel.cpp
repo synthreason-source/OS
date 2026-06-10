@@ -29,33 +29,24 @@
 // =============================================================================
 
 // ── Forward-declare kernel functions (defined in kernel.cpp) ─────────────────
-class TerminalWindow; // full class is in kernel.cpp; opaque here
+// (TerminalWindow is opaque here — accessed only via tcc_bridge_exec_elf)
 
+// Bridge functions defined at the bottom of kernel.cpp with extern "C" linkage.
 extern "C" {
-    char*        fat32_read_file_as_string(const char* filename);
-    int          fat32_write_file(const char* filename, const void* data,
-                                  unsigned int size);
-    void         console_print(const char* s);
-    void         printf(const char* fmt, ...);
-    int          snprintf(char* buf, unsigned long size, const char* fmt, ...);
-
-    void*        memcpy (void* d, const void* s, unsigned long n);
-    void*        memset (void* d, int v, unsigned long n);
-    void*        memmove(void* d, const void* s, unsigned long n);
-    int          memcmp (const void* a, const void* b, unsigned long n);
-    unsigned long strlen (const char* s);
-    int          strcmp (const char* a, const char* b);
-    int          strncmp(const char* a, const char* b, unsigned long n);
-    char*        strcpy (char* d, const char* s);
-    char*        strcat (char* d, const char* s);
-    char*        strncpy(char* d, const char* s, unsigned long n);
-    char*        strchr (const char* s, int c);
-    char*        strrchr(const char* s, int c);
-    const char*  strstr (const char* h, const char* n);
+    void  tcc_bridge_console_print(const char* s);
+    char* tcc_bridge_fat32_read   (const char* filename);
+    int   tcc_bridge_fat32_write  (const char* filename, const void* data,
+                                   unsigned int size);
+    int   tcc_bridge_exec_elf     (void* terminal, const char* filename,
+                                   const char* args);
 }
 
-extern "C" int load_and_execute_elf(const char* filename, const char* args,
-                         TerminalWindow* terminal);
+// Convenience macros so the rest of tcc_kernel.cpp reads naturally
+#define console_print(s)              tcc_bridge_console_print(s)
+#define fat32_read_file_as_string(f)  tcc_bridge_fat32_read(f)
+#define fat32_write_file(f,d,s)       tcc_bridge_fat32_write(f,d,s)
+
+// TerminalWindow is opaque here — we call it via tcc_bridge_exec_elf
 
 // ── Kernel heap via operator new/delete (defined in kernel.cpp) ──────────────
 // We provide malloc/free/realloc in extern "C" below.
@@ -70,6 +61,97 @@ typedef __builtin_va_list va_list;
 
 // ── All stubs in extern "C" ───────────────────────────────────────────────────
 extern "C" {
+
+// ── String functions — defined HERE so i386-libtcc-kern.a resolves them ───────
+// kernel.cpp defines these too, but with --allow-multiple-definition the
+// linker picks the first definition. Defining them in tcc_kernel.cpp ensures
+// they appear in the same object that i386-libtcc-kern.a references directly.
+unsigned long strlen(const char* s) {
+    unsigned long n = 0; while (s[n]) n++; return n;
+}
+int strcmp(const char* a, const char* b) {
+    while (*a && *a == *b) { a++; b++; }
+    return *(const unsigned char*)a - *(const unsigned char*)b;
+}
+int strncmp(const char* a, const char* b, unsigned long n) {
+    while (n && *a && *a == *b) { a++; b++; n--; }
+    return n ? (*(const unsigned char*)a - *(const unsigned char*)b) : 0;
+}
+char* strcpy(char* d, const char* s) {
+    char* r = d; while ((*d++ = *s++)); return r;
+}
+char* strncpy(char* d, const char* s, unsigned long n) {
+    unsigned long i = 0;
+    while (i < n && s[i]) { d[i] = s[i]; i++; }
+    while (i < n) d[i++] = '\0';
+    return d;
+}
+char* strcat(char* d, const char* s) {
+    char* r = d; while (*d) d++; while ((*d++ = *s++)); return r;
+}
+char* strchr(const char* s, int c) {
+    while (*s && *s != (char)c) s++;
+    return (*s == (char)c) ? (char*)s : nullptr;
+}
+char* strrchr(const char* s, int c) {
+    const char* last = nullptr;
+    do { if (*s == (char)c) last = s; } while (*s++);
+    return (char*)last;
+}
+const char* strstr(const char* h, const char* n) {
+    if (!*n) return h;
+    for (; *h; h++) {
+        if (*h == *n) {
+            const char* a = h; const char* b = n;
+            while (*b && *a == *b) { a++; b++; }
+            if (!*b) return h;
+        }
+    }
+    return nullptr;
+}
+char* strstr_w(const char* h, const char* n) { return (char*)strstr(h,n); }
+
+// memcpy, memset, memmove, memcmp — needed by i386-libtcc-kern.a
+void* memcpy(void* d, const void* s, unsigned long n) {
+    unsigned char* dd=(unsigned char*)d;
+    const unsigned char* ss=(const unsigned char*)s;
+    for (unsigned long i=0;i<n;i++) dd[i]=ss[i];
+    return d;
+}
+void* memset(void* d, int v, unsigned long n) {
+    unsigned char* dd=(unsigned char*)d;
+    for (unsigned long i=0;i<n;i++) dd[i]=(unsigned char)v;
+    return d;
+}
+void* memmove(void* d, const void* s, unsigned long n) {
+    unsigned char* dd=(unsigned char*)d;
+    const unsigned char* ss=(const unsigned char*)s;
+    if (dd < ss) { for (unsigned long i=0;i<n;i++) dd[i]=ss[i]; }
+    else         { for (unsigned long i=n;i>0;i--) dd[i-1]=ss[i-1]; }
+    return d;
+}
+int memcmp(const void* a, const void* b, unsigned long n) {
+    const unsigned char* p=(const unsigned char*)a;
+    const unsigned char* q=(const unsigned char*)b;
+    for (unsigned long i=0;i<n;i++) if(p[i]!=q[i]) return (int)p[i]-(int)q[i];
+    return 0;
+}
+
+// printf — routes to console_print; kern_vsnprintf defined later, forward-declared here
+static int kern_vsnprintf(char* buf, unsigned long cap, const char* fmt, va_list ap);
+
+void printf(const char* fmt, ...) {
+    char buf[512];
+    va_list ap; va_start(ap, fmt);
+    kern_vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    console_print(buf);
+}
+int snprintf(char* buf, unsigned long cap, const char* fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    int r = kern_vsnprintf(buf, cap, fmt, ap);
+    va_end(ap); return r;
+}
 
 // ── Memory allocation ─────────────────────────────────────────────────────────
 void* malloc(unsigned long size) {
@@ -278,9 +360,6 @@ static int kern_vsnprintf(char* buf, unsigned long cap,
 
 int vsnprintf(char* buf, unsigned long cap, const char* fmt, va_list ap) {
     return kern_vsnprintf(buf, cap, fmt, ap);
-}
-int snprintf_tcc(char* buf, unsigned long cap, const char* fmt, ...) {
-    va_list ap; va_start(ap,fmt); int r=kern_vsnprintf(buf,cap,fmt,ap); va_end(ap); return r;
 }
 int sprintf(char* buf, const char* fmt, ...) {
     va_list ap; va_start(ap,fmt); int r=kern_vsnprintf(buf,65536,fmt,ap); va_end(ap); return r;
@@ -598,7 +677,6 @@ extern "C" int tcc_kernel_version(void) { return 2; } // 2 = real in-kernel TCC
 extern "C" void tcc_kernel_cmd_cc(void* terminal_opaque,
                                   const char* src_name,
                                   const char* out_name_arg) {
-    TerminalWindow* terminal = (TerminalWindow*)terminal_opaque;
     g_errlen = 0; g_errbuf[0] = '\0';
 
     if (!src_name || !src_name[0]) {
@@ -707,5 +785,5 @@ extern "C" void tcc_kernel_cmd_cc(void* terminal_opaque,
     console_print("cc: written '"); console_print(out_name); console_print("'\n");
 
     // Auto-launch
-    load_and_execute_elf(out_name, nullptr, terminal);
+    tcc_bridge_exec_elf(terminal_opaque, out_name, nullptr);
 }

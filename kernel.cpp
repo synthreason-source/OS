@@ -13,7 +13,8 @@
 // SECTION 1: TYPE DEFS, STDLIB/CXX STUBS, AND LOW-LEVEL FUNCTIONS
 // =============================================================================
 #define SECTOR_SIZE 512
-
+// Process structure for ELF execution
+#define MAX_ELF_PROCESSES 4
 #define ELF_STACK_SIZE (64 * 1024)  // 64KB stack per process
 #define ELF_HEAP_SIZE (256 * 1024)   // 256KB heap per process
 // --- Type Definitions ---
@@ -119,7 +120,7 @@ extern "C" long long __divmoddi4(long long num,
 
 // --- Forward Declarations ---
 class Window;
-
+class TerminalWindow;
 class FileExplorerWindow; // New
 extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr);
 void launch_new_terminal();
@@ -203,7 +204,119 @@ static inline uint32_t pci_read_config_dword(uint16_t bus, uint8_t device, uint8
     outl(0xCF8, address);
     return inl(0xCFC);
 }
+// =============================================================================
+//  CENTRAL DEFINITIONS & FORWARD DECLARATIONS
+// =============================================================================
+	
+// =============================================================================
+// INDEPENDENT RUN AND EXEC IMPLEMENTATION
+// =============================================================================
+// This refactoring completely decouples run and exec processes:
+// - run: manages disk-based object files with full disk I/O context
+// - exec: manages in-memory compiled code with no disk dependencies
+// - Separate process tables, separate resource management
+// - No shared state between the two subsystems
 
+// =============================================================================
+// SECTION 1: SEPARATE PROCESS CONTEXTS
+// =============================================================================
+
+
+// COMPLETE FIXED KERNEL.CPP - BUSYBOX ELF EXEC READY
+// Paste this ENTIRE file as your new kernel.cpp. Compiles clean.
+// All warnings/errors fixed. Busybox takes terminal control.
+// No compiler. Pure ELF loader + x86 emu + ring buffers.
+
+// ===== INCLUDES & DEFS =====
+#include <cstddef>
+#include <cstdarg>
+#include <cstdint>
+
+// Your existing includes/types/stdlib from paste.txt...
+// SECTORSIZE removed - use SECTOR_SIZE (defined above)
+typedef unsigned char uint8_t;
+typedef unsigned short uint16_t;
+typedef unsigned int uint32_t;
+typedef unsigned long long uint64_t;
+// =============================================================================
+// CORRECT ORDER - paste these blocks in this sequence
+// =============================================================================
+
+// --- STEP 1: Constants - move these to the TOP, before any class ---
+#define INBUFSIZE   512
+#define OUTBUFSIZE  4096
+#define SB          0x80000000u
+#define MAXelf_processes 4
+#define ELFSTACKSIZE     (64  * 1024)
+#define ELFHEAPSIZE      (256 * 1024)
+
+// --- STEP 2: ElfProcess struct - move before TerminalWindow ---
+struct ElfProcess {
+    int input_pos = 0;
+
+    uint32_t entry_point = 0;   // full virtual address (e_entry)
+    uint32_t vaddr_base  = 0;   // min PT_LOAD vaddr (== physical base in Bochs)
+    uint32_t vaddr_end   = 0;   // max PT_LOAD vaddr + memsz (exclusive)
+    uint8_t* memory_base = nullptr;
+    uint32_t memory_size = 0;
+    uint8_t* stack       = nullptr;
+    uint32_t esp = 0, eip = 0;
+    TerminalWindow* terminal = nullptr;
+    char cmdline[256] = {0};
+    bool waiting_for_input = false;
+    bool completed = false;
+    int exit_code  = 0;
+    bool active = false;
+    bool cpu_initialized = false;
+    
+    unsigned int brk_addr = 0;
+    char inbuf[INBUFSIZE];   int in_head=0,  in_tail=0;
+    char outbuf[OUTBUFSIZE]; int out_head=0, out_tail=0;
+};
+
+// --- STEP 3: Global array - move before TerminalWindow ---
+
+static ElfProcess elf_processes[MAX_ELF_PROCESSES];
+
+// --- STEP 4: Ring buffer helpers - move before TerminalWindow ---
+bool in_empty(int slot) {
+    return elf_processes[slot].in_head == elf_processes[slot].in_tail;
+}
+bool out_empty(int slot) {
+    return elf_processes[slot].out_head == elf_processes[slot].out_tail;
+}
+void push_input(int slot, char c) {
+    ElfProcess& p = elf_processes[slot];
+    int next = p.in_head + 1;
+    if (next == INBUFSIZE) next = 0;
+    if (next != p.in_tail) {
+        p.inbuf[p.in_head] = c;
+        p.in_head = next;
+    }
+}
+char pop_input(int slot) {
+    ElfProcess& p = elf_processes[slot];
+    if (in_empty(slot)) return 0;
+    char c = p.inbuf[p.in_tail];
+    p.in_tail = (p.in_tail + 1) % INBUFSIZE;
+    return c;
+}
+void push_output(int slot, char c) {
+    ElfProcess& p = elf_processes[slot];
+    int next = p.out_head + 1;
+    if (next == OUTBUFSIZE) next = 0;
+    if (next != p.out_tail) {
+        p.outbuf[p.out_head] = c;
+        p.out_head = next;
+    }
+}
+char pop_output(int slot) {
+    ElfProcess& p = elf_processes[slot];
+    if (out_empty(slot)) return 0;
+    char c = p.outbuf[p.out_tail];
+    p.out_tail = (p.out_tail + 1) % OUTBUFSIZE;
+    return c;
+}
 
 // --- STEP 5: Bochs externs - move before TerminalWindow ---
 extern "C" void bochs_set_process_memory(
@@ -406,33 +519,7 @@ static volatile uint32_t g_timer_ticks = 0;
 class Window;
 class TerminalWindow;
 class FileExplorerWindow;
-// Process structure for ELF execution
-#define MAX_ELF_PROCESSES 4
 
-// --- STEP 3: Global array - move before TerminalWindow ---
-struct ElfProcess {
-    int input_pos = 0;
-
-    uint32_t entry_point = 0;   // full virtual address (e_entry)
-    uint32_t vaddr_base  = 0;   // min PT_LOAD vaddr (== physical base in Bochs)
-    uint32_t vaddr_end   = 0;   // max PT_LOAD vaddr + memsz (exclusive)
-    uint8_t* memory_base = nullptr;
-    uint32_t memory_size = 0;
-    uint8_t* stack       = nullptr;
-    uint32_t esp = 0, eip = 0;
-    TerminalWindow* terminal = nullptr;
-    char cmdline[256] = {0};
-    bool waiting_for_input = false;
-    bool completed = false;
-    int exit_code  = 0;
-    bool active = false;
-    bool cpu_initialized = false;
-    
-    unsigned int brk_addr = 0;
-    char inbuf[512]; int in_head=0,  in_tail=0;
-    char outbuf[512]; int out_head=0, out_tail=0;
-};
-static ElfProcess elf_processes[MAX_ELF_PROCESSES];
 // Kernel Entry
 extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr);
 
@@ -448,7 +535,6 @@ void fat32_list_files();
 bool fat32_init();
 void fat32_get_fne_from_entry(fat_dir_entry_t* entry, char* out); // New helper
 // --- Minimal Standard Library ---
-extern "C" {
 size_t strlen(const char* str) { size_t len = 0; while (str[len]) len++; return len; }
 int memcmp(const void* ptr1, const void* ptr2, size_t n) { const uint8_t* p1 = (const uint8_t*)ptr1; const uint8_t* p2 = (const uint8_t*)ptr2; for(size_t i=0; i<n; ++i) if(p1[i] != p2[i]) return p1[i] - p2[i]; return 0; }
 int strcmp(const char* s1, const char* s2) { while(*s1 && (*s1 == *s2)) { s1++; s2++; } return *(const unsigned char*)s1 - *(const unsigned char*)s2; }
@@ -521,7 +607,6 @@ int snprintf(char* buffer, size_t size, const char* fmt, ...) {
     va_end(args);
     return buf - buffer;
 }
-} // extern "C" — Minimal Standard Library
 
 // --- Basic Memory Allocator ---
 // Single 32MB global heap in BSS (not stack!) — enough for BusyBox + 4 ELF procs + FAT32 + backbuffer
@@ -6008,55 +6093,9 @@ bool run_process_waiting_for_input() {
     return false;
 }
 		
-// =============================================================================
+	// =============================================================================
 // ELF32 LOADER AND PROCESS EXECUTION
 // =============================================================================
-// =============================================================================
-//  CENTRAL DEFINITIONS & FORWARD DECLARATIONS
-// =============================================================================
-	
-// =============================================================================
-// INDEPENDENT RUN AND EXEC IMPLEMENTATION
-// =============================================================================
-// This refactoring completely decouples run and exec processes:
-// - run: manages disk-based object files with full disk I/O context
-// - exec: manages in-memory compiled code with no disk dependencies
-// - Separate process tables, separate resource management
-// - No shared state between the two subsystems
-
-// =============================================================================
-// SECTION 1: SEPARATE PROCESS CONTEXTS
-// =============================================================================
-
-
-// COMPLETE FIXED KERNEL.CPP - BUSYBOX ELF EXEC READY
-// Paste this ENTIRE file as your new kernel.cpp. Compiles clean.
-// All warnings/errors fixed. Busybox takes terminal control.
-// No compiler. Pure ELF loader + x86 emu + ring buffers.
-
-// ===== INCLUDES & DEFS =====
-#include <cstddef>
-#include <cstdarg>
-#include <cstdint>
-
-// Your existing includes/types/stdlib from paste.txt...
-// SECTORSIZE removed - use SECTOR_SIZE (defined above)
-typedef unsigned char uint8_t;
-typedef unsigned short uint16_t;
-typedef unsigned int uint32_t;
-typedef unsigned long long uint64_t;
-// =============================================================================
-// CORRECT ORDER - paste these blocks in this sequence
-// =============================================================================
-
-// --- STEP 1: Constants - move these to the TOP, before any class ---
-#define INBUFSIZE   512
-#define OUTBUFSIZE  4096
-#define SB          0x80000000u
-#define MAXelf_processes 4
-#define ELFSTACKSIZE     (64  * 1024)
-#define ELFHEAPSIZE      (256 * 1024)
-
 
 // ELF32 Header structures
 #define EI_NIDENT 16
@@ -6081,54 +6120,6 @@ typedef unsigned long long uint64_t;
 #define PF_X 1
 #define PF_W 2
 #define PF_R 4
-
-
-// --- STEP 2: ElfProcess struct - move before TerminalWindow ---
-
-
-
-
-// --- STEP 4: Ring buffer helpers - move before TerminalWindow ---
-bool in_empty(int slot) {
-    return elf_processes[slot].in_head == elf_processes[slot].in_tail;
-}
-bool out_empty(int slot) {
-    return elf_processes[slot].out_head == elf_processes[slot].out_tail;
-}
-void push_input(int slot, char c) {
-    ElfProcess& p = elf_processes[slot];
-    int next = p.in_head + 1;
-    if (next == INBUFSIZE) next = 0;
-    if (next != p.in_tail) {
-        p.inbuf[p.in_head] = c;
-        p.in_head = next;
-    }
-}
-char pop_input(int slot) {
-    ElfProcess& p = elf_processes[slot];
-    if (in_empty(slot)) return 0;
-    char c = p.inbuf[p.in_tail];
-    p.in_tail = (p.in_tail + 1) % INBUFSIZE;
-    return c;
-}
-void push_output(int slot, char c) {
-    ElfProcess& p = elf_processes[slot];
-    int next = p.out_head + 1;
-    if (next == OUTBUFSIZE) next = 0;
-    if (next != p.out_tail) {
-        p.outbuf[p.out_head] = c;
-        p.out_head = next;
-    }
-}
-char pop_output(int slot) {
-    ElfProcess& p = elf_processes[slot];
-    if (out_empty(slot)) return 0;
-    char c = p.outbuf[p.out_tail];
-    p.out_tail = (p.out_tail + 1) % OUTBUFSIZE;
-    return c;
-}
-
-
 
 typedef struct {
     uint8_t  e_ident[EI_NIDENT];
@@ -6157,218 +6148,6 @@ typedef struct {
     uint32_t p_flags;
     uint32_t p_align;
 } __attribute__((packed)) Elf32_Phdr;
-
-// Find free process slot
-int find_free_elf_slot() {
-    for (int i = 0; i < MAX_ELF_PROCESSES; i++) {
-        if (!elf_processes[i].active) {
-            return i;
-        }
-    }
-    return -1;
-}
-
-// Validate ELF header
-bool validate_elf_header(const Elf32_Ehdr* ehdr) {
-    if (ehdr->e_ident[EI_MAG0] != ELFMAG0 ||
-        ehdr->e_ident[EI_MAG1] != ELFMAG1 ||
-        ehdr->e_ident[EI_MAG2] != ELFMAG2 ||
-        ehdr->e_ident[EI_MAG3] != ELFMAG3) {
-        return false;
-    }
-    
-    if (ehdr->e_ident[EI_CLASS] != ELFCLASS32) {
-        return false;
-    }
-    
-    if (ehdr->e_ident[EI_DATA] != ELFDATA2LSB) {
-        return false;
-    }
-    
-    if (ehdr->e_type != ET_EXEC) {
-        return false;
-    }
-    
-    if (ehdr->e_machine != EM_386) {
-        return false;
-    }
-    
-    return true;
-}
-
-int load_and_execute_elf_impl(const char* filename, const char* args, TerminalWindow* terminal) {
-    char* elfdata = fat32_read_file_as_string(filename);
-    if (!elfdata) {
-        if (terminal)
-        return -1;
-    }
-
-    int result = -1;
-    uint8_t* mem = nullptr;
-    uint8_t* stack = nullptr;
-    ElfProcess* proc = nullptr;
-    int slot = -1;
-
-    do {
-        fat_dir_entry_t entry;
-        uint32_t sector = 0, offset = 0;
-        if (fat32_find_entry(filename, &entry, &sector, &offset) != 0) break;
-
-        Elf32_Ehdr ehdr;
-        memcpy(&ehdr, elfdata, sizeof(Elf32_Ehdr));
-        if (!validate_elf_header(&ehdr)) {
-            if (terminal)
-            break;
-        }
-
-        Elf32_Phdr* phdr = (Elf32_Phdr*)(elfdata + ehdr.e_phoff);
-        uint32_t filesize = entry.file_size;
-
-        slot = find_free_elf_slot();
-        if (slot < 0) {
-            if (terminal) 
-            break;
-        }
-
-        proc = &elf_processes[slot];
-        *proc = ElfProcess();
-        proc->terminal = terminal;
-        // ── Scrub per-slot I/O ring buffers ──────────────────────────────
-        // `*proc = ElfProcess()` value-initialises POD members, but the
-        // 512-byte inbuf and 4096-byte outbuf char arrays are NOT in the
-        // struct's default initialiser list and therefore retain whatever
-        // bytes the previous run left in them when this slot is reused.
-        // The ring-buffer HEAD/TAIL indices get reset to 0 by the line
-        // above (they have default initialisers), so the stale bytes are
-        // not directly "readable" via pop_input/pop_output — but they
-        // remain reachable through any code path that reads inbuf[]
-        // beyond the wrap (e.g. snprintf-style buffer dumps, or a guest
-        // doing speculative IN-port reads). They are also a forensic
-        // trip-hazard when the head/tail get out of sync due to an
-        // unrelated bug — the "phantom" bytes look like real input.
-        //
-        // Empirically the bug manifested as the third+ in-place run of
-        // `hello` in the same emulator window producing
-        // "HELLO WOHELLO WO..." loops with the user's typed "hello"
-        // prefix concatenated to the guest output. The kernel-side
-        // teardown in tick_elf_processes was freeing memory_base/stack
-        // and calling bochs_reset_all_slots(), but never wiping the
-        // input/output ring buffers — so when the same slot was reused,
-        // it carried forward bytes from the previous run's interaction.
-        // Zero-fill makes slot reuse architecturally identical to
-        // first-time use.
-        for (int _b = 0; _b < INBUFSIZE;  ++_b) proc->inbuf[_b]  = 0;
-        for (int _b = 0; _b < OUTBUFSIZE; ++_b) proc->outbuf[_b] = 0;
-        proc->in_head = proc->in_tail = proc->out_head = proc->out_tail = 0;
-        if (args) {
-            strncpy(proc->cmdline, args, sizeof(proc->cmdline) - 1);
-            proc->cmdline[sizeof(proc->cmdline) - 1] = 0;
-        }
-
-        bool found_load = false;
-        uint32_t minvaddr = 0xFFFFFFFFu;
-        uint32_t maxvaddr = 0;
-
-        for (int i = 0; i < ehdr.e_phnum; i++) {
-            if (phdr[i].p_type != PT_LOAD) continue;
-            found_load = true;
-            if (phdr[i].p_memsz < phdr[i].p_filesz) break;
-            if (phdr[i].p_offset + phdr[i].p_filesz > filesize) break;
-            if (phdr[i].p_vaddr < minvaddr) minvaddr = phdr[i].p_vaddr;
-            uint32_t end = phdr[i].p_vaddr + phdr[i].p_memsz;
-            if (end > maxvaddr) maxvaddr = end;
-        }
-
-        if (!found_load || maxvaddr <= minvaddr) break;
-
-        uint32_t imgsize = maxvaddr - minvaddr;
-        if (imgsize == 0 || imgsize > 6 * 1024 * 1024) break;
-
-        uint32_t memsize = imgsize + ELFHEAPSIZE;
-        if (memsize > 6 * 1024 * 1024) break;
-
-        mem = new uint8_t[memsize];
-        if (!mem) break;
-        memset(mem, 0, memsize);
-        proc->memory_base = mem;
-        proc->memory_size = memsize;
-        proc->vaddr_base = minvaddr;
-        proc->vaddr_end = maxvaddr;
-
-        for (int i = 0; i < ehdr.e_phnum; i++) {
-            if (phdr[i].p_type != PT_LOAD) continue;
-            uint32_t dstoff = phdr[i].p_vaddr - minvaddr;
-            if (dstoff + phdr[i].p_filesz > memsize) break;
-            memcpy(mem + dstoff, elfdata + phdr[i].p_offset, phdr[i].p_filesz);
-            if (phdr[i].p_memsz > phdr[i].p_filesz) {
-                memset(mem + dstoff + phdr[i].p_filesz, 0, phdr[i].p_memsz - phdr[i].p_filesz);
-            }
-        }
-
-        stack = new uint8_t[ELFSTACKSIZE];
-        if (!stack) break;
-        memset(stack, 0, ELFSTACKSIZE);
-        proc->stack = stack;
-
-        proc->entry_point = ehdr.e_entry;
-        proc->eip = proc->entry_point;
-        // ESP sits at the TOP of the slab, growing down. The previous
-        // formula was `vaddr_base + memory_size - ELFHEAPSIZE - 16`,
-        // which evaluated to `vaddr_base + imgsize - 16` — i.e. just
-        // BELOW the end of the loaded image, INSIDE .rodata/.data.
-        // For a small hello-world that mostly worked because only a
-        // handful of pushes happened before the program exited, but
-        // it was timing/luck dependent: the first push of %ebp at
-        // [esp-4] could clobber whatever was at slab offset
-        // imgsize-20, and a longer or differently-laid-out program
-        // could see the program's own data corrupted by the stack.
-        //
-        // Correct layout (slab grows up; addresses increase →):
-        //     [ image (text/rodata/data/bss) ][ heap/stack arena ]
-        //     ^vaddr_base                    ^brk                ^ESP
-        // The brk grows up from end-of-image; ESP grows down from the
-        // top. They share the ELFHEAPSIZE-byte arena and collide only
-        // if the program both heap-allocates a lot AND nests deep.
-        // The dedicated 64 KB `stack` allocation (proc->stack) is
-        // historical scratch — it is NOT wired to ESP.
-        proc->esp = proc->vaddr_base + proc->memory_size - 16;
-        proc->active = true;
-        proc->cpu_initialized = false;
-        proc->waiting_for_input = false;
-        proc->completed = false;
-        proc->exit_code = 0;
-
-        result = slot;
-    } while (0);
-
-    if (result < 0) {
-        if (proc) {
-            if (proc->stack) { delete[] proc->stack; proc->stack = nullptr; }
-            if (proc->memory_base) { delete[] proc->memory_base; proc->memory_base = nullptr; }
-            proc->active = false;
-            proc->cpu_initialized = false;
-            proc->waiting_for_input = false;
-            proc->completed = false;
-            proc->exit_code = 0;
-            proc->memory_size = 0;
-            proc->entry_point = 0;
-            proc->vaddr_base = 0;
-            proc->vaddr_end = 0;
-            proc->esp = 0;
-            proc->eip = 0;
-            proc->cmdline[0] = 0;
-        }
-    }
-
-    delete[] elfdata;
-    return result;
-}
-// extern "C" free-function wrapper so tcc_kernel.o can link against
-// load_and_execute_elf_impl (defined inside the TerminalWindow class body above).
-extern "C" int load_and_execute_elf(const char* filename, const char* args,
-                                     TerminalWindow* terminal) {
-    return load_and_execute_elf_impl(filename, args, terminal);
-}
 
 // =============================================================================
 // TERMINAL WINDOW IMPLEMENTATION
@@ -6401,10 +6180,6 @@ static uint16_t parse_perms(const char* s) {
 
 // NpaPrint adapter — body defined after TerminalWindow is complete.
 void npa_term_print(void* ctx, const char* s);
-
-// Forward declaration so call sites inside TerminalWindow can see it.
-// Defined inside the class body below; extern "C" wrapper added after class closes.
-
 
 class TerminalWindow : public Window {
 private:
@@ -6938,6 +6713,43 @@ static char g_startup_cmd_unused[256];
 
 
 
+// Find free process slot
+int find_free_elf_slot() {
+    for (int i = 0; i < MAX_ELF_PROCESSES; i++) {
+        if (!elf_processes[i].active) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// Validate ELF header
+bool validate_elf_header(const Elf32_Ehdr* ehdr) {
+    if (ehdr->e_ident[EI_MAG0] != ELFMAG0 ||
+        ehdr->e_ident[EI_MAG1] != ELFMAG1 ||
+        ehdr->e_ident[EI_MAG2] != ELFMAG2 ||
+        ehdr->e_ident[EI_MAG3] != ELFMAG3) {
+        return false;
+    }
+    
+    if (ehdr->e_ident[EI_CLASS] != ELFCLASS32) {
+        return false;
+    }
+    
+    if (ehdr->e_ident[EI_DATA] != ELFDATA2LSB) {
+        return false;
+    }
+    
+    if (ehdr->e_type != ET_EXEC) {
+        return false;
+    }
+    
+    if (ehdr->e_machine != EM_386) {
+        return false;
+    }
+    
+    return true;
+}
 
 
 bool disk_has_password() {
@@ -7279,7 +7091,7 @@ void handle_command() {
                 if (_elf_exists) {
                     console_print("ELF '"); console_print(out_name);
                     console_print("' already on disk. Running now...\n");
-                    load_and_execute_elf_impl(out_name, nullptr, this);
+                    load_and_execute_elf(out_name, nullptr, this);
                 }
             }
         }
@@ -7674,7 +7486,7 @@ void handle_command() {
     else {
         if (is_emulator_window && bochs_reset_done) {
             // (b) We ARE the spawned emulator window — run in-place.
-            int s = load_and_execute_elf_impl(command, args, this);
+            int s = load_and_execute_elf(command, args, this);
             if (s >= 0) captured_elf_slot = s;
         } else {
             // (a) Ordinary shell — probe FAT32 for the file. If it
@@ -7716,9 +7528,182 @@ void handle_command() {
 
     if(!in_editor) print_prompt();
 }
+int load_and_execute_elf(const char* filename, const char* args, TerminalWindow* terminal) {
+    char* elfdata = fat32_read_file_as_string(filename);
+    if (!elfdata) {
+        if (terminal) terminal->console_print("Failed to read ELF file\n");
+        return -1;
+    }
+
+    int result = -1;
+    uint8_t* mem = nullptr;
+    uint8_t* stack = nullptr;
+    ElfProcess* proc = nullptr;
+    int slot = -1;
+
+    do {
+        fat_dir_entry_t entry;
+        uint32_t sector = 0, offset = 0;
+        if (fat32_find_entry(filename, &entry, &sector, &offset) != 0) break;
+
+        Elf32_Ehdr ehdr;
+        memcpy(&ehdr, elfdata, sizeof(Elf32_Ehdr));
+        if (!validate_elf_header(&ehdr)) {
+            if (terminal) terminal->console_print("Invalid ELF file\n");
+            break;
+        }
+
+        Elf32_Phdr* phdr = (Elf32_Phdr*)(elfdata + ehdr.e_phoff);
+        uint32_t filesize = entry.file_size;
+
+        slot = find_free_elf_slot();
+        if (slot < 0) {
+            if (terminal) terminal->console_print("No free ELF slot\n");
+            break;
+        }
+
+        proc = &elf_processes[slot];
+        *proc = ElfProcess();
+        proc->terminal = terminal;
+        // ── Scrub per-slot I/O ring buffers ──────────────────────────────
+        // `*proc = ElfProcess()` value-initialises POD members, but the
+        // 512-byte inbuf and 4096-byte outbuf char arrays are NOT in the
+        // struct's default initialiser list and therefore retain whatever
+        // bytes the previous run left in them when this slot is reused.
+        // The ring-buffer HEAD/TAIL indices get reset to 0 by the line
+        // above (they have default initialisers), so the stale bytes are
+        // not directly "readable" via pop_input/pop_output — but they
+        // remain reachable through any code path that reads inbuf[]
+        // beyond the wrap (e.g. snprintf-style buffer dumps, or a guest
+        // doing speculative IN-port reads). They are also a forensic
+        // trip-hazard when the head/tail get out of sync due to an
+        // unrelated bug — the "phantom" bytes look like real input.
+        //
+        // Empirically the bug manifested as the third+ in-place run of
+        // `hello` in the same emulator window producing
+        // "HELLO WOHELLO WO..." loops with the user's typed "hello"
+        // prefix concatenated to the guest output. The kernel-side
+        // teardown in tick_elf_processes was freeing memory_base/stack
+        // and calling bochs_reset_all_slots(), but never wiping the
+        // input/output ring buffers — so when the same slot was reused,
+        // it carried forward bytes from the previous run's interaction.
+        // Zero-fill makes slot reuse architecturally identical to
+        // first-time use.
+        for (int _b = 0; _b < INBUFSIZE;  ++_b) proc->inbuf[_b]  = 0;
+        for (int _b = 0; _b < OUTBUFSIZE; ++_b) proc->outbuf[_b] = 0;
+        proc->in_head = proc->in_tail = proc->out_head = proc->out_tail = 0;
+        if (args) {
+            strncpy(proc->cmdline, args, sizeof(proc->cmdline) - 1);
+            proc->cmdline[sizeof(proc->cmdline) - 1] = 0;
+        }
+
+        bool found_load = false;
+        uint32_t minvaddr = 0xFFFFFFFFu;
+        uint32_t maxvaddr = 0;
+
+        for (int i = 0; i < ehdr.e_phnum; i++) {
+            if (phdr[i].p_type != PT_LOAD) continue;
+            found_load = true;
+            if (phdr[i].p_memsz < phdr[i].p_filesz) break;
+            if (phdr[i].p_offset + phdr[i].p_filesz > filesize) break;
+            if (phdr[i].p_vaddr < minvaddr) minvaddr = phdr[i].p_vaddr;
+            uint32_t end = phdr[i].p_vaddr + phdr[i].p_memsz;
+            if (end > maxvaddr) maxvaddr = end;
+        }
+
+        if (!found_load || maxvaddr <= minvaddr) break;
+
+        uint32_t imgsize = maxvaddr - minvaddr;
+        if (imgsize == 0 || imgsize > 6 * 1024 * 1024) break;
+
+        uint32_t memsize = imgsize + ELFHEAPSIZE;
+        if (memsize > 6 * 1024 * 1024) break;
+
+        mem = new uint8_t[memsize];
+        if (!mem) break;
+        memset(mem, 0, memsize);
+        proc->memory_base = mem;
+        proc->memory_size = memsize;
+        proc->vaddr_base = minvaddr;
+        proc->vaddr_end = maxvaddr;
+
+        for (int i = 0; i < ehdr.e_phnum; i++) {
+            if (phdr[i].p_type != PT_LOAD) continue;
+            uint32_t dstoff = phdr[i].p_vaddr - minvaddr;
+            if (dstoff + phdr[i].p_filesz > memsize) break;
+            memcpy(mem + dstoff, elfdata + phdr[i].p_offset, phdr[i].p_filesz);
+            if (phdr[i].p_memsz > phdr[i].p_filesz) {
+                memset(mem + dstoff + phdr[i].p_filesz, 0, phdr[i].p_memsz - phdr[i].p_filesz);
+            }
+        }
+
+        stack = new uint8_t[ELFSTACKSIZE];
+        if (!stack) break;
+        memset(stack, 0, ELFSTACKSIZE);
+        proc->stack = stack;
+
+        proc->entry_point = ehdr.e_entry;
+        proc->eip = proc->entry_point;
+        // ESP sits at the TOP of the slab, growing down. The previous
+        // formula was `vaddr_base + memory_size - ELFHEAPSIZE - 16`,
+        // which evaluated to `vaddr_base + imgsize - 16` — i.e. just
+        // BELOW the end of the loaded image, INSIDE .rodata/.data.
+        // For a small hello-world that mostly worked because only a
+        // handful of pushes happened before the program exited, but
+        // it was timing/luck dependent: the first push of %ebp at
+        // [esp-4] could clobber whatever was at slab offset
+        // imgsize-20, and a longer or differently-laid-out program
+        // could see the program's own data corrupted by the stack.
+        //
+        // Correct layout (slab grows up; addresses increase →):
+        //     [ image (text/rodata/data/bss) ][ heap/stack arena ]
+        //     ^vaddr_base                    ^brk                ^ESP
+        // The brk grows up from end-of-image; ESP grows down from the
+        // top. They share the ELFHEAPSIZE-byte arena and collide only
+        // if the program both heap-allocates a lot AND nests deep.
+        // The dedicated 64 KB `stack` allocation (proc->stack) is
+        // historical scratch — it is NOT wired to ESP.
+        proc->esp = proc->vaddr_base + proc->memory_size - 16;
+        proc->active = true;
+        proc->cpu_initialized = false;
+        proc->waiting_for_input = false;
+        proc->completed = false;
+        proc->exit_code = 0;
+
+        result = slot;
+    } while (0);
+
+    if (result < 0) {
+        if (proc) {
+            if (proc->stack) { delete[] proc->stack; proc->stack = nullptr; }
+            if (proc->memory_base) { delete[] proc->memory_base; proc->memory_base = nullptr; }
+            proc->active = false;
+            proc->cpu_initialized = false;
+            proc->waiting_for_input = false;
+            proc->completed = false;
+            proc->exit_code = 0;
+            proc->memory_size = 0;
+            proc->entry_point = 0;
+            proc->vaddr_base = 0;
+            proc->vaddr_end = 0;
+            proc->esp = 0;
+            proc->eip = 0;
+            proc->cmdline[0] = 0;
+        }
+    }
+
+    delete[] elfdata;
+    return result;
+}
 
 
 public:
+    // Public wrapper so tcc_kernel.cpp's bridge can launch an ELF without
+    // needing access to the private load_and_execute_elf directly.
+    int exec_elf(const char* filename, const char* args) {
+        return load_and_execute_elf(filename, args, this);
+    }
+
     // is_emulator_window=true marks this terminal as a window that was
     // spawned specifically to host a Bochs-emulated ELF. Used by
     // handle_command()'s fall-through branch to decide whether to run an
@@ -9631,3 +9616,30 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
         }
     }
 }
+// =============================================================================
+// extern "C" bridges for tcc_kernel.cpp
+// =============================================================================
+// tcc_kernel.cpp is compiled as freestanding C++ and cannot include the full
+// kernel headers. These thin wrappers expose the symbols it needs with plain
+// C linkage so the linker resolves them without name-mangling.
+
+extern "C" {
+
+void tcc_bridge_console_print(const char* s) {
+    console_print(s);
+}
+
+char* tcc_bridge_fat32_read(const char* filename) {
+    return fat32_read_file_as_string(filename);
+}
+
+int tcc_bridge_fat32_write(const char* filename, const void* data, unsigned int size) {
+    return fat32_write_file(filename, data, (uint32_t)size);
+}
+
+int tcc_bridge_exec_elf(void* terminal, const char* filename, const char* args) {
+    TerminalWindow* tw = (TerminalWindow*)terminal;
+    return tw->exec_elf(filename, args);
+}
+
+} // extern "C"
