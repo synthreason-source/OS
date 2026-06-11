@@ -1268,7 +1268,7 @@ extern "C" int bochs_cpu_tick(int n) {
     s.wants_input = false;
 
     if (n < 1) n = 1;
-    if (n > 4) n = 4;
+    if (n > 256) n = 256;   // allow 256 chars per frame before yielding to paint
 
     // Clear any stale exit flag from a previous tick of a different
     // (now-dead) slot.
