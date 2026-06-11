@@ -9648,9 +9648,25 @@ extern "C" {
 void tcc_bridge_console_print(const char* s) {
     console_print(s);
 }
+static inline bool is_cc_safe_char(unsigned char c) {
+    return c == '\n' || c == '\r' || c == '\t' || (c >= 32 && c != 127);
+}
 
 char* tcc_bridge_fat32_read(const char* filename) {
-    return fat32_read_file_as_string(filename);
+    char *data = fat32_read_file_as_string(filename);
+
+    if (!data) {
+        return NULL;
+    }
+
+    for (char *p = data; *p; ++p) {
+        if (!is_cc_safe_char((unsigned char)*p)) {
+            
+            return NULL;
+        }
+    }
+
+    return data;
 }
 
 int tcc_bridge_fat32_write(const char* filename, const void* data, unsigned int size) {

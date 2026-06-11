@@ -10,7 +10,7 @@
 // Pipeline for  `cc foo.c`  typed in the kernel shell:
 //   1. fat32_read_file_as_string("foo.c")      — source bytes from disk
 //   2. tcc_new() / tcc_compile_string()        — parse + codegen (i386 ELF)
-//   3. tcc_output_file("/@tcc/out")            — ELF written via fake fd shim
+//   3. tcc_output_file("/@tcc/out.elf")        — ELF written via fake fd shim
 //      (open/fdopen/fwrite intercept write into kernel-heap buffer)
 //   4. fat32_write_file(out_name, buf, size)   — persist ELF to FAT32
 //   5. load_and_execute_elf(out_name, …)       — launch in Bochs CPU slot
@@ -440,8 +440,6 @@ struct KFd {
 };
 
 static KFd g_kfds[FAKE_FD_MAX];
-// When >= 0, open("/@tcc/obj") returns this pre-loaded read fd for stage-2 link.
-static int g_obj_read_fd = -1;
 
 static int kfd_alloc() {
     for (int i=0;i<FAKE_FD_MAX;i++)
@@ -472,11 +470,6 @@ int open(const char* path, int flags, ...) {
     bool writing=(flags&O_WRONLY)||(flags&O_RDWR)||(flags&O_CREAT);
     { char _db[128]; snprintf(_db,sizeof(_db),"[tcc] open(%s, flags=0x%x, writing=%d)\n", path?path:"null", flags, (int)writing); console_print(_db); }
     if (!writing) {
-        // Stage-2 link: return the pre-loaded read fd for the obj file
-        if (g_obj_read_fd >= 0 && path && path[0] == '/' && path[1] == '@') {
-            KFd* f = kfd_get(g_obj_read_fd);
-            if (f) { f->active = true; f->pos = 0; console_print("[tcc] open: returned read fd\n"); return g_obj_read_fd; }
-        }
         g_errno_val=2; console_print("[tcc] open: ENOENT\n"); return -1;
     }
     int fd=kfd_alloc();
@@ -759,15 +752,26 @@ extern "C" void tcc_kernel_cmd_cc(void* terminal_opaque,
     // Hook TCC allocator to the kernel heap
     tcc_set_realloc(tcc_kern_realloc);
 
-    // ── Stage 1: compile C source → relocatable OBJ in RAM ───────────────────
-    // Using TCC_OUTPUT_OBJ avoids the EXE linker's symbol-merging pass that
-    // causes '' defined twice errors when merging internal ELF sections.
+    // ── Single stage: compile C source → EXE ELF directly ────────────────────
+    // Compiling and linking in one TCCState avoids the '' defined twice errors
+    // that occur when tcc_add_file merges an externally-produced .o, because
+    // TCC's internal linker manages its own anonymous section symbols from
+    // scratch without any merge step.
     TCCState* s1 = tcc_new();
     if (!s1) { free(full); console_print("cc: tcc_new failed\n"); return; }
 
     tcc_set_error_func(s1, nullptr, tcc_err_cb);
+
+    // CRITICAL: set -nostdlib/-nostdinc BEFORE tcc_set_output_type.
+    // tcc_set_output_type checks s->nostdlib to decide whether to call
+    // tccelf_add_crtbegin(). If options are set after, crtbegin is loaded
+    // from CONFIG_TCC_CRTPREFIX (a path that doesn't exist here), its
+    // symbols get merged in, and every global symbol appears twice.
     tcc_set_options(s1, "-nostdlib -nostdinc");
-    tcc_set_output_type(s1, TCC_OUTPUT_OBJ);
+    tcc_set_lib_path(s1, "/nonexistent");
+    tcc_set_output_type(s1, TCC_OUTPUT_EXE);   // nostdlib is now set — safe
+    tcc_set_options(s1, "-Wl,-e=_start");
+    tcc_set_options(s1, "-Wl,-Ttext=0x08002000");
 
     int rc = tcc_compile_string(s1, full);
     free(full);
@@ -778,76 +782,9 @@ extern "C" void tcc_kernel_cmd_cc(void* terminal_opaque,
         tcc_delete(s1); return;
     }
 
-    // Write .o to RAM buffer via fake fd "/@tcc/obj"
-    rc = tcc_output_file(s1, "/@tcc/obj");
+    // Write EXE ELF to RAM buffer via fake fd
+    rc = tcc_output_file(s1, "/@tcc/out.elf");
     tcc_delete(s1);
-
-    if (rc < 0) {
-        console_print("cc: obj output error:\n");
-        if (g_errlen>0) console_print(g_errbuf);
-        return;
-    }
-
-    // Harvest the .o bytes — we keep them in a named slot for stage 2 to read
-    unsigned long obj_size = 0;
-    unsigned char* obj_buf = harvest_elf(&obj_size); // .o is ELF too
-    if (!obj_buf || obj_size < 4) {
-        console_print("cc: empty obj output\n");
-        if (obj_buf) free(obj_buf);
-        return;
-    }
-
-    // Store .o in a readable fake fd so tcc_add_file can consume it
-    int read_fd = kfd_alloc();
-    if (read_fd < 0) {
-        console_print("cc: no fd for link stage\n");
-        free(obj_buf); return;
-    }
-    {
-        KFd* rf = kfd_get(read_fd);
-        rf->is_write = false;
-        rf->buf      = obj_buf;   // transfer ownership
-        rf->size     = obj_size;
-        rf->cap      = obj_size;
-        rf->pos      = 0;
-    }
-
-    // ── Stage 2: link OBJ → final EXE ELF at 0x08002000 ─────────────────────
-    // Reset error buffer for the link stage
-    g_errlen = 0; g_errbuf[0] = '\0';
-
-    TCCState* s2 = tcc_new();
-    if (!s2) {
-        kfd_release(read_fd);
-        console_print("cc: tcc_new (link) failed\n"); return;
-    }
-
-    tcc_set_error_func(s2, nullptr, tcc_err_cb);
-    // -nostdlib before set_output_type to skip crt
-    tcc_set_options(s2, "-nostdlib -nostdinc -static");
-    tcc_set_lib_path(s2, "/nonexistent");
-    tcc_set_output_type(s2, TCC_OUTPUT_EXE);
-    tcc_set_options(s2, "-Wl,-e=_start");
-    tcc_set_options(s2, "-Wl,-Ttext=0x08002000");
-
-    // Feed the .o via tcc_add_file using our readable fake fd.
-    // tcc_add_file internally calls open() for the path — our open() for
-    // the magic path "/@tcc/obj" returns the pre-loaded read fd.
-    g_obj_read_fd = read_fd; // signal open() to return this fd for /@tcc/obj
-    rc = tcc_add_file(s2, "/@tcc/obj");
-    g_obj_read_fd = -1;
-
-    kfd_release(read_fd);
-
-    if (rc < 0) {
-        console_print("cc: add_file error:\n");
-        if (g_errlen>0) console_print(g_errbuf);
-        tcc_delete(s2); return;
-    }
-
-    // Link → ELF via fake fd
-    rc = tcc_output_file(s2, "/@tcc/out");
-    tcc_delete(s2);
 
     if (rc < 0) {
         console_print("cc: link error:\n");

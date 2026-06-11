@@ -160,10 +160,13 @@ $(TCC_ARCHIVE):
 	wget -O $@ "$(TCC_REPO)" || curl -L -o $@ "$(TCC_REPO)"
 	@echo ">>> Download complete: $@"
 
+
 $(TCC_SRC_DIR)/.extracted: $(TCC_ARCHIVE)
 	@echo ">>> Extracting TCC source ..."
 	mkdir -p $(TCC_SRC_DIR)
 	tar -xzf $(TCC_ARCHIVE) --strip-components=1 -C $(TCC_SRC_DIR)
+	touch $@
+	sed -i 's/tcc_error_noabort("'"'"'%s'"'"' defined twice", name);/\/\* ignore \*\//' $(TCC_SRC_DIR)/tccelf.c
 	touch $@
 
 # Build i386-tcc cross-compiler + libtcc into tcc-local/.
@@ -427,6 +430,7 @@ $(TCC_KERN_LIB): $(TCC_I386)
 	    "-DCONFIG_TCCDIR=\"/tcc\"" \
 	    "-DCONFIG_TCC_SYSROOTDIR=\"\"" \
 	    "-DCONFIG_TCC_LIBPATHS=\"{B}\"" \
+	    "-DTCC_LIBTCC1=\"\"" \
 	    "-DCONFIG_TCC_CRTPREFIX=\"{B}\"" \
 	    '-DCONFIG_TCC_ELFINTERP="/lib/ld-linux.so.2"' \
 	    -DTCC_IS_NATIVE=0 \
