@@ -1,4 +1,4 @@
-a simple GUI interface OS with terminal windows and bochs emulator.
+a simple GUI interface OS with terminal windows, TCC compiler & bochs emulator.
 
 
 CTRL-Q saves and exits text editor...
@@ -7,9 +7,5 @@ CTRL-Q saves and exits text editor...
 SATA port selection with 'disk_select'
 
 
-TODO: more GUI features, get busybox working and test elf functionality(currently some bochs instances may need a window refresh due to some type of print/memory conflict)
-TODO: add TCC compiler
-
-TODO: bochs register keyboard and framebuffer. (test execution available)
-
-TODO: add elf pipe arguments & batch commands, ethernet, Lynx_(web_browser)
+TODO: get elf's print and keyboard input working and test elf functionality via bochs CPU emulator
+TODO: add ethernet, Lynx_(web_browser)
