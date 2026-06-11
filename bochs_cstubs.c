@@ -236,27 +236,30 @@ double             strtod           (const char* s, char** e)                 { 
 int                snprintf         (char* b, size_t n, const char* f, ...)   { (void)n; (void)f; if(b && n) *b = 0; return 0; }
 
 /* ── FILE stubs ─────────────────────────────────────────────────────────── */
+// All IO stubs are __attribute__((weak)) so tcc_kernel.o's strong definitions
+// override them at link time (tcc_kernel.o provides the real implementations
+// that route through kernel heap buffers instead of silently discarding data).
 typedef struct { int fd; } FILE;
 static FILE _null_file = { -1 };
-FILE*  fopen64    (const char* p, const char* m)        { (void)p; (void)m; return (FILE*)0; }
-FILE*  tmpfile64  (void)                                { return (FILE*)0; }
-int    fclose     (FILE* f)                             { (void)f; return 0; }
-int    feof       (FILE* f)                             { (void)f; return 1; }
-char*  fgets      (char* s, int n, FILE* f)             { (void)s; (void)n; (void)f; return (char*)0; }
-int    fflush     (FILE* f)                             { (void)f; return 0; }
-size_t fread      (void* p, size_t sz, size_t n, FILE* f) { (void)p; (void)sz; (void)n; (void)f; return 0; }
-size_t fwrite     (const void* p, size_t sz, size_t n, FILE* f) { (void)p; (void)sz; (void)n; (void)f; return 0; }
-int    fseeko64   (FILE* f, off64_t o, int w)           { (void)f; (void)o; (void)w; return -1; }
-FILE*  stdout = &_null_file;
-FILE*  stderr = &_null_file;
-int    fprintf(FILE* f, const char* fmt, ...)           { (void)f; (void)fmt; return 0; }
-int    fputs  (const char* s, FILE* f)                  { (void)s; (void)f; return 0; }
+__attribute__((weak)) FILE*  fopen64    (const char* p, const char* m)        { (void)p; (void)m; return (FILE*)0; }
+__attribute__((weak)) FILE*  tmpfile64  (void)                                { return (FILE*)0; }
+__attribute__((weak)) int    fclose     (FILE* f)                             { (void)f; return 0; }
+__attribute__((weak)) int    feof       (FILE* f)                             { (void)f; return 1; }
+__attribute__((weak)) char*  fgets      (char* s, int n, FILE* f)             { (void)s; (void)n; (void)f; return (char*)0; }
+__attribute__((weak)) int    fflush     (FILE* f)                             { (void)f; return 0; }
+__attribute__((weak)) size_t fread      (void* p, size_t sz, size_t n, FILE* f) { (void)p; (void)sz; (void)n; (void)f; return 0; }
+__attribute__((weak)) size_t fwrite     (const void* p, size_t sz, size_t n, FILE* f) { (void)p; (void)sz; (void)n; (void)f; return 0; }
+__attribute__((weak)) int    fseeko64   (FILE* f, off64_t o, int w)           { (void)f; (void)o; (void)w; return -1; }
+__attribute__((weak)) FILE*  stdout = &_null_file;
+__attribute__((weak)) FILE*  stderr = &_null_file;
+__attribute__((weak)) int    fprintf(FILE* f, const char* fmt, ...)           { (void)f; (void)fmt; return 0; }
+__attribute__((weak)) int    fputs  (const char* s, FILE* f)                  { (void)s; (void)f; return 0; }
 
 /* ── POSIX file operations ──────────────────────────────────────────────── */
-int     open64 (const char* p, int f, ...)              { (void)p; (void)f; return -1; }
-int     fstat64(int fd, void* st)                       { (void)fd; (void)st; return -1; }
-ssize_t read   (int fd, void* buf, size_t n)            { (void)fd; (void)buf; (void)n; return -1; }
-int     close  (int fd)                                 { (void)fd; return 0; }
+__attribute__((weak)) int     open64 (const char* p, int f, ...)              { (void)p; (void)f; return -1; }
+__attribute__((weak)) int     fstat64(int fd, void* st)                       { (void)fd; (void)st; return -1; }
+__attribute__((weak)) ssize_t read   (int fd, void* buf, size_t n)            { (void)fd; (void)buf; (void)n; return -1; }
+__attribute__((weak)) int     close  (int fd)                                 { (void)fd; return 0; }
 
 /* ── Bochs-specific globals ─────────────────────────────────────────────── */
 int simulate_xapic = 0;

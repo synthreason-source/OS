@@ -428,7 +428,7 @@ void __stack_chk_fail(void) {
 
 // ── RAM-backed fd/FILE shim ───────────────────────────────────────────────────
 #define FAKE_FD_BASE  500
-#define FAKE_FD_MAX   8
+#define FAKE_FD_MAX   16   // TCC opens several internal fds during compilation
 
 struct KFd {
     bool          active;
@@ -440,6 +440,8 @@ struct KFd {
 };
 
 static KFd g_kfds[FAKE_FD_MAX];
+// When >= 0, open("/@tcc/obj") returns this pre-loaded read fd for stage-2 link.
+static int g_obj_read_fd = -1;
 
 static int kfd_alloc() {
     for (int i=0;i<FAKE_FD_MAX;i++)
@@ -466,23 +468,33 @@ static void kfd_release(int fd) {
 #define O_TRUNC    0x200
 #define O_BINARY   0
 
-int open(const char* /*path*/, int flags, ...) {
+int open(const char* path, int flags, ...) {
     bool writing=(flags&O_WRONLY)||(flags&O_RDWR)||(flags&O_CREAT);
-    if (!writing) { g_errno_val=2; return -1; } // no read-only opens
+    { char _db[128]; snprintf(_db,sizeof(_db),"[tcc] open(%s, flags=0x%x, writing=%d)\n", path?path:"null", flags, (int)writing); console_print(_db); }
+    if (!writing) {
+        // Stage-2 link: return the pre-loaded read fd for the obj file
+        if (g_obj_read_fd >= 0 && path && path[0] == '/' && path[1] == '@') {
+            KFd* f = kfd_get(g_obj_read_fd);
+            if (f) { f->active = true; f->pos = 0; console_print("[tcc] open: returned read fd\n"); return g_obj_read_fd; }
+        }
+        g_errno_val=2; console_print("[tcc] open: ENOENT\n"); return -1;
+    }
     int fd=kfd_alloc();
-    if (fd<0) { g_errno_val=12; return -1; }
+    if (fd<0) { g_errno_val=12; console_print("[tcc] open: no fd slots!\n"); return -1; }
     KFd* f=kfd_get(fd);
     f->is_write=true;
     f->cap=65536;
     f->buf=(unsigned char*)malloc(f->cap);
-    if (!f->buf) { kfd_release(fd); g_errno_val=12; return -1; }
+    if (!f->buf) { kfd_release(fd); g_errno_val=12; console_print("[tcc] open: malloc fail\n"); return -1; }
+    { char _db[64]; snprintf(_db,sizeof(_db),"[tcc] open: allocated fd=%d\n",fd); console_print(_db); }
     return fd;
 }
 
 int close(int fd) {
     KFd* f=kfd_get(fd);
     if (!f) { g_errno_val=9; return -1; }
-    f->active=false; // keep buf alive for harvest
+    { char _db[64]; snprintf(_db,sizeof(_db),"[tcc] close(fd=%d) size=%lu\n",fd,f->size); console_print(_db); }
+    f->active=false; // keep buf alive for harvest (write) or explicit free (read)
     return 0;
 }
 
@@ -506,6 +518,7 @@ long read(int fd, void* buf, unsigned long n) {
 }
 
 static bool kfd_write_bytes(KFd* f, const void* data, unsigned long n) {
+    { char _db[80]; snprintf(_db,sizeof(_db),"[tcc] kfd_write_bytes n=%lu cur_size=%lu\n",n,f->size); console_print(_db); }
     unsigned long need=f->size+n;
     if (need>f->cap) {
         unsigned long nc=f->cap*2; while(nc<need) nc*=2;
@@ -518,105 +531,140 @@ static bool kfd_write_bytes(KFd* f, const void* data, unsigned long n) {
     f->size+=n; return true;
 }
 
+// ── write() syscall ───────────────────────────────────────────────────────────
+// tcc_output_file (mob branch) calls write(fd,...) directly rather than fwrite.
+// Without this stub, all bytes are silently dropped and harvest_elf sees size=0.
+long write(int fd, const void* buf, unsigned long n) {
+    KFd* f = kfd_get(fd);
+    if (!f || !f->is_write) { g_errno_val = 9; return -1; }
+    return kfd_write_bytes(f, buf, n) ? (long)n : -1;
+}
+
 // ── FILE* shim ────────────────────────────────────────────────────────────────
-// We use a small per-slot struct instead of real FILE*.
+// IMPORTANT: libtcc.a was compiled against glibc's <stdio.h>, so inside that
+// .a the symbol "FILE" is glibc's struct _IO_FILE (~148 bytes, 32-bit).
+// We must NOT typedef our own struct as FILE — libtcc would try to dereference
+// our small token as a glibc FILE and read garbage offsets, silently dropping
+// all fwrite calls.
+//
+// The correct approach: declare our token struct under a different name and
+// expose FILE* as an opaque pointer (forward-declared, never defined here).
+// All stdio functions (fwrite, fputc, fclose, ...) are resolved at kernel
+// link time from THIS translation unit, so libtcc.a never actually
+// dereferences the FILE* it receives — it only passes it back to us.
+// We embed the real fd number inside the token and recover it via a cast.
 
 struct KFile {
-    bool active;
-    bool is_console; // stdout/stderr — route to console_print
-    int  fd;         // index into g_kfds when !is_console
+    unsigned int magic;   // 0xF11EF11E — sanity check
+    bool is_console;
+    int  fd;
 };
 
-#define KFILE_MAX 8
+#define KFILE_MAGIC 0xF11EF11Eu
+#define KFILE_MAX 16
 static KFile g_kfiles[KFILE_MAX];
 
-// Fake FILE objects for stdout/stderr — must be actual objects so pointers work.
-static KFile g_stdout_kf = {true, true, -1};
-static KFile g_stderr_kf = {true, true, -1};
+static KFile g_stdout_kf = {KFILE_MAGIC, true,  -1};
+static KFile g_stderr_kf = {KFILE_MAGIC, true,  -1};
 
-typedef KFile FILE;
+// FILE is declared as an incomplete struct so we can have FILE* without
+// defining the layout — we cast KFile* to FILE* and back.
+struct _KFileOpaque;
+typedef struct _KFileOpaque FILE;
 
-FILE* stdout = &g_stdout_kf;
-FILE* stderr = &g_stderr_kf;
+FILE* stdout = (FILE*)&g_stdout_kf;
+FILE* stderr = (FILE*)&g_stderr_kf;
 FILE* stdin  = nullptr;
 
+static KFile* kf_of(FILE* f) {
+    KFile* k = (KFile*)f;
+    if (!k || k->magic != KFILE_MAGIC) return nullptr;
+    return k;
+}
+
 static FILE* kfile_alloc(bool console, int fd) {
-    for (int i=0;i<KFILE_MAX;i++)
-        if (!g_kfiles[i].active) {
-            g_kfiles[i]={true,console,fd};
-            return &g_kfiles[i];
+    for (int i = 0; i < KFILE_MAX; i++) {
+        if (g_kfiles[i].magic != KFILE_MAGIC) {
+            g_kfiles[i] = {KFILE_MAGIC, console, fd};
+            return (FILE*)&g_kfiles[i];
         }
+    }
     return nullptr;
 }
 static void kfile_free(FILE* f) {
-    if (!f||f==stdout||f==stderr) return;
-    f->active=false;
+    KFile* k = kf_of(f);
+    if (!k || f == stdout || f == stderr) return;
+    k->magic = 0;
 }
 
-FILE* fdopen(int fd, const char*) {
-    if (!kfd_get(fd)) { g_errno_val=9; return nullptr; }
-    return kfile_alloc(false, fd);
+FILE* fdopen(int fd, const char* mode) {
+    { char _db[64]; snprintf(_db,sizeof(_db),"[tcc] fdopen(fd=%d)\n",fd); console_print(_db); }
+    if (!kfd_get(fd)) { g_errno_val = 9; console_print("[tcc] fdopen: kfd_get FAILED\n"); return nullptr; }
+    FILE* ret = kfile_alloc(false, fd);
+    { char _db[80]; snprintf(_db,sizeof(_db),"[tcc] fdopen: KFile slot=%p\n",(void*)ret); console_print(_db); }
+    return ret;
 }
 FILE* fopen(const char* path, const char* mode) {
-    bool w=(mode&&(mode[0]=='w'||mode[0]=='a'));
-    int fd=open(path, w?(O_WRONLY|O_CREAT|O_TRUNC):O_RDONLY);
-    if (fd<0) return nullptr;
+    bool w = (mode && (mode[0] == 'w' || mode[0] == 'a'));
+    int fd = open(path, w ? (O_WRONLY|O_CREAT|O_TRUNC) : O_RDONLY);
+    if (fd < 0) return nullptr;
     return fdopen(fd, mode);
 }
 FILE* freopen(const char* path, const char* mode, FILE* /*f*/) {
-    return fopen(path,mode);
+    return fopen(path, mode);
 }
 int fclose(FILE* f) {
-    if (!f||f==stdout||f==stderr) return 0;
-    int fd=f->fd; kfile_free(f); return close(fd);
+    KFile* k = kf_of(f);
+    if (!k) return 0;
+    if (f == stdout || f == stderr) return 0;
+    int fd = k->fd;
+    kfile_free(f);
+    return close(fd);
 }
 
 static void con_write(const char* p, unsigned long n) {
     char tmp[128];
-    while (n>0) {
-        unsigned long c=(n>127)?127:n;
-        memcpy(tmp,p,c); tmp[c]='\0';
-        console_print(tmp); p+=c; n-=c;
+    while (n > 0) {
+        unsigned long c = (n > 127) ? 127 : n;
+        memcpy(tmp, p, c); tmp[c] = '\0';
+        console_print(tmp); p += c; n -= c;
     }
 }
 
 unsigned long fwrite(const void* ptr, unsigned long sz,
                      unsigned long count, FILE* f) {
-    if (!f) return 0;
-    unsigned long n=sz*count;
-    if (f->is_console) { con_write((const char*)ptr,n); return count; }
-    KFd* kf=kfd_get(f->fd);
-    if (!kf) return 0;
-    return kfd_write_bytes(kf,ptr,n)?count:0;
+    if (!f) { console_print("[tcc] fwrite: NULL FILE*\n"); return 0; }
+    unsigned long n = sz * count;
+    KFile* k = kf_of(f);
+    if (!k) { char _db[80]; snprintf(_db,sizeof(_db),"[tcc] fwrite: kf_of FAILED f=%p\n",(void*)f); console_print(_db); return 0; }
+    if (k->is_console) { con_write((const char*)ptr, n); return count; }
+    KFd* kf = kfd_get(k->fd);
+    if (!kf) { char _db[80]; snprintf(_db,sizeof(_db),"[tcc] fwrite: kfd_get(%d) FAILED\n",k->fd); console_print(_db); return 0; }
+    return kfd_write_bytes(kf, ptr, n) ? count : 0;
 }
 
 int fputc(int c, FILE* f) {
-    char ch=(char)c;
-    return (fwrite(&ch,1,1,f)==1)?(unsigned char)c:-1;
+    char ch = (char)c;
+    return (fwrite(&ch, 1, 1, f) == 1) ? (unsigned char)c : -1;
 }
-
 int fputs(const char* s, FILE* f) {
-    unsigned long n=strlen(s);
-    return (fwrite(s,1,n,f)==n)?(int)n:-1;
+    unsigned long n = strlen(s);
+    return (fwrite(s, 1, n, f) == n) ? (int)n : -1;
 }
-
 int fflush(FILE*) { return 0; }
-
 int fprintf(FILE* f, const char* fmt, ...) {
     char buf[512];
-    va_list ap; va_start(ap,fmt);
-    int n=kern_vsnprintf(buf,sizeof(buf),fmt,ap); va_end(ap);
-    fwrite(buf,1,(unsigned long)n,f); return n;
+    va_list ap; va_start(ap, fmt);
+    int n = kern_vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
+    fwrite(buf, 1, (unsigned long)n, f); return n;
 }
-
 int vfprintf(FILE* f, const char* fmt, va_list ap) {
     char buf[512];
-    int n=kern_vsnprintf(buf,sizeof(buf),fmt,ap);
-    fwrite(buf,1,(unsigned long)n,f); return n;
+    int n = kern_vsnprintf(buf, sizeof(buf), fmt, ap);
+    fwrite(buf, 1, (unsigned long)n, f); return n;
 }
-
-int putchar(int c) { return fputc(c,stdout); }
-int puts(const char* s) { fputs(s,stdout); fputc('\n',stdout); return 0; }
+int putchar(int c) { return fputc(c, stdout); }
+int puts(const char* s) { fputs(s, stdout); fputc('\n', stdout); return 0; }
 
 int unlink(const char*) { return 0; }
 
@@ -646,22 +694,17 @@ static void tcc_err_cb(void*, const char* msg) {
 
 // ── Harvest ELF from the closed fake fd ──────────────────────────────────────
 static unsigned char* harvest_elf(unsigned long* sz) {
+    console_print("[tcc] harvest_elf: scanning slots\n");
     for (int i=0;i<FAKE_FD_MAX;i++) {
         KFd* f=&g_kfds[i];
-        if (!f->active && f->buf && f->size>0) {
+        { char _db[96]; snprintf(_db,sizeof(_db),"[tcc]   slot[%d]: active=%d write=%d buf=%p size=%lu\n", i,(int)f->active,(int)f->is_write,(void*)f->buf,f->size); console_print(_db); }
+        if (!f->active && f->is_write && f->buf && f->size>0) {
             unsigned char* b=f->buf; *sz=f->size;
             f->buf=nullptr; f->size=0; return b;
         }
     }
     return nullptr;
 }
-
-// ── Guest ABI header injected before every user source file ──────────────────
-static const char k_guest_hdr[] =
-"static inline void outb(unsigned short p,unsigned char v){\n"
-"  __asm__ volatile(\"outb %0,%1\"::\"a\"(v),\"Nd\"(p));}\n"
-"static inline void kprint(const char*s){while(*s)outb(0xE9,*s++);}\n"
-"static inline void kexit(int c){outb(0xE8,(unsigned char)c);}\n";
 
 // ── tcc_realloc wrapper (plain function, not lambda) ─────────────────────────
 static void* tcc_kern_realloc(void* ptr, unsigned long size) {
@@ -707,54 +750,104 @@ extern "C" void tcc_kernel_cmd_cc(void* terminal_opaque,
     console_print("\n");
 
     // Read source from FAT32
-    char* src = fat32_read_file_as_string(src_name);
-    if (!src) {
+    char* full = fat32_read_file_as_string(src_name);
+    if (!full) {
         console_print("cc: cannot read "); console_print(src_name); console_print("\n");
         return;
     }
 
-    // Build full source: guest header + user code
-    unsigned long hl=sizeof(k_guest_hdr)-1, sl=strlen(src);
-    char* full=(char*)malloc(hl+sl+1);
-    if (!full) { free(src); console_print("cc: OOM\n"); return; }
-    memcpy(full,          k_guest_hdr, hl);
-    memcpy(full+hl,       src,         sl);
-    full[hl+sl]='\0';
-    free(src);
-
     // Hook TCC allocator to the kernel heap
     tcc_set_realloc(tcc_kern_realloc);
 
-    TCCState* s = tcc_new();
-    if (!s) { free(full); console_print("cc: tcc_new failed\n"); return; }
+    // ── Stage 1: compile C source → relocatable OBJ in RAM ───────────────────
+    // Using TCC_OUTPUT_OBJ avoids the EXE linker's symbol-merging pass that
+    // causes '' defined twice errors when merging internal ELF sections.
+    TCCState* s1 = tcc_new();
+    if (!s1) { free(full); console_print("cc: tcc_new failed\n"); return; }
 
-    tcc_set_error_func(s, nullptr, tcc_err_cb);
+    tcc_set_error_func(s1, nullptr, tcc_err_cb);
+    tcc_set_options(s1, "-nostdlib -nostdinc");
+    tcc_set_output_type(s1, TCC_OUTPUT_OBJ);
 
-    // IMPORTANT: -nostdlib must come BEFORE tcc_set_output_type so that
-    // tccelf_add_crtbegin() is skipped (it checks s->nostdlib before adding crt1.o).
-    tcc_set_options(s, "-nostdlib -nostdinc -static");
-    tcc_set_lib_path(s, "/nonexistent");
-
-    tcc_set_output_type(s, TCC_OUTPUT_EXE);
-
-    // Entry point and load address 0x08002000 (past Bochs GDT/IDT stub zone).
-    // TCC native linker syntax: -Wl,-e=name and -Wl,-Ttext=addr (with = not space).
-    tcc_set_options(s, "-Wl,-e=_start");
-    tcc_set_options(s, "-Wl,-Ttext=0x08002000");
-
-    // Compile
-    int rc = tcc_compile_string(s, full);
+    int rc = tcc_compile_string(s1, full);
     free(full);
 
     if (rc < 0) {
         console_print("cc: compile error:\n");
         if (g_errlen>0) console_print(g_errbuf);
-        tcc_delete(s); return;
+        tcc_delete(s1); return;
     }
 
-    // Link -> ELF via fake fd
-    rc = tcc_output_file(s, "/@tcc/out");
-    tcc_delete(s);
+    // Write .o to RAM buffer via fake fd "/@tcc/obj"
+    rc = tcc_output_file(s1, "/@tcc/obj");
+    tcc_delete(s1);
+
+    if (rc < 0) {
+        console_print("cc: obj output error:\n");
+        if (g_errlen>0) console_print(g_errbuf);
+        return;
+    }
+
+    // Harvest the .o bytes — we keep them in a named slot for stage 2 to read
+    unsigned long obj_size = 0;
+    unsigned char* obj_buf = harvest_elf(&obj_size); // .o is ELF too
+    if (!obj_buf || obj_size < 4) {
+        console_print("cc: empty obj output\n");
+        if (obj_buf) free(obj_buf);
+        return;
+    }
+
+    // Store .o in a readable fake fd so tcc_add_file can consume it
+    int read_fd = kfd_alloc();
+    if (read_fd < 0) {
+        console_print("cc: no fd for link stage\n");
+        free(obj_buf); return;
+    }
+    {
+        KFd* rf = kfd_get(read_fd);
+        rf->is_write = false;
+        rf->buf      = obj_buf;   // transfer ownership
+        rf->size     = obj_size;
+        rf->cap      = obj_size;
+        rf->pos      = 0;
+    }
+
+    // ── Stage 2: link OBJ → final EXE ELF at 0x08002000 ─────────────────────
+    // Reset error buffer for the link stage
+    g_errlen = 0; g_errbuf[0] = '\0';
+
+    TCCState* s2 = tcc_new();
+    if (!s2) {
+        kfd_release(read_fd);
+        console_print("cc: tcc_new (link) failed\n"); return;
+    }
+
+    tcc_set_error_func(s2, nullptr, tcc_err_cb);
+    // -nostdlib before set_output_type to skip crt
+    tcc_set_options(s2, "-nostdlib -nostdinc -static");
+    tcc_set_lib_path(s2, "/nonexistent");
+    tcc_set_output_type(s2, TCC_OUTPUT_EXE);
+    tcc_set_options(s2, "-Wl,-e=_start");
+    tcc_set_options(s2, "-Wl,-Ttext=0x08002000");
+
+    // Feed the .o via tcc_add_file using our readable fake fd.
+    // tcc_add_file internally calls open() for the path — our open() for
+    // the magic path "/@tcc/obj" returns the pre-loaded read fd.
+    g_obj_read_fd = read_fd; // signal open() to return this fd for /@tcc/obj
+    rc = tcc_add_file(s2, "/@tcc/obj");
+    g_obj_read_fd = -1;
+
+    kfd_release(read_fd);
+
+    if (rc < 0) {
+        console_print("cc: add_file error:\n");
+        if (g_errlen>0) console_print(g_errbuf);
+        tcc_delete(s2); return;
+    }
+
+    // Link → ELF via fake fd
+    rc = tcc_output_file(s2, "/@tcc/out");
+    tcc_delete(s2);
 
     if (rc < 0) {
         console_print("cc: link error:\n");

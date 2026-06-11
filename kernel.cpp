@@ -9488,6 +9488,26 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
             wm.print_to_focused("BusyBox: ramdisk empty or write failed.\n");
         if (extract_hello_to_filesystem())
             wm.print_to_focused("hello: saved to FAT32.\n");
+
+        // Write the TCC guest ABI header so user programs can #include "tcc.h"
+        // to get outb / kprint / kexit without redefining them.
+        {
+            fat_dir_entry_t tcc_hdr_entry;
+            uint32_t th_sec = 0, th_off = 0;
+            if (fat32_find_entry("tcc.h", &tcc_hdr_entry, &th_sec, &th_off) != 0) {
+                static const char tcc_h[] =
+                    "/* tcc.h — guest ABI for in-kernel TCC programs */\n"
+                    "#ifndef TCC_H\n#define TCC_H\n"
+                    "static inline void outb(unsigned short p, unsigned char v) {\n"
+                    "    __asm__ volatile(\"outb %0,%1\"::\"a\"(v),\"Nd\"(p)); }\n"
+                    "static inline void kprint(const char* s) {\n"
+                    "    while (*s) outb(0xE9, *s++); }\n"
+                    "static inline void kexit(int c) {\n"
+                    "    outb(0xE8, (unsigned char)c); }\n"
+                    "#endif\n";
+                fat32_write_file("tcc.h", tcc_h, (uint32_t)(sizeof(tcc_h) - 1));
+            }
+        }
     } else {
         wm.print_to_focused("FAT32: not initialised.\n");
     }
