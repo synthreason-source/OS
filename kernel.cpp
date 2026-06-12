@@ -8819,12 +8819,21 @@ static bool x86_tick(int slot, int steps) {
         // Re-register the slab (the glue unregisters any previous mapping
         // for the slot first, so this is idempotent). Then hardware-reset
         // the CPU, enter protected mode, and point it at the guest entry.
+        //
+        // ORDER MATTERS: bochs_cpu_init() must come first so the global
+        // Bochs subsystem (BX_MEM, BX_CPU, pc_system) is fully initialised
+        // before bochs_set_process_memory tries to register memory handlers
+        // and call slot_prime_cpu. If set_process_memory runs first it
+        // calls bochs_global_init() internally, but the explicit call here
+        // makes the dependency explicit and avoids the fragile case where
+        // the first sub-call inside set_process_memory triggers global init
+        // mid-function.
         x86_breadcrumb(0, 'L');
+        bochs_cpu_init();
+        x86_breadcrumb(2, 'I');
         bochs_set_process_memory(proc.memory_base, proc.memory_size,
                                  proc.vaddr_base);
         x86_breadcrumb(1, 'M');
-        bochs_cpu_init();
-        x86_breadcrumb(2, 'I');
         bochs_cpu_set_esp(proc.esp);
         x86_breadcrumb(3, 'S');
         bochs_cpu_set_eip(proc.entry_point);
@@ -8880,6 +8889,14 @@ static bool x86_tick(int slot, int steps) {
 
     return true;
 }
+// Persistent flag: set when the last Bochs slot exits, cleared once the
+// output ring buffers have fully drained and bochs_reset_all_slots() fires.
+// Survives across tick_elf_processes frames so the reset isn't lost when
+// output is still pending on the exit frame (any_exited_this_frame is only
+// true on the ONE frame the exit is detected, not on the drain frames that
+// follow it).
+static bool g_bochs_reset_needed = false;
+
 // And definition without default:
 void tick_elf_processes(int steps) {
     bool any_exited_this_frame = false;
@@ -8999,32 +9016,47 @@ void tick_elf_processes(int steps) {
     }
 
     // ── Deferred glue-wide reset ────────────────────────────────────
-    // If any process exited this frame AND no other Bochs-emulated
-    // process is still running, wipe Bochs's glue state back to its
-    // post-boot baseline. The next launch will then start from the
-    // same state as launch #1.
+    // After all slots have exited, wipe Bochs's glue state back to its
+    // post-boot baseline.
+    //
+    // This is now a SAFETY NET rather than the primary correctness
+    // mechanism. The real guarantee of identical start state comes from
+    // bochs_set_process_memory, which does a full BX_RESET_HARDWARE
+    // before priming each slot (when no peer slots are live). This
+    // deferred reset handles two remaining cases:
+    //
+    //   1. Concurrent slots: when two slots run together, the pre-load
+    //      reset in bochs_set_process_memory is skipped to avoid
+    //      clobbering the peer. Once both exit, this reset cleans up
+    //      any residual glue state so the next solo launch starts clean.
+    //
+    //   2. Belt-and-braces: ensures g_active_slot is reset to -1 and
+    //      all slot mappings are unregistered even if bochs_release_slot
+    //      was somehow missed.
     //
     // CRITICAL: do NOT reset while another slot is still running.
-    // bochs_reset_all_slots() unmaps every slab and hardware-resets
-    // BX_CPU(0); doing that to a live slot drops its EIP/CRs/segments
-    // back to the post-reset state. On the very next frame, x86_tick
-    // would re-enter the lazy-init path and bochs_cpu_set_eip would
-    // restart the guest from _start. The visible symptom is a runaway
-    // window spamming "HELLO WOHELLO WO..." for as long as another
-    // window is finishing — exactly because every frame's exit on
-    // window B triggered a reset that restarted window A from the top.
     if (any_exited_this_frame) {
-   	 bool any_still_active = false;
-	 bool any_output_pending = false;
-	 for (int j = 0; j < MAX_ELF_PROCESSES; ++j) {
-	     if (elf_processes[j].active) { any_still_active = true; break; }
- 	     if (!out_empty(j)) any_output_pending = true;
-	     }
-	     if (!any_still_active && !any_output_pending) {
-	        bochs_reset_all_slots();
-	     }
-	 }
-     
+        bool any_still_active = false;
+        for (int j = 0; j < MAX_ELF_PROCESSES; ++j)
+            if (elf_processes[j].active) { any_still_active = true; break; }
+        if (!any_still_active)
+            g_bochs_reset_needed = true;
+    }
+    if (g_bochs_reset_needed) {
+        // Wait until the output ring buffers are fully drained so the
+        // terminal displays the last line of output before the reset
+        // clears the glue state. (The reset does not affect kernel-side
+        // ring buffers — it only touches Bochs internals — but draining
+        // first keeps the visual ordering correct.)
+        bool any_output = false;
+        for (int j = 0; j < MAX_ELF_PROCESSES; ++j)
+            if (!out_empty(j)) { any_output = true; break; }
+        if (!any_output) {
+            bochs_reset_all_slots();
+            g_bochs_reset_needed = false;
+        }
+    }
+
 }
 
 extern "C" void cmd_exec(const char* code_text) {
