@@ -9014,14 +9014,17 @@ void tick_elf_processes(int steps) {
     // window is finishing — exactly because every frame's exit on
     // window B triggered a reset that restarted window A from the top.
     if (any_exited_this_frame) {
-        bool any_still_active = false;
-        for (int j = 0; j < MAX_ELF_PROCESSES; ++j) {
-            if (elf_processes[j].active) { any_still_active = true; break; }
-        }
-        if (!any_still_active) {
-            bochs_reset_all_slots();
-        }
-    }
+   	 bool any_still_active = false;
+	 bool any_output_pending = false;
+	 for (int j = 0; j < MAX_ELF_PROCESSES; ++j) {
+	     if (elf_processes[j].active) { any_still_active = true; break; }
+ 	     if (!out_empty(j)) any_output_pending = true;
+	     }
+	     if (!any_still_active && !any_output_pending) {
+	        bochs_reset_all_slots();
+	     }
+	 }
+     
 }
 
 extern "C" void cmd_exec(const char* code_text) {
