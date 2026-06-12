@@ -745,6 +745,8 @@ extern "C" void bochs_set_process_memory(Bit8u* base, Bit32u size,
     // entry code instead of guest code. slot_restore_cpu copies every
     // architectural register from s.cpu into the live CPU.
     slot_restore_cpu(s);
+    BX_CPU(0)->oszapc.result     = 0;
+    BX_CPU(0)->oszapc.auxbits    = 0;
 
     // Flush Bochs caches that might still reference a previous
     // mapping for this slot.
@@ -908,7 +910,9 @@ extern "C" void bochs_reset_all_slots() {
     // Clear sticky yield flags that reset() may have set, the same
     // way bochs_global_init() does after its boot-time reset.
     BX_CPU(0)->reset(BX_RESET_HARDWARE);
-    BX_CPU(0)->async_event          = 0;
+    BX_CPU(0)->oszapc.result  = 0;   // add this
+    BX_CPU(0)->oszapc.auxbits = 0;   // add this
+    BX_CPU(0)->async_event = 0;
     bx_pc_system.kill_bochs_request = 0;
     g_exit_pending                  = 0;
 
@@ -1267,8 +1271,7 @@ extern "C" int bochs_cpu_tick(int n) {
 
     s.wants_input = false;
 
-    if (n < 1) n = 1;
-    if (n > 256) n = 256;   // allow 256 chars per frame before yielding to paint
+    if (n > 64) n = 64;
 
     // Clear any stale exit flag from a previous tick of a different
     // (now-dead) slot.
@@ -1291,6 +1294,7 @@ extern "C" int bochs_cpu_tick(int n) {
         // After return, leave both flags clear so the next iteration
         // (or next tick call) starts clean.
         bx_pc_system.kill_bochs_request = 0;
+        BX_CPU(0)->async_event          = 0;
     }
     return 0;
 }
