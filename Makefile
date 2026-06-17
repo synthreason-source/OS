@@ -16,8 +16,10 @@ CXXFLAGS := -ffreestanding -O2 -Wall -Wextra \
             -include fixes.h                  \
             -include instrument_stub.h
 
-# ── Bochs 2.7 ────────────────────────────────────────────────
-BOCHS_VERSION   := 2.7
+# ── Bochs 2.0.2 ──────────────────────────────────────────────
+# Bochs 2.0.2: simple plain-interpreter cpu_loop, no iCache traces,
+# no handlers chaining. This is what bochs_glue.cpp is written for.
+BOCHS_VERSION   := 2.0.2
 BOCHS_DIR       := bochs-$(BOCHS_VERSION)
 BOCHS_ARCHIVE   := $(BOCHS_DIR).tar.gz
 BOCHS_URL       := https://downloads.sourceforge.net/project/bochs/bochs/$(BOCHS_VERSION)/$(BOCHS_ARCHIVE)
@@ -262,8 +264,7 @@ endif
 # ------------------------------------------------------------
 #  OFFLINE BUNDLE: this tree ships with bochs-2.7/ already
 #  configured and with the four static libs prebuilt
-#  (cpu/libcpu.a, cpu/fpu/libfpu.a, cpu/cpudb/libcpudb.a,
-#  memory/libmemory.a). When those libs are present "make"
+#  (cpu/libcpu.a, cpu/fpu/libfpu.a, memory/libmemory.a). When those libs are present "make"
 #  uses them directly and performs NO download / configure.
 #
 #  If the prebuilt libs are absent, the rule falls back to the
