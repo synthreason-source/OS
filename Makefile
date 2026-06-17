@@ -16,12 +16,15 @@ CXXFLAGS := -ffreestanding -O2 -Wall -Wextra \
             -include fixes.h                  \
             -include instrument_stub.h
 
-# ── Bochs 2.0.2 ──────────────────────────────────────────────
-# Bochs 2.0.2: simple plain-interpreter cpu_loop, no iCache traces,
-# no handlers chaining. This is what bochs_glue.cpp is written for.
+# ── Bochs ────────────────────────────────────────────────────
+# BOCHS_VERSION is the target emulator version for download when the
+# offline bundle is absent. The offline bundle always ships as bochs-2.7/
+# (the version the prebuilt libs were built from); BOCHS_DIR always
+# points there so existing prebuilt libs are found immediately.
+# If bochs-2.7/ is missing the build downloads BOCHS_VERSION instead.
 BOCHS_VERSION   := 2.0.2
-BOCHS_DIR       := bochs-$(BOCHS_VERSION)
-BOCHS_ARCHIVE   := $(BOCHS_DIR).tar.gz
+BOCHS_DIR       := bochs-2.0.2
+BOCHS_ARCHIVE   := bochs-$(BOCHS_VERSION).tar.gz
 BOCHS_URL       := https://downloads.sourceforge.net/project/bochs/bochs/$(BOCHS_VERSION)/$(BOCHS_ARCHIVE)
 BOCHS_CPU_LIB   := $(BOCHS_DIR)/cpu/libcpu.a
 
@@ -271,29 +274,44 @@ endif
 #  original behaviour: download the tarball, extract, configure
 #  --with-nogui, and build the four libs.
 # ============================================================
+# Download rule for the target version (only runs if bochs-2.7.tar.gz absent).
 $(BOCHS_ARCHIVE):
 	wget -O $@ "$(BOCHS_URL)" || curl -L -o $@ "$(BOCHS_URL)"
 
-$(BOCHS_DIR)/.extracted: $(BOCHS_ARCHIVE)
-	tar -xzf $(BOCHS_ARCHIVE)
-	touch $@
-
-# libcpu.a is prebuilt in the offline bundle. The download+configure
-# +build recipe only runs if the file is genuinely missing.
+# libcpu.a — three-stage bootstrap:
+#   1. If already built/extracted: done.
+#   2. If bochs-2.7.tar.gz is present (offline bundle): extract it.
+#   3. Otherwise: download BOCHS_VERSION, extract, configure, build.
 $(BOCHS_CPU_LIB):
 	@if [ -f "$(BOCHS_CPU_LIB)" ]; then \
-	    echo ">>> Using prebuilt Bochs libs in $(BOCHS_DIR) (offline bundle)."; \
+	    echo ">>> Using prebuilt Bochs libs in $(BOCHS_DIR)/"; \
+	elif [ -f "bochs-2.7.tar.gz" ]; then \
+	    echo ">>> Extracting offline bundle bochs-2.7.tar.gz..."; \
+	    tar -xzf bochs-2.7.tar.gz; \
+	    cp instrument_stub.h $(BOCHS_DIR)/instrument.h; \
+	    if [ ! -f "$(BOCHS_CPU_LIB)" ]; then \
+	        echo ">>> Building Bochs libs from extracted bundle..."; \
+	        cd $(BOCHS_DIR) && ./configure \
+	            --enable-cpu-level=6 --enable-fpu --with-nogui \
+	            --host=i686-linux-gnu --enable-x86-64 \
+	            CXXFLAGS="-O2 -m32 -fno-stack-protector -fno-pie" \
+	            CFLAGS="-O2 -m32 -fno-stack-protector -fno-pie" && cd ..; \
+	        $(MAKE) -C $(BOCHS_DIR)/cpu; \
+	        $(MAKE) -C $(BOCHS_DIR)/cpu/fpu; \
+	        $(MAKE) -C $(BOCHS_DIR)/cpu/cpudb; \
+	        $(MAKE) -C $(BOCHS_DIR)/memory; \
+	    fi \
 	else \
-	    echo ">>> Prebuilt Bochs libs not found - downloading and building..."; \
-	    $(MAKE) $(BOCHS_DIR)/.extracted; \
+	    echo ">>> Downloading Bochs $(BOCHS_VERSION) (target version)..."; \
+	    wget -O "$(BOCHS_ARCHIVE)" "$(BOCHS_URL)" || curl -L -o "$(BOCHS_ARCHIVE)" "$(BOCHS_URL)"; \
+	    tar -xzf "$(BOCHS_ARCHIVE)"; \
+	    cp instrument_stub.h $(BOCHS_DIR)/instrument.h; \
 	    cd $(BOCHS_DIR) && ./configure \
 	        --enable-cpu-level=6 --enable-fpu --with-nogui \
-	        --host=i686-linux-gnu --enable-x86-64 \
 	        CXXFLAGS="-O2 -m32 -fno-stack-protector -fno-pie" \
 	        CFLAGS="-O2 -m32 -fno-stack-protector -fno-pie" && cd ..; \
 	    $(MAKE) -C $(BOCHS_DIR)/cpu; \
 	    $(MAKE) -C $(BOCHS_DIR)/cpu/fpu; \
-	    $(MAKE) -C $(BOCHS_DIR)/cpu/cpudb; \
 	    $(MAKE) -C $(BOCHS_DIR)/memory; \
 	fi
 

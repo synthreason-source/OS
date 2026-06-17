@@ -1381,8 +1381,7 @@ extern "C" bool bochs_process_wants_input(int slot) {
 // put_str->put_ch->out_byte call chain caused cpu_loop to return on
 // intermediate function-call traces as well as on the actual out dx,al,
 // consuming iterations without producing output and cutting "HELLO
-// WORLD
-" off at 8 characters.
+// WORLD" off at 8 characters.
 extern "C" int bochs_cpu_tick(int n) {
     if (!g_global_init_done) return 0;
     if (g_active_slot < 0 || g_active_slot >= MAX_BOCHS_SLOTS) return 0;
