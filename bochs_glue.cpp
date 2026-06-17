@@ -563,7 +563,7 @@ static void slot_prime_cpu(SlotState& s) {
 
     cs.activity_state = 0;    // BX_ACTIVITY_STATE_ACTIVE
     cs.async_event    = 0;
-    cs.oszapc_result  = 0;
+    cs.oszapc_result  = 1;   // 1 = all-flags-clear: ZF=SF=CF=OF=0 (result != 0)
     cs.oszapc_auxbits = 0;
     cs.valid          = true;
 
@@ -819,7 +819,7 @@ extern "C" void bochs_set_process_memory(Bit8u* base, Bit32u size,
         if (!peer_live) {
             // No concurrent slots — full hardware reset for a clean slate.
             BX_CPU(0)->reset(BX_RESET_HARDWARE);
-            BX_CPU(0)->oszapc.result          = 0;
+            BX_CPU(0)->oszapc.result          = 1;   // ZF=0 (result!=0 means no-zero-flag)
             BX_CPU(0)->oszapc.auxbits         = 0;
             BX_CPU(0)->async_event            = 0;
             bx_pc_system.kill_bochs_request   = 0;
@@ -847,7 +847,7 @@ extern "C" void bochs_set_process_memory(Bit8u* base, Bit32u size,
     // entry code instead of guest code. slot_restore_cpu copies every
     // architectural register from s.cpu into the live CPU.
     slot_restore_cpu(s);
-    BX_CPU(0)->oszapc.result     = 0;
+    BX_CPU(0)->oszapc.result     = 1;   // all-flags-clear: ZF=SF=CF=OF=0
     BX_CPU(0)->oszapc.auxbits    = 0;
 
     // Flush Bochs caches that might still reference a previous
@@ -1012,7 +1012,7 @@ extern "C" void bochs_reset_all_slots() {
     // Clear sticky yield flags that reset() may have set, the same
     // way bochs_global_init() does after its boot-time reset.
     BX_CPU(0)->reset(BX_RESET_HARDWARE);
-    BX_CPU(0)->oszapc.result  = 0;   // add this
+    BX_CPU(0)->oszapc.result  = 1;   // all-flags-clear: ZF=0 (non-zero result)
     BX_CPU(0)->oszapc.auxbits = 0;   // add this
     BX_CPU(0)->async_event = 0;
     bx_pc_system.kill_bochs_request = 0;
@@ -1363,6 +1363,27 @@ extern "C" bool bochs_process_wants_input(int slot) {
 // insns because port-IO writes (the primary yield trigger) are
 // frequent for a chatty guest.
 
+// bochs_cpu_tick — Bochs 2.0-style single-call tick.
+//
+// Previous design: n-capped loop calling cpu_loop() once per putc.
+// This was unstable because:
+//   1. cpu_loop() returns after EVERY guest port-IO (putc or exit),
+//      so n=64 only guaranteed 64 INSTRUCTIONS-worth of guest progress,
+//      not 64 characters. A multi-function-call putc chain (put_str ->
+//      put_ch -> out_byte -> out dx,al) ate several iterations per char
+//      in some ELF layouts, cutting output at 8 chars before the budget
+//      was exhausted.
+//   2. The per-iteration clear of kill_bochs_request/async_event was
+//      racy: if bochs_guest_exit fired on the LAST iteration, the flags
+//      were cleared after the fact, losing the exit signal.
+//
+// Fix: single cpu_loop() call per tick, capped by wall-instruction
+// count rather than an outer loop. cpu_loop() already handles the
+// internal yield/resume via kill_bochs_request; we just need to let
+// it run until the guest does a clean exit (g_exit_pending) or until
+// we've executed enough instructions that we should yield back to the
+// kernel for a repaint. The instruction budget (n * 256) is large
+// enough that a short program like hello always completes in one tick.
 extern "C" int bochs_cpu_tick(int n) {
     if (!g_global_init_done) return 0;
     if (g_active_slot < 0 || g_active_slot >= MAX_BOCHS_SLOTS) return 0;
@@ -1373,30 +1394,48 @@ extern "C" int bochs_cpu_tick(int n) {
 
     s.wants_input = false;
 
-    if (n > 64) n = 64;
-
-    // Clear any stale exit flag from a previous tick of a different
-    // (now-dead) slot.
+    // Clear any stale exit/yield flags from a previous tick.
     g_exit_pending = 0;
+    bx_pc_system.kill_bochs_request = 0;
+    BX_CPU(0)->async_event          = 0;
 
-    for (int i = 0; i < n; ++i) {
-        if (g_exit_pending) {
-            g_exit_pending = 0;
-            return 0;
-        }
+    // Run guest instructions. cpu_loop() returns when:
+    //   (a) the guest does port-0xE8 exit  -> g_exit_pending=1
+    //   (b) the guest does port-0xE9 putc  -> kill_bochs_request=1
+    //   (c) the guest faults through IDT   -> exit stub fires (a)
+    //
+    // For (b), putc: we loop back and keep running. The guest's
+    // own output loop drives forward progress — we don't need to
+    // count cpu_loop() calls, just let it run until done or until
+    // the instruction budget expires.
+    //
+    // Budget: n * 256 instructions. At n=100 that's 25600 instructions —
+    // enough for any reasonable short ELF (hello needs ~200) while
+    // still yielding promptly for repaint.
+    Bit64u budget = (Bit64u)n * 256;
+    Bit64u start  = BX_CPU(0)->get_icount();
 
-        // Clear yield flags so cpu_loop actually executes
-        // instructions. bochs_guest_putc / bochs_guest_exit will
-        // re-set them when the guest does port IO.
+    while (!g_exit_pending) {
         bx_pc_system.kill_bochs_request = 0;
         BX_CPU(0)->async_event          = 0;
 
         BX_CPU(0)->cpu_loop();
 
-        // After return, leave both flags clear so the next iteration
-        // (or next tick call) starts clean.
         bx_pc_system.kill_bochs_request = 0;
         BX_CPU(0)->async_event          = 0;
+
+        // Check instruction budget.
+        Bit64u elapsed = BX_CPU(0)->get_icount() - start;
+        if (elapsed >= budget) break;
+
+        // If the slot became invalid mid-tick (shouldn't happen,
+        // but belt-and-suspenders), stop.
+        if (!s.mem_base || !s.mapped) break;
+    }
+
+    if (g_exit_pending) {
+        g_exit_pending = 0;
+        return 0;
     }
     return 0;
 }

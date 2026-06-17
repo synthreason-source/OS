@@ -7715,12 +7715,22 @@ public:
             g_test_overlay_owner  = nullptr;
             g_test_overlay_active = false;
         }
-        // Kill the attached ELF process so it disappears from the taskbar
+        // Kill the attached ELF process so it disappears from the taskbar.
+        // Also release the Bochs glue slot and free the slab/stack to avoid
+        // dangling pointers in the memory-handler table and memory leaks.
         if (captured_elf_slot >= 0 && captured_elf_slot < MAX_ELF_PROCESSES) {
             ElfProcess& proc = elf_processes[captured_elf_slot];
             proc.active    = false;
             proc.completed = true;
             proc.terminal  = nullptr;
+            // Unregister the Bochs memory handlers for this slot before
+            // freeing the slab — otherwise the glue holds a dangling
+            // mem_base pointer that any future activate_slot could deref.
+            bochs_release_slot(captured_elf_slot);
+            if (proc.memory_base) { delete[] proc.memory_base; proc.memory_base = nullptr; }
+            if (proc.stack)       { delete[] proc.stack;       proc.stack       = nullptr; }
+            proc.memory_size     = 0;
+            proc.cpu_initialized = false;
         }
         captured_elf_slot = -1;
         is_closed = true;
@@ -8981,16 +8991,24 @@ void tick_elf_processes(int steps) {
     // window is finishing — exactly because every frame's exit on
     // window B triggered a reset that restarted window A from the top.
     if (any_exited_this_frame) {
-   	 bool any_still_active = false;
-	 bool any_output_pending = false;
-	 for (int j = 0; j < MAX_ELF_PROCESSES; ++j) {
-	     if (elf_processes[j].active) { any_still_active = true; break; }
- 	     if (!out_empty(j)) any_output_pending = true;
-	     }
-	     if (!any_still_active && !any_output_pending) {
-	        bochs_reset_all_slots();
-	     }
-	 }
+        // Only wipe the Bochs glue when ALL slots are done AND all
+        // output has been drained. Use two separate loops: the old
+        // single-loop version broke out early on the first active slot,
+        // so any_output_pending was never checked for remaining slots.
+        bool any_still_active   = false;
+        bool any_output_pending = false;
+        for (int j = 0; j < MAX_ELF_PROCESSES; ++j) {
+            if (elf_processes[j].active) { any_still_active = true; break; }
+        }
+        if (!any_still_active) {
+            for (int j = 0; j < MAX_ELF_PROCESSES; ++j) {
+                if (!out_empty(j)) { any_output_pending = true; break; }
+            }
+        }
+        if (!any_still_active && !any_output_pending) {
+            bochs_reset_all_slots();
+        }
+    }
      
 }
 
