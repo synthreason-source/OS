@@ -338,6 +338,12 @@ extern "C" void bochs_register_io_callbacks(
     void (*write_cb)(int, char),
     void (*exit_cb )(int, int));
 extern "C" bool bochs_process_wants_input(int slot);
+
+// ── In-kernel TCC compiler (tcc_kernel.cpp + i386-libtcc-kern.a) ─────────────
+// tcc_kernel_version() == 0 → stub (no TCC), 2 → real in-kernel TCC.
+extern "C" int  tcc_kernel_version(void);
+extern "C" void tcc_kernel_cmd_cc(void* terminal, const char* src_name,
+                                  const char* out_name);
 // Heavy "reset everything" — called between ELF runs so each launch
 // starts from the same state as the first one. See the comment block
 // over its definition in bochs_glue.cpp for the full rationale.
@@ -3477,127 +3483,184 @@ void fat32_format() {
     }
     wm.print_to_focused("WARNING: This is a destructive operation!\nFormatting disk...\n");
 
+    // ─────────────────────────────────────────────────────────────────────
+    // Decide partition layout upfront.
+    //
+    // On a raw disk (g_partition_lba == 0) we will write an MBR and place
+    // the FAT32 partition at PART_START_LBA (2048 = 1 MiB, the standard
+    // alignment used by fdisk/parted/mkfs.fat).  On a pre-partitioned disk
+    // we format in-place at g_partition_lba.
+    //
+    // IMPORTANT: tot_sec32 in the BPB is the sector count OF THE PARTITION,
+    // not the whole disk.  Windows fastfat validates:
+    //   cluster_count = (tot_sec32 - rsvd_sec_cnt - num_fats*fat_sz32)
+    //                   / sec_per_clus
+    // and requires cluster_count >= 65525 for FAT32.  Using the whole-disk
+    // sector count here inflates the number and causes chkdsk to report
+    // "The volume size is too big" or refuse to mount on small images.
+    // ─────────────────────────────────────────────────────────────────────
+    const uint32_t PART_START_LBA = 2048;   // 1 MiB boundary (standard)
+    const bool raw_disk = (g_partition_lba == 0);
+
+    // Effective partition start that will end up in g_partition_lba after format.
+    const uint64_t new_part_lba = raw_disk ? PART_START_LBA : g_partition_lba;
+
+    // Total disk size in sectors (128 MB image).  The partition occupies
+    // disk_total_sectors - new_part_lba sectors.
+    const uint32_t disk_total_sectors = (128u * 1024u * 1024u) / 512u;
+    // Guard: partition must fit within the disk.
+    if (new_part_lba >= disk_total_sectors) {
+        wm.print_to_focused("Error: partition start beyond disk end.\n");
+        return;
+    }
+    const uint32_t part_total_sectors = disk_total_sectors - (uint32_t)new_part_lba;
+
     fat32_bpb_t new_bpb;
     memset(&new_bpb, 0, sizeof(fat32_bpb_t));
     new_bpb.jmp[0] = 0xEB; new_bpb.jmp[1] = 0x58; new_bpb.jmp[2] = 0x90;
-    memcpy(new_bpb.oem, "MSWIN4.1", 8);   // canonical OEM string — what
-                                          // mkfs.vfat and Windows write;
-                                          // some tools key off this exact
-                                          // string when probing.
+    memcpy(new_bpb.oem, "MSWIN4.1", 8);
     new_bpb.bytes_per_sec = 512;
-    new_bpb.rsvd_sec_cnt = 32;
-    new_bpb.num_fats = 2;
-    new_bpb.media = 0xF8;
-    new_bpb.sec_per_trk = 32;
-    new_bpb.num_heads = 64;
+    new_bpb.rsvd_sec_cnt  = 32;
+    new_bpb.num_fats      = 2;
+    new_bpb.root_ent_cnt  = 0;      // must be 0 for FAT32
+    new_bpb.tot_sec16     = 0;      // must be 0 for FAT32 (use tot_sec32)
+    new_bpb.media         = 0xF8;
+    new_bpb.fat_sz16      = 0;      // must be 0 for FAT32 (use fat_sz32)
+    new_bpb.sec_per_trk   = 32;
+    new_bpb.num_heads     = 64;
+    new_bpb.hidd_sec      = (uint32_t)new_part_lba;  // sectors before this partition
+    new_bpb.tot_sec32     = part_total_sectors;        // partition size, NOT disk size
 
-    uint32_t total_sectors = (128 * 1024 * 1024) / 512;
-    new_bpb.tot_sec32 = total_sectors;
-
-    // ─────────────────────────────────────────────────────────────────────
-    // sec_per_clus selection per Microsoft FAT spec ("Determining FAT
-    // Type") plus the FAT32 cluster-count minimum.
-    //
-    // FAT32 is only legitimate when the data-area cluster count is
-    // >= 65525. With sec_per_clus = 8 (4 KB clusters) on a 128 MB volume
-    // we'd get ~32k clusters and the volume falls into the FAT32
-    // exclusion zone — most strict validators (Windows fastfat, dosfstools
-    // > 4.0) reject this as "ambiguous / probably FAT16".
-    //
-    // Pick the smallest sec_per_clus that yields >= 65525 clusters; for a
-    // 128 MB volume that's 1 sector per cluster (≈262k clusters), which
-    // is exactly what mkfs.vfat -F 32 also chooses for this size.
-    // ─────────────────────────────────────────────────────────────────────
+    // ── sec_per_clus: smallest value that yields >= 65525 clusters ────────
     {
         uint8_t spc_candidates[] = { 1, 2, 4, 8, 16, 32, 64, 128 };
-        uint8_t chosen = 1;
+        uint8_t chosen = 128; // safe fallback
         for (uint32_t k = 0; k < sizeof(spc_candidates); k++) {
             uint8_t spc = spc_candidates[k];
-            // Microsoft FAT size formula (FAT spec section 3.5).
-            uint32_t tmp1 = total_sectors - new_bpb.rsvd_sec_cnt;
+            uint32_t tmp1 = part_total_sectors - new_bpb.rsvd_sec_cnt;
             uint32_t tmp2 = (256u * spc + new_bpb.num_fats) / 2u;
             uint32_t fat_sz = (tmp1 + tmp2 - 1u) / tmp2;
-            uint32_t data_sec = total_sectors -
-                                new_bpb.rsvd_sec_cnt -
-                                new_bpb.num_fats * fat_sz;
+            uint32_t data_sec = part_total_sectors
+                                - new_bpb.rsvd_sec_cnt
+                                - new_bpb.num_fats * fat_sz;
             uint32_t clusters = data_sec / spc;
             if (clusters >= 65525u) { chosen = spc; break; }
         }
         new_bpb.sec_per_clus = chosen;
     }
 
+    // ── fat_sz32 from Microsoft FAT spec section 3.5 ─────────────────────
     {
-        uint32_t tmp1 = total_sectors - new_bpb.rsvd_sec_cnt;
+        uint32_t tmp1 = part_total_sectors - new_bpb.rsvd_sec_cnt;
         uint32_t tmp2 = (256u * new_bpb.sec_per_clus + new_bpb.num_fats) / 2u;
         new_bpb.fat_sz32 = (tmp1 + tmp2 - 1u) / tmp2;
     }
-    new_bpb.root_clus = 2;
-    new_bpb.fs_info = 1;        // FSInfo sector lives at partition + 1
-    new_bpb.bk_boot_sec = 6;    // backup boot sector at partition + 6
-    new_bpb.ext_flags = 0;      // 0 = mirror FATs (default, matches write_fat_entry)
-    new_bpb.drv_num = 0x80;
-    new_bpb.boot_sig = 0x29;
-    new_bpb.vol_id = 0x12345678;
-    memcpy(new_bpb.vol_lab, "MYOS VOL   ", 11);
-    memcpy(new_bpb.fil_sys_type, "FAT32   ", 8);
 
-    wm.print_to_focused("Writing new boot sector...\n");
+    new_bpb.root_clus   = 2;
+    new_bpb.fs_info     = 1;        // FSInfo at partition + 1
+    new_bpb.bk_boot_sec = 6;        // backup boot sector at partition + 6
+    new_bpb.ext_flags   = 0;        // mirror FATs
+    new_bpb.fs_ver      = 0x0000;   // FAT32 version 0.0 — required by spec
+    new_bpb.drv_num     = 0x80;
+    new_bpb.res1        = 0;
+    new_bpb.boot_sig    = 0x29;
+    new_bpb.vol_id      = 0x12345678;
+    memcpy(new_bpb.vol_lab,      "MYOS VOL   ", 11);
+    memcpy(new_bpb.fil_sys_type, "FAT32   ",    8);
+
+    // ── Commit globals NOW, before any sector writes that depend on them ──
+    // All write helpers (write_fat_entry, cluster_to_lba, …) use the
+    // module-level fat_start_sector / data_start_sector globals, so they
+    // must be correct before we call them — not after.
+    memcpy(&bpb, &new_bpb, sizeof(fat32_bpb_t));
+    g_partition_lba   = new_part_lba;
+    fat_start_sector  = (uint32_t)(new_part_lba + bpb.rsvd_sec_cnt);
+    data_start_sector = fat_start_sector + (bpb.num_fats * bpb.fat_sz32);
+
+    // ── Write MBR (raw disk only) ─────────────────────────────────────────
+    if (raw_disk) {
+        wm.print_to_focused("Writing MBR and partition table...\n");
+        char* mbr = new char[SECTOR_SIZE];
+        memset(mbr, 0, SECTOR_SIZE);
+
+        // Minimal x86 bootstrap stub (prints "No bootable OS", halts).
+        static const uint8_t boot_stub[] = {
+            0xFA,                         // CLI
+            0x31, 0xC0,                   // XOR AX, AX
+            0x8E, 0xD0,                   // MOV SS, AX
+            0xBC, 0x00, 0x7C,             // MOV SP, 0x7C00
+            0xFB,                         // STI
+            0x0E,                         // PUSH CS
+            0x1F,                         // POP DS
+            0xBE, 0x1E, 0x7C,             // MOV SI, msg_offset
+            0xAC,                         // LODSB
+            0x08, 0xC0,                   // OR AL, AL
+            0x74, 0x09,                   // JZ halt
+            0xB4, 0x0E,                   // MOV AH, 0x0E
+            0xBB, 0x07, 0x00,             // MOV BX, 7
+            0xCD, 0x10,                   // INT 0x10
+            0xEB, 0xF2,                   // JMP loop
+            0xF4,                         // HLT
+            0xEB, 0xFD,                   // JMP halt
+            'N','o',' ','b','o','o','t','a','b','l','e',' ','O','S','\r','\n', 0x00
+        };
+        memcpy(mbr, boot_stub, sizeof(boot_stub));
+
+        // Partition table entry 0: type 0x0C (FAT32 LBA), bootable.
+        // CHS values set to 0xFE/0xFF/0xFF (LBA-mode placeholder, per
+        // the convention used by Windows Disk Management and fdisk).
+        uint8_t* pt = (uint8_t*)mbr + 446;
+        pt[0] = 0x80;                                // bootable
+        pt[1] = 0xFE; pt[2] = 0xFF; pt[3] = 0xFF;  // CHS start placeholder
+        pt[4] = 0x0C;                                // type: FAT32 LBA
+        pt[5] = 0xFE; pt[6] = 0xFF; pt[7] = 0xFF;  // CHS end placeholder
+        *(uint32_t*)(pt +  8) = PART_START_LBA;
+        *(uint32_t*)(pt + 12) = part_total_sectors;
+        // Entries 1–3: zeroed (unused).
+
+        mbr[510] = (char)0x55;
+        mbr[511] = (char)0xAA;
+
+        bool was = g_fs_encryption_enabled;
+        g_fs_encryption_enabled = false;
+        if (read_write_sectors(g_ahci_port, 0, 1, true, mbr) != 0)
+            wm.print_to_focused("Warning: MBR write failed.\n");
+        else
+            wm.print_to_focused("MBR + partition table written.\n");
+        g_fs_encryption_enabled = was;
+        delete[] mbr;
+    }
+
+    // ── Write VBR (Volume Boot Record = BPB sector) at new_part_lba ──────
+    wm.print_to_focused("Writing volume boot record...\n");
     char* boot_sector_buffer = new char[SECTOR_SIZE];
     memset(boot_sector_buffer, 0, SECTOR_SIZE);
     memcpy(boot_sector_buffer, &new_bpb, sizeof(fat32_bpb_t));
-    // Boot-sector signature required by the FAT spec: last two bytes of
-    // sector 0 MUST be 0x55 0xAA. Without it Windows refuses to mount
-    // ("drive needs to be formatted") and Linux returns -EINVAL from
-    // mount(2). The old code wrote 0x55/0xAA then immediately overwrote
-    // both with zero in the next two statements.
     boot_sector_buffer[510] = (char)0x55;
     boot_sector_buffer[511] = (char)0xAA;
 
-    // Where do we write the BPB? On a raw image (g_partition_lba==0)
-    // it's sector 0. On a partitioned disk it's the partition's first
-    // sector; writing to sector 0 there would destroy the MBR/GPT and
-    // brick every other OS on the box.
-    uint64_t bpb_lba = g_partition_lba;
-
-    // ── Plaintext window: BPB / FSInfo / backup BPB are spec-defined
-    //    structures every other OS reads with byte-exact validators, so
-    //    they MUST go to disk un-encrypted regardless of FS-encryption.
     bool boot_sec_was_enc = g_fs_encryption_enabled;
-    g_fs_encryption_enabled = false;
+    g_fs_encryption_enabled = false;   // BPB/FSInfo must be plaintext
 
-    if (read_write_sectors(g_ahci_port, bpb_lba, 1, true, boot_sector_buffer) != 0) {
-        wm.print_to_focused("Error: Failed to write new boot sector.\n");
+    if (read_write_sectors(g_ahci_port, new_part_lba, 1, true, boot_sector_buffer) != 0) {
+        wm.print_to_focused("Error: Failed to write volume boot record.\n");
         delete[] boot_sector_buffer;
         g_fs_encryption_enabled = boot_sec_was_enc;
         return;
     }
-
-    // ─────────────────────────────────────────────────────────────────────
-    // Backup boot sector at bk_boot_sec (=6). Required by the FAT spec.
-    // Linux dosfsck -a will detect a mismatched/missing backup and
-    // "repair" the primary from the backup; if the backup is absent
-    // (= sector full of zeros) it can corrupt the live boot sector.
-    // ─────────────────────────────────────────────────────────────────────
+    // Backup VBR at partition + bk_boot_sec (=6).
     wm.print_to_focused("Writing backup boot sector...\n");
-    if (read_write_sectors(g_ahci_port, bpb_lba + new_bpb.bk_boot_sec, 1,
+    if (read_write_sectors(g_ahci_port, new_part_lba + new_bpb.bk_boot_sec, 1,
                            true, boot_sector_buffer) != 0)
-    {
         wm.print_to_focused("Warning: backup boot sector write failed.\n");
-    }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // FSInfo sector at bpb_lba + fs_info (=1). Spec layout (sector
-    // pretty-much entirely zero except four fixed signatures and two
-    // values):
-    //   offset   0   uint32   LeadSig   = 0x41615252  ("RRaA")
-    //   offset 484   uint32   StrucSig  = 0x61417272  ("rrAa")
-    //   offset 488   uint32   FreeCount = 0xFFFFFFFF  (unknown → recompute)
-    //   offset 492   uint32   NextFree  = 0xFFFFFFFF  (unknown → search)
-    //   offset 508   uint32   TrailSig  = 0xAA550000
-    // Setting FreeCount/NextFree to 0xFFFFFFFF is the spec-blessed
-    // "values not maintained" sentinel, so Windows / Linux will recompute
-    // on first mount and we never have to keep them in sync during write.
-    // ─────────────────────────────────────────────────────────────────────
+    // ── Write FSInfo sector at partition + fs_info (=1) ───────────────────
+    // Signatures per FAT32 spec Table 9:
+    //   offset   0  LeadSig  = 0x41615252  ("RRaA")
+    //   offset 484  StrucSig = 0x61417272  ("rrAa")
+    //   offset 488  FreeCount= 0xFFFFFFFF  (unknown — recompute on first mount)
+    //   offset 492  NextFree = 0xFFFFFFFF  (unknown — search from cluster 2)
+    //   offset 508  TrailSig = 0xAA550000
     wm.print_to_focused("Writing FSInfo sector...\n");
     memset(boot_sector_buffer, 0, SECTOR_SIZE);
     *(uint32_t*)(boot_sector_buffer +   0) = 0x41615252u;
@@ -3605,45 +3668,78 @@ void fat32_format() {
     *(uint32_t*)(boot_sector_buffer + 488) = 0xFFFFFFFFu;
     *(uint32_t*)(boot_sector_buffer + 492) = 0xFFFFFFFFu;
     *(uint32_t*)(boot_sector_buffer + 508) = 0xAA550000u;
-    if (read_write_sectors(g_ahci_port, bpb_lba + new_bpb.fs_info, 1,
+    if (read_write_sectors(g_ahci_port, new_part_lba + new_bpb.fs_info, 1,
                            true, boot_sector_buffer) != 0)
-    {
         wm.print_to_focused("Warning: FSInfo sector write failed.\n");
-    }
-
-    // Most distributions also keep a backup FSInfo at bk_boot_sec + 1.
-    if (read_write_sectors(g_ahci_port, bpb_lba + new_bpb.bk_boot_sec + 1, 1,
-                           true, boot_sector_buffer) != 0)
-    {
-        // Non-fatal — backup FSInfo is recommended but not required.
-    }
+    // Backup FSInfo at bk_boot_sec + 1 (recommended by spec, not required).
+    read_write_sectors(g_ahci_port, new_part_lba + new_bpb.bk_boot_sec + 1, 1,
+                       true, boot_sector_buffer);
 
     delete[] boot_sector_buffer;
     g_fs_encryption_enabled = boot_sec_was_enc;
 
-    memcpy(&bpb, &new_bpb, sizeof(fat32_bpb_t));
-    fat_start_sector  = (uint32_t)(bpb_lba + bpb.rsvd_sec_cnt);
-    data_start_sector = fat_start_sector + (bpb.num_fats * bpb.fat_sz32);
-    g_partition_lba = bpb_lba;
-
+    // ── Clear FAT1 + FAT2 ─────────────────────────────────────────────────
+    // fat_start_sector already reflects the correct absolute LBA.
     uint8_t* zero_sector = new uint8_t[SECTOR_SIZE];
     memset(zero_sector, 0, SECTOR_SIZE);
     wm.print_to_focused("Clearing FATs...\n");
     for (uint32_t i = 0; i < bpb.fat_sz32; ++i) {
-        read_write_sectors(g_ahci_port, fat_start_sector + i, 1, true, zero_sector); // FAT1
-        read_write_sectors(g_ahci_port, fat_start_sector + bpb.fat_sz32 + i, 1, true, zero_sector); // FAT2
+        read_write_sectors(g_ahci_port, fat_start_sector + i, 1, true, zero_sector);                    // FAT1
+        read_write_sectors(g_ahci_port, fat_start_sector + bpb.fat_sz32 + i, 1, true, zero_sector);    // FAT2
     }
 
+    // ── Clear root directory cluster ───────────────────────────────────────
     wm.print_to_focused("Clearing root directory...\n");
     for (uint8_t i = 0; i < bpb.sec_per_clus; ++i) {
         read_write_sectors(g_ahci_port, cluster_to_lba(bpb.root_clus) + i, 1, true, zero_sector);
     }
     delete[] zero_sector;
 
+    // ── Write initial FAT entries ──────────────────────────────────────────
+    // Cluster 0: media-type byte (0x0FFFFF_F8 for fixed disk, mirroring BPB_Media).
+    // Cluster 1: end-of-chain / dirty-flag word (0x0FFFFFFF = clean).
+    // Cluster 2: root directory — single cluster, end of chain.
     wm.print_to_focused("Writing initial FAT entries...\n");
     write_fat_entry(0, 0x0FFFFFF8); // Media descriptor
-    write_fat_entry(1, 0x0FFFFFFF); // Reserved, EOC
-    write_fat_entry(bpb.root_clus, 0x0FFFFFFF); // Root directory cluster EOC
+    write_fat_entry(1, 0x0FFFFFFF); // Clean/EOC
+    write_fat_entry(bpb.root_clus, 0x0FFFFFFF); // Root directory EOC
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Volume label directory entry in the root cluster.
+    //
+    // The FAT32 spec (section 6) requires that the first entry in the root
+    // directory is a volume-label entry (ATTR_VOLUME_ID = 0x08) whose
+    // DIR_Name field matches BPB_VolLab. Without it Windows Explorer shows
+    // "Local Disk" instead of the volume name, and chkdsk reports a missing
+    // volume label as a warning.
+    //
+    // The entry is written AFTER the initial FAT entries so that
+    // cluster_to_lba(bpb.root_clus) is already valid and fat_start_sector
+    // / data_start_sector have been updated for the MBR-partition case.
+    // ─────────────────────────────────────────────────────────────────────
+    {
+        uint8_t* root_sector = new uint8_t[SECTOR_SIZE];
+        memset(root_sector, 0, SECTOR_SIZE);
+        fat_dir_entry_t* vol_entry = (fat_dir_entry_t*)root_sector;
+        memcpy(vol_entry->name, new_bpb.vol_lab, 11); // "MYOS VOL   "
+        vol_entry->attr = ATTR_VOLUME_ID;
+        // crt_time / crt_date — use a fixed timestamp (2024-01-01 00:00:00).
+        // FAT date: bits 15-9 = year-1980, bits 8-5 = month, bits 4-0 = day.
+        // FAT time: bits 15-11 = hour, bits 10-5 = minute, bits 4-0 = sec/2.
+        vol_entry->crt_date = (uint16_t)((44 << 9) | (1 << 5) | 1); // 2024-01-01
+        vol_entry->wrt_date = vol_entry->crt_date;
+        vol_entry->lst_acc_date = vol_entry->crt_date;
+        vol_entry->fst_clus_hi = 0;
+        vol_entry->fst_clus_lo = 0;
+        vol_entry->file_size   = 0;
+        // Write to the first sector of the root cluster (already zeroed
+        // above, but we only wrote zeros — the volume entry goes here now).
+        bool vl_ok = (read_write_sectors(
+            g_ahci_port, cluster_to_lba(bpb.root_clus), 1, true, root_sector) == 0);
+        if (!vl_ok) wm.print_to_focused("Warning: volume label dir entry write failed.\n");
+        delete[] root_sector;
+        wm.print_to_focused("Volume label directory entry written.\n");
+    }
 
     wm.print_to_focused("Format complete. Re-initializing filesystem...\n");
     if (fat32_init()) {
@@ -3651,13 +3747,13 @@ void fat32_format() {
     } else {
         wm.print_to_focused("FAT32 FS re-initialization failed.\n");
         // Diagnostic: read the BPB sector back as plaintext and report what
-        // is actually on disk. On a partitioned bare-metal disk this is
-        // bpb_lba (the partition's first sector), not sector 0 (the MBR).
+        // is actually on disk. g_partition_lba is the partition's first
+        // sector (sector 0 holds the MBR on a raw disk, not the BPB).
         char* vb = new char[SECTOR_SIZE];
         if (vb) {
             bool was = g_fs_encryption_enabled;
             g_fs_encryption_enabled = false;
-            int rr = read_write_sectors(g_ahci_port, bpb_lba, 1, false, vb);
+            int rr = read_write_sectors(g_ahci_port, g_partition_lba, 1, false, vb);
             g_fs_encryption_enabled = was;
             if (rr != 0) {
                 wm.print_to_focused("  diag: boot-sector read-back FAILED.\n");
@@ -6830,6 +6926,7 @@ void handle_command() {
 					  "  setpass, removepass, unlock, busybox, pself, killelf,\n"
 					  "  killexec, killrun, aesenc, aesdec, test,\n"
 					  "  bochs <elf-file> [args]  -- run ELF in Bochs emulator window\n"
+					  "  cc <file.c> [out]        -- compile C in-kernel via TCC\n"
 					  "  hello                   -- shortcut: bochs hello\n"
 					  "  reset                   -- shortcut: bochs reset\n"
 					  "  matrix help             -- NumPy-style arrays + blocked GEMM\n"
@@ -6931,7 +7028,74 @@ void handle_command() {
 	// ELF-launch / "command not found" branch at the end.
 	else if (strcmp(command, "compile") == 0) {
         cmd_compile(ahci_base, selected_port, get_arg(args, 0));
-    } 
+    }
+    // ── cc / tcc — C compiler frontend ───────────────────────────────────
+    // cc <source.c> [output]
+    //
+    // Compilation runs on the HOST via the tcc_glue tool (`make cc`).
+    // Inside the kernel this command explains the workflow and, as a
+    // convenience, immediately tries to run the ELF if it already exists
+    // on the FAT32 disk from a previous host-side `make cc` invocation.
+    //
+    // Workflow:
+    //   1. On the host (before or after booting):
+    //        make cc SRC=foo.c          # compiles foo.c → foo on disk.img
+    //   2. In this terminal:
+    //        cc foo.c                   # (explains the above)
+    //        foo                        # runs the compiled ELF via Bochs
+    //
+    // The reason compilation lives on the host is identical to the reason
+    // bochs_glue.so lives there: TCC itself is not a freestanding library
+    // and needs malloc, file I/O, and a POSIX environment.
+    else if (strcmp(command, "cc")  == 0 ||
+             strcmp(command, "tcc") == 0) {
+        char* src_arg = get_arg(args, 0);
+        char* out_arg = get_arg(args, 1);
+
+        if (!src_arg) {
+            console_print("Usage: cc <source.c> [output]\n");
+            if (tcc_kernel_version() >= 2) {
+                console_print("  Compiles C source from disk to a 32-bit ELF and runs it.\n");
+                console_print("  Source must already be on the FAT32 disk (copy via mtools\n");
+                console_print("  or write it with the built-in editor if available).\n");
+            } else {
+                console_print("  In-kernel TCC not linked. Use on the host:\n");
+                console_print("      make cc SRC=<file.c>\n");
+                console_print("  to compile and inject the ELF into disk.img.\n");
+            }
+        } else {
+            if (tcc_kernel_version() >= 2) {
+                // Real in-kernel compilation via libtcc.
+                tcc_kernel_cmd_cc(this, src_arg, out_arg);
+            } else {
+                // Stub path: explain host workflow, auto-run if ELF exists.
+                char out_name[64];
+                if (out_arg) {
+                    strncpy(out_name, out_arg, sizeof(out_name) - 1);
+                    out_name[sizeof(out_name) - 1] = '\0';
+                } else {
+                    strncpy(out_name, src_arg, sizeof(out_name) - 1);
+                    out_name[sizeof(out_name) - 1] = '\0';
+                    for (int _i = (int)strlen(out_name)-1; _i >= 0; _i--)
+                        if (out_name[_i] == '.') { out_name[_i] = '\0'; break; }
+                }
+                fat_dir_entry_t _elf_entry;
+                uint32_t _elf_sec = 0, _elf_off = 0;
+                bool _elf_exists =
+                    (fat32_find_entry(out_name, &_elf_entry, &_elf_sec, &_elf_off) == 0);
+
+                console_print("cc: in-kernel TCC not available. On the host run:\n");
+                console_print("        make cc SRC="); console_print(src_arg);
+                if (out_arg) { console_print(" OUT="); console_print(out_arg); }
+                console_print("\n");
+                if (_elf_exists) {
+                    console_print("ELF '"); console_print(out_name);
+                    console_print("' already on disk. Running now...\n");
+                    load_and_execute_elf(out_name, nullptr, this);
+                }
+            }
+        }
+    }
 	 else if (strcmp(command, "pself") == 0) {
 			// List ELF processes
 			list_elf_processes(this);
@@ -7534,6 +7698,12 @@ int load_and_execute_elf(const char* filename, const char* args, TerminalWindow*
 
 
 public:
+    // Public wrapper so tcc_kernel.cpp's bridge can launch an ELF without
+    // needing access to the private load_and_execute_elf directly.
+    int exec_elf(const char* filename, const char* args) {
+        return load_and_execute_elf(filename, args, this);
+    }
+
     // is_emulator_window=true marks this terminal as a window that was
     // spawned specifically to host a Bochs-emulated ELF. Used by
     // handle_command()'s fall-through branch to decide whether to run an
@@ -8649,12 +8819,21 @@ static bool x86_tick(int slot, int steps) {
         // Re-register the slab (the glue unregisters any previous mapping
         // for the slot first, so this is idempotent). Then hardware-reset
         // the CPU, enter protected mode, and point it at the guest entry.
+        //
+        // ORDER MATTERS: bochs_cpu_init() must come first so the global
+        // Bochs subsystem (BX_MEM, BX_CPU, pc_system) is fully initialised
+        // before bochs_set_process_memory tries to register memory handlers
+        // and call slot_prime_cpu. If set_process_memory runs first it
+        // calls bochs_global_init() internally, but the explicit call here
+        // makes the dependency explicit and avoids the fragile case where
+        // the first sub-call inside set_process_memory triggers global init
+        // mid-function.
         x86_breadcrumb(0, 'L');
+        bochs_cpu_init();
+        x86_breadcrumb(2, 'I');
         bochs_set_process_memory(proc.memory_base, proc.memory_size,
                                  proc.vaddr_base);
         x86_breadcrumb(1, 'M');
-        bochs_cpu_init();
-        x86_breadcrumb(2, 'I');
         bochs_cpu_set_esp(proc.esp);
         x86_breadcrumb(3, 'S');
         bochs_cpu_set_eip(proc.entry_point);
@@ -8710,6 +8889,14 @@ static bool x86_tick(int slot, int steps) {
 
     return true;
 }
+// Persistent flag: set when the last Bochs slot exits, cleared once the
+// output ring buffers have fully drained and bochs_reset_all_slots() fires.
+// Survives across tick_elf_processes frames so the reset isn't lost when
+// output is still pending on the exit frame (any_exited_this_frame is only
+// true on the ONE frame the exit is detected, not on the drain frames that
+// follow it).
+static bool g_bochs_reset_needed = false;
+
 // And definition without default:
 void tick_elf_processes(int steps) {
     bool any_exited_this_frame = false;
@@ -8829,29 +9016,47 @@ void tick_elf_processes(int steps) {
     }
 
     // ── Deferred glue-wide reset ────────────────────────────────────
-    // If any process exited this frame AND no other Bochs-emulated
-    // process is still running, wipe Bochs's glue state back to its
-    // post-boot baseline. The next launch will then start from the
-    // same state as launch #1.
+    // After all slots have exited, wipe Bochs's glue state back to its
+    // post-boot baseline.
+    //
+    // This is now a SAFETY NET rather than the primary correctness
+    // mechanism. The real guarantee of identical start state comes from
+    // bochs_set_process_memory, which does a full BX_RESET_HARDWARE
+    // before priming each slot (when no peer slots are live). This
+    // deferred reset handles two remaining cases:
+    //
+    //   1. Concurrent slots: when two slots run together, the pre-load
+    //      reset in bochs_set_process_memory is skipped to avoid
+    //      clobbering the peer. Once both exit, this reset cleans up
+    //      any residual glue state so the next solo launch starts clean.
+    //
+    //   2. Belt-and-braces: ensures g_active_slot is reset to -1 and
+    //      all slot mappings are unregistered even if bochs_release_slot
+    //      was somehow missed.
     //
     // CRITICAL: do NOT reset while another slot is still running.
-    // bochs_reset_all_slots() unmaps every slab and hardware-resets
-    // BX_CPU(0); doing that to a live slot drops its EIP/CRs/segments
-    // back to the post-reset state. On the very next frame, x86_tick
-    // would re-enter the lazy-init path and bochs_cpu_set_eip would
-    // restart the guest from _start. The visible symptom is a runaway
-    // window spamming "HELLO WOHELLO WO..." for as long as another
-    // window is finishing — exactly because every frame's exit on
-    // window B triggered a reset that restarted window A from the top.
     if (any_exited_this_frame) {
         bool any_still_active = false;
-        for (int j = 0; j < MAX_ELF_PROCESSES; ++j) {
+        for (int j = 0; j < MAX_ELF_PROCESSES; ++j)
             if (elf_processes[j].active) { any_still_active = true; break; }
-        }
-        if (!any_still_active) {
+        if (!any_still_active)
+            g_bochs_reset_needed = true;
+    }
+    if (g_bochs_reset_needed) {
+        // Wait until the output ring buffers are fully drained so the
+        // terminal displays the last line of output before the reset
+        // clears the glue state. (The reset does not affect kernel-side
+        // ring buffers — it only touches Bochs internals — but draining
+        // first keeps the visual ordering correct.)
+        bool any_output = false;
+        for (int j = 0; j < MAX_ELF_PROCESSES; ++j)
+            if (!out_empty(j)) { any_output = true; break; }
+        if (!any_output) {
             bochs_reset_all_slots();
+            g_bochs_reset_needed = false;
         }
     }
+
 }
 
 extern "C" void cmd_exec(const char* code_text) {
@@ -9318,6 +9523,26 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
             wm.print_to_focused("BusyBox: ramdisk empty or write failed.\n");
         if (extract_hello_to_filesystem())
             wm.print_to_focused("hello: saved to FAT32.\n");
+
+        // Write the TCC guest ABI header so user programs can #include "tcc.h"
+        // to get outb / kprint / kexit without redefining them.
+        {
+            fat_dir_entry_t tcc_hdr_entry;
+            uint32_t th_sec = 0, th_off = 0;
+            if (fat32_find_entry("tcc.h", &tcc_hdr_entry, &th_sec, &th_off) != 0) {
+                static const char tcc_h[] =
+                    "/* tcc.h — guest ABI for in-kernel TCC programs */\n"
+                    "#ifndef TCC_H\n#define TCC_H\n"
+                    "static inline void outb(unsigned short p, unsigned char v) {\n"
+                    "    __asm__ volatile(\"outb %0,%1\"::\"a\"(v),\"Nd\"(p)); }\n"
+                    "static inline void kprint(const char* s) {\n"
+                    "    while (*s) outb(0xE9, *s++); }\n"
+                    "static inline void kexit(int c) {\n"
+                    "    outb(0xE8, (unsigned char)c); }\n"
+                    "#endif\n";
+                fat32_write_file("tcc.h", tcc_h, (uint32_t)(sizeof(tcc_h) - 1));
+            }
+        }
     } else {
         wm.print_to_focused("FAT32: not initialised.\n");
     }
@@ -9446,3 +9671,53 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
         }
     }
 }
+// =============================================================================
+// extern "C" bridges for tcc_kernel.cpp
+// =============================================================================
+// tcc_kernel.cpp is compiled as freestanding C++ and cannot include the full
+// kernel headers. These thin wrappers expose the symbols it needs with plain
+// C linkage so the linker resolves them without name-mangling.
+extern "C" int tcc_kernel_version(void) {2;} // 2 = real in-kernel TCC
+
+// ── tcc_kernel_cmd_cc ─────────────────────────────────────────────────────────
+extern "C" void tcc_kernel_cmd_cc(void*,
+                                  const char*,
+                                  const char*);
+
+
+extern "C" {
+
+void tcc_bridge_console_print(const char* s) {
+    console_print(s);
+}
+static inline bool is_cc_safe_char(unsigned char c) {
+    return c == '\n' || c == '\r' || c == '\t' || (c >= 32 && c != 127);
+}
+
+char* tcc_bridge_fat32_read(const char* filename) {
+    char *data = fat32_read_file_as_string(filename);
+
+    if (!data) {
+        return NULL;
+    }
+
+    for (char *p = data; *p; ++p) {
+        if (!is_cc_safe_char((unsigned char)*p)) {
+            
+            return NULL;
+        }
+    }
+
+    return data;
+}
+
+int tcc_bridge_fat32_write(const char* filename, const void* data, unsigned int size) {
+    return fat32_write_file(filename, data, (uint32_t)size);
+}
+
+int tcc_bridge_exec_elf(void* terminal, const char* filename, const char* args) {
+    TerminalWindow* tw = (TerminalWindow*)terminal;
+    return tw->exec_elf(filename, args);
+}
+
+} // extern "C"
