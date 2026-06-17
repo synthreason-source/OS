@@ -436,7 +436,7 @@ $(TCC_KERN_LIB): $(TCC_I386)
 	    -DTCC_IS_NATIVE=0 \
 	    -I. -O2 -w -fno-stack-protector -U_FORTIFY_SOURCE -fno-builtin \
 	    -o i386-libtcc-kern.o
-	ar rcs "$(CURDIR)/$(TCC_KERN_LIB)" $(TCC_SRC_DIR)/i386-libtcc-kern.o
+	ar rcs $(CURDIR)/$(TCC_KERN_LIB) $(TCC_SRC_DIR)/i386-libtcc-kern.o
 	@echo ">>> $(TCC_KERN_LIB) ready."
 
 # tcc_kernel.o — real in-kernel TCC glue (replaces tcc_stub.o).

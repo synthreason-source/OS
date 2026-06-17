@@ -112,6 +112,17 @@ struct SavedCpuState {
     Bit32u  activity_state;
     Bit32u  async_event;
 
+    // Lazy-EFLAGS shadow. Bochs evaluates OF/SF/ZF/AF/PF/CF lazily
+    // from this struct; setEFlagsOSZAPC only writes the decoded bits
+    // back into cpu->eflags, it does NOT restore result/auxbits. Without
+    // saving these, a slot switch leaves the shadow holding the OTHER
+    // slot's last arithmetic operation — causing conditional jumps
+    // (test/jne in put_str's null-terminator loop) to read the wrong ZF
+    // and mis-terminate, producing "HELLO WO" (8 chars) instead of the
+    // full "HELLO WORLD\n".
+    Bit32u  oszapc_result;
+    Bit32u  oszapc_auxbits;
+
     bool    valid;        // true once we've saved this slot at least once
 };
 
@@ -423,6 +434,17 @@ static void slot_save_cpu(SlotState& s) {
     cs.activity_state = cpu->activity_state;
     cs.async_event    = cpu->async_event;
 
+    // Save the raw lazy-EFLAGS shadow. read_eflags() above forced the
+    // decoded bits into cs.eflags, but the shadow struct itself must
+    // also be snapshotted so slot_restore_cpu can put it back exactly —
+    // setEFlagsOSZAPC re-decodes the bits, but that round-trip is lossy
+    // for operations whose oszapc encoding is not uniquely invertible
+    // from the six flag bits alone (e.g. different ADD results can
+    // produce the same OSZAPC pattern). Restoring result/auxbits
+    // directly preserves the exact lazy encoding the guest left behind.
+    cs.oszapc_result  = cpu->oszapc.result;
+    cs.oszapc_auxbits = cpu->oszapc.auxbits;
+
     cs.valid = true;
 }
 
@@ -462,6 +484,15 @@ static void slot_restore_cpu(SlotState& s) {
     // minimal correct sequence.
     cpu->eflags   = cs.eflags;
     cpu->setEFlagsOSZAPC(cs.eflags);
+    // Restore the raw lazy shadow AFTER setEFlagsOSZAPC. The call above
+    // writes decoded flag bits into oszapc using SET_FLAGS_OSZAPC_LOGIC_32,
+    // which is correct for the OSZAPC flag values but does NOT reproduce
+    // the exact result/auxbits the guest's last arithmetic instruction
+    // left there. Overwrite now with the snapshotted values so the next
+    // conditional jump sees this slot's own lazy state, not a re-encoded
+    // approximation of it.
+    cpu->oszapc.result  = cs.oszapc_result;
+    cpu->oszapc.auxbits = cs.oszapc_auxbits;
 
     for (int i = 0; i < 6; ++i) cpu->sregs[i] = cs.sregs[i];
 
@@ -532,6 +563,8 @@ static void slot_prime_cpu(SlotState& s) {
 
     cs.activity_state = 0;    // BX_ACTIVITY_STATE_ACTIVE
     cs.async_event    = 0;
+    cs.oszapc_result  = 0;
+    cs.oszapc_auxbits = 0;
     cs.valid          = true;
 
     s.cpu_primed = true;
@@ -730,6 +763,75 @@ extern "C" void bochs_set_process_memory(Bit8u* base, Bit32u size,
 
     if (!base || !size) return;
 
+    // ── Guarantee identical start state for every ELF load ───────────────
+    //
+    // Every ELF launch MUST begin from a byte-identical BX_CPU state so
+    // that run N is indistinguishable from run 1. The fields saved and
+    // restored by slot_save_cpu / slot_restore_cpu cover the architectural
+    // register set (GPRs, EIP, EFLAGS, sregs, CRs, GDTR/IDTR), but
+    // BX_CPU carries many additional fields that persist across cpu_loop
+    // entries and are NOT covered by the save/restore:
+    //
+    //   • FPU / SSE / AVX / MMX register file and MXCSR
+    //   • MSRs (IA32_EFER, SYSENTER_*, PAT, APIC_BASE, …)
+    //   • Debug registers DR0–DR6, DR7
+    //   • Hidden segment descriptor cache fields (base, limit, access
+    //     rights) beyond the selector — written by segment-register
+    //     loads in guest code and cached inside the CPU struct
+    //   • pending_event / event_mask / EXT / inhibit_mask / inhibit_icount
+    //     / last_exception_type / debug_trap — exception delivery state
+    //   • TR and LDTR (not in sregs[6])
+    //   • bx_pc_system timer/tick counters — currCountdown / ticksTotal /
+    //     lastTimeUsec — which influence how many instructions cpu_loop
+    //     runs per call and when it yields
+    //
+    // Any of these surviving from a previous run can cause silent
+    // divergence: a conditional branch takes a different path, an
+    // exception is delivered or suppressed, cpu_loop yields earlier or
+    // later, etc.
+    //
+    // The fix: BX_RESET_HARDWARE before every slot prime. This wipes
+    // every field in BX_CPU back to its architectural post-reset value
+    // (the same state bochs_global_init left it in after the very first
+    // boot-time reset). slot_prime_cpu + slot_restore_cpu then layer the
+    // flat-32 protected-mode configuration on top, identically to the
+    // first launch. Combined with the bx_pc_system re-init below, the
+    // Bochs subsystem is in exactly the same state at the start of run N
+    // as it was at the start of run 1.
+    //
+    // Guard: skip the CPU reset if any OTHER slot is currently live
+    // (mapped and has a valid CPU snapshot). Resetting BX_CPU while a
+    // peer is mid-execution would destroy its EIP/CRs/segments —
+    // on the very next tick the peer's x86_tick would re-run lazy init
+    // and restart the guest from _start. For the concurrent case the
+    // reset-between-live-slots path in bochs_activate_slot already scrubs
+    // the untracked fields on every slot switch, so per-slot isolation is
+    // maintained without a full CPU reset here.
+    {
+        bool peer_live = false;
+        for (int i = 0; i < MAX_BOCHS_SLOTS; ++i) {
+            if (i == g_active_slot) continue;
+            if (g_slots[i].mapped && g_slots[i].cpu.valid) {
+                peer_live = true;
+                break;
+            }
+        }
+        if (!peer_live) {
+            // No concurrent slots — full hardware reset for a clean slate.
+            BX_CPU(0)->reset(BX_RESET_HARDWARE);
+            BX_CPU(0)->oszapc.result          = 0;
+            BX_CPU(0)->oszapc.auxbits         = 0;
+            BX_CPU(0)->async_event            = 0;
+            bx_pc_system.kill_bochs_request   = 0;
+            g_exit_pending                    = 0;
+            // Re-zero pc_system counters so cpu_loop yields at the same
+            // instruction count as it did on the first launch.
+            bx_pc_system.initialize(50000000u);
+            bx_pc_system.set_enable_a20(true);
+            flushICaches();
+        }
+    }
+
     // Register handlers for this slot's range.
     mapping_register(s);
 
@@ -745,6 +847,8 @@ extern "C" void bochs_set_process_memory(Bit8u* base, Bit32u size,
     // entry code instead of guest code. slot_restore_cpu copies every
     // architectural register from s.cpu into the live CPU.
     slot_restore_cpu(s);
+    BX_CPU(0)->oszapc.result     = 0;
+    BX_CPU(0)->oszapc.auxbits    = 0;
 
     // Flush Bochs caches that might still reference a previous
     // mapping for this slot.
@@ -908,7 +1012,9 @@ extern "C" void bochs_reset_all_slots() {
     // Clear sticky yield flags that reset() may have set, the same
     // way bochs_global_init() does after its boot-time reset.
     BX_CPU(0)->reset(BX_RESET_HARDWARE);
-    BX_CPU(0)->async_event          = 0;
+    BX_CPU(0)->oszapc.result  = 0;   // add this
+    BX_CPU(0)->oszapc.auxbits = 0;   // add this
+    BX_CPU(0)->async_event = 0;
     bx_pc_system.kill_bochs_request = 0;
     g_exit_pending                  = 0;
 
@@ -1267,8 +1373,7 @@ extern "C" int bochs_cpu_tick(int n) {
 
     s.wants_input = false;
 
-    if (n < 1) n = 1;
-    if (n > 4) n = 4;
+    if (n > 64) n = 64;
 
     // Clear any stale exit flag from a previous tick of a different
     // (now-dead) slot.
@@ -1291,6 +1396,7 @@ extern "C" int bochs_cpu_tick(int n) {
         // After return, leave both flags clear so the next iteration
         // (or next tick call) starts clean.
         bx_pc_system.kill_bochs_request = 0;
+        BX_CPU(0)->async_event          = 0;
     }
     return 0;
 }
