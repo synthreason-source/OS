@@ -823,6 +823,7 @@ void operator delete[](void* ptr, size_t size) noexcept {
     operator delete[](ptr);
 }
 
+
 // ── Non-halting allocation for callers that must be able to fail cleanly ──
 // kernel_alloc_nofail()/kernel_free() are the same FreeListAllocator +
 // Bochs-pool fallback as operator new/delete above, EXCEPT they return
