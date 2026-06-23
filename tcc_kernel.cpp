@@ -918,6 +918,17 @@ extern "C" void tcc_kernel_cmd_cc(void* terminal_opaque,
 
     console_print("cc: written '"); console_print(out_name); console_print("'\n");
 
-    // Auto-launch
-    tcc_bridge_exec_elf(terminal_opaque, out_name, nullptr);
+    // Auto-launch. tcc_bridge_exec_elf returns the slot index (>=0) on
+    // success or -1 on failure (no free slot, invalid ELF, image too
+    // large, allocation failure, etc.). The return value used to be
+    // discarded here, so a failed launch was completely silent: the user
+    // saw "cc: written 'foo'" and then nothing — no crash, no error, just
+    // a shell that looked like it had hung. load_and_execute_elf() prints
+    // its own diagnostic (e.g. "No free ELF slot", "ELF: out of memory
+    // (image)") before returning -1, so this just makes sure the failure
+    // itself is visible as a `cc`-attributed message too.
+    int launch_rc = tcc_bridge_exec_elf(terminal_opaque, out_name, nullptr);
+    if (launch_rc < 0) {
+        console_print("cc: launch failed (see error above)\n");
+    }
 }

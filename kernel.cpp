@@ -861,6 +861,28 @@ extern "C" size_t kernel_alloc_usable_size(void* ptr) {
     return block_size - sizeof(size_t);
 }
 
+// ── Non-halting byte-buffer alloc/free for ELF process images ─────────────
+// load_and_execute_elf() previously allocated the guest image slab and its
+// stack with plain `new uint8_t[...]`, which goes through operator new and
+// therefore HALTS THE ENTIRE KERNEL on exhaustion (oom_halt()) — exactly
+// like the in-kernel TCC compiler did before it was switched to
+// kernel_alloc_nofail. A user launching an ELF when the heap happens to be
+// tight (e.g. several Bochs slots already running, or a large compiled
+// program) should see "cc: out of memory" / a failed launch, not freeze
+// the whole OS over one `cc foo.c && foo`.
+//
+// These wrap kernel_alloc_nofail/kernel_free in a uint8_t* interface so
+// load_and_execute_elf can swap its `new[]`/`delete[]` calls 1:1 without
+// touching the unrelated `new[]`/`delete[]` call sites used for filesystem
+// I/O buffers elsewhere in this file (those are kernel-internal and not
+// driven by arbitrary user input in the same way).
+extern "C" uint8_t* elf_alloc_bytes(size_t size) {
+    return (uint8_t*)kernel_alloc_nofail(size);
+}
+extern "C" void elf_free_bytes(uint8_t* ptr) {
+    kernel_free(ptr);
+}
+
 
 
 // =============================================================================
@@ -6806,10 +6828,10 @@ bool disk_has_password() {
 void kill_elf_process(int slot) {
     if (slot >= 0 && slot < MAX_ELF_PROCESSES && elf_processes[slot].active) {
         if (elf_processes[slot].memory_base) {
-            delete[] elf_processes[slot].memory_base;
+            elf_free_bytes(elf_processes[slot].memory_base);
         }
         if (elf_processes[slot].stack) {
-            delete[] elf_processes[slot].stack;
+            elf_free_bytes(elf_processes[slot].stack);
         }
         elf_processes[slot].active          = false;
         elf_processes[slot].cpu_initialized = false;  // <-- ADD THIS
@@ -7128,7 +7150,9 @@ void handle_command() {
                 if (_elf_exists) {
                     console_print("ELF '"); console_print(out_name);
                     console_print("' already on disk. Running now...\n");
-                    load_and_execute_elf(out_name, nullptr, this);
+                    if (load_and_execute_elf(out_name, nullptr, this) < 0) {
+                        console_print("cc: launch failed (see error above)\n");
+                    }
                 }
             }
         }
@@ -7548,7 +7572,10 @@ int load_and_execute_elf(const char* filename, const char* args, TerminalWindow*
     do {
         fat_dir_entry_t entry;
         uint32_t sector = 0, offset = 0;
-        if (fat32_find_entry(filename, &entry, &sector, &offset) != 0) break;
+        if (fat32_find_entry(filename, &entry, &sector, &offset) != 0) {
+            if (terminal) terminal->console_print("ELF: directory entry not found\n");
+            break;
+        }
 
         Elf32_Ehdr ehdr;
         memcpy(&ehdr, elfdata, sizeof(Elf32_Ehdr));
@@ -7604,45 +7631,75 @@ int load_and_execute_elf(const char* filename, const char* args, TerminalWindow*
         bool found_load = false;
         uint32_t minvaddr = 0xFFFFFFFFu;
         uint32_t maxvaddr = 0;
+        bool phdr_bad = false;
 
         for (int i = 0; i < ehdr.e_phnum; i++) {
             if (phdr[i].p_type != PT_LOAD) continue;
             found_load = true;
-            if (phdr[i].p_memsz < phdr[i].p_filesz) break;
-            if (phdr[i].p_offset + phdr[i].p_filesz > filesize) break;
+            if (phdr[i].p_memsz < phdr[i].p_filesz) { phdr_bad = true; break; }
+            if (phdr[i].p_offset + phdr[i].p_filesz > filesize) { phdr_bad = true; break; }
             if (phdr[i].p_vaddr < minvaddr) minvaddr = phdr[i].p_vaddr;
             uint32_t end = phdr[i].p_vaddr + phdr[i].p_memsz;
             if (end > maxvaddr) maxvaddr = end;
         }
 
-        if (!found_load || maxvaddr <= minvaddr) break;
+        if (phdr_bad) {
+            if (terminal) terminal->console_print("ELF: malformed program header (memsz/filesz/offset)\n");
+            break;
+        }
+        if (!found_load) {
+            if (terminal) terminal->console_print("ELF: no PT_LOAD segment found\n");
+            break;
+        }
+        if (maxvaddr <= minvaddr) {
+            if (terminal) terminal->console_print("ELF: empty or inverted load range\n");
+            break;
+        }
 
         uint32_t imgsize = maxvaddr - minvaddr;
-        if (imgsize == 0 || imgsize > 6 * 1024 * 1024) break;
+        if (imgsize == 0 || imgsize > 6 * 1024 * 1024) {
+            if (terminal) terminal->console_print("ELF: image size out of range (0 or >6MB)\n");
+            break;
+        }
 
         uint32_t memsize = imgsize + ELFHEAPSIZE;
-        if (memsize > 6 * 1024 * 1024) break;
+        if (memsize > 6 * 1024 * 1024) {
+            if (terminal) terminal->console_print("ELF: image+heap exceeds 6MB limit\n");
+            break;
+        }
 
-        mem = new uint8_t[memsize];
-        if (!mem) break;
+
+        mem = elf_alloc_bytes(memsize);
+        if (!mem) {
+            if (terminal) terminal->console_print("ELF: out of memory (image)\n");
+            break;
+        }
         memset(mem, 0, memsize);
         proc->memory_base = mem;
         proc->memory_size = memsize;
         proc->vaddr_base = minvaddr;
         proc->vaddr_end = maxvaddr;
 
+        bool copy_bad = false;
         for (int i = 0; i < ehdr.e_phnum; i++) {
             if (phdr[i].p_type != PT_LOAD) continue;
             uint32_t dstoff = phdr[i].p_vaddr - minvaddr;
-            if (dstoff + phdr[i].p_filesz > memsize) break;
+            if (dstoff + phdr[i].p_filesz > memsize) { copy_bad = true; break; }
             memcpy(mem + dstoff, elfdata + phdr[i].p_offset, phdr[i].p_filesz);
             if (phdr[i].p_memsz > phdr[i].p_filesz) {
                 memset(mem + dstoff + phdr[i].p_filesz, 0, phdr[i].p_memsz - phdr[i].p_filesz);
             }
         }
+        if (copy_bad) {
+            if (terminal) terminal->console_print("ELF: segment offset out of bounds\n");
+            break;
+        }
 
-        stack = new uint8_t[ELFSTACKSIZE];
-        if (!stack) break;
+        stack = elf_alloc_bytes(ELFSTACKSIZE);
+        if (!stack) {
+            if (terminal) terminal->console_print("ELF: out of memory (stack)\n");
+            break;
+        }
         memset(stack, 0, ELFSTACKSIZE);
         proc->stack = stack;
 
@@ -7679,8 +7736,8 @@ int load_and_execute_elf(const char* filename, const char* args, TerminalWindow*
 
     if (result < 0) {
         if (proc) {
-            if (proc->stack) { delete[] proc->stack; proc->stack = nullptr; }
-            if (proc->memory_base) { delete[] proc->memory_base; proc->memory_base = nullptr; }
+            if (proc->stack) { elf_free_bytes(proc->stack); proc->stack = nullptr; }
+            if (proc->memory_base) { elf_free_bytes(proc->memory_base); proc->memory_base = nullptr; }
             proc->active = false;
             proc->cpu_initialized = false;
             proc->waiting_for_input = false;
@@ -7764,8 +7821,8 @@ public:
             // freeing the slab — otherwise the glue holds a dangling
             // mem_base pointer that any future activate_slot could deref.
             bochs_release_slot(captured_elf_slot);
-            if (proc.memory_base) { delete[] proc.memory_base; proc.memory_base = nullptr; }
-            if (proc.stack)       { delete[] proc.stack;       proc.stack       = nullptr; }
+            if (proc.memory_base) { elf_free_bytes(proc.memory_base); proc.memory_base = nullptr; }
+            if (proc.stack)       { elf_free_bytes(proc.stack);       proc.stack       = nullptr; }
             proc.memory_size     = 0;
             proc.cpu_initialized = false;
         }
@@ -8679,7 +8736,7 @@ static bool load_elf_image_to_slab(
     unsigned int vaddr_top = align_up(max_vaddr + ELF_STACK_SIZE + ELF_HEAP_SIZE, 0x1000);
     unsigned int slab_size = vaddr_top - vaddr_base;
 
-    unsigned char* slab = new unsigned char[slab_size];
+    unsigned char* slab = elf_alloc_bytes(slab_size);
     if (!slab) return false;
     memset(slab, 0, slab_size);
 
@@ -8696,13 +8753,13 @@ static bool load_elf_image_to_slab(
         unsigned int p_memsz   = rd32(p + 20);
 
         if (p_offset + p_filesz > elf_size) {
-            delete[] slab;
+            elf_free_bytes(slab);
             return false;
         }
 
         unsigned int dest = p_vaddr - vaddr_base;
         if (dest + p_memsz > slab_size) {
-            delete[] slab;
+            elf_free_bytes(slab);
             return false;
         }
 
@@ -8975,8 +9032,8 @@ void tick_elf_processes(int steps) {
             // reset path also fires below, release_slot's wipe is
             // simply overwritten by the same values via reset_all_slots.
             bochs_release_slot(i);
-            if (proc.memory_base) { delete[] proc.memory_base; proc.memory_base = nullptr; }
-            if (proc.stack)       { delete[] proc.stack;       proc.stack       = nullptr; }
+            if (proc.memory_base) { elf_free_bytes(proc.memory_base); proc.memory_base = nullptr; }
+            if (proc.stack)       { elf_free_bytes(proc.stack);       proc.stack       = nullptr; }
             proc.memory_size     = 0;
             proc.cpu_initialized = false;
 
