@@ -154,21 +154,56 @@ int snprintf(char* buf, unsigned long cap, const char* fmt, ...) {
 }
 
 // ── Memory allocation ─────────────────────────────────────────────────────────
+// IMPORTANT: this calls kernel_alloc_nofail()/kernel_free() (defined in
+// kernel.cpp), NOT ::operator new/delete directly. The global operator new
+// halts the entire kernel on exhaustion (oom_halt()) — appropriate for
+// kernel-internal structures, but not for memory driven by an arbitrary
+// user-supplied C source file. A bad `cc foo.c` should report "out of
+// memory" and return to the shell, not freeze the OS.
+extern void* kernel_alloc_nofail(unsigned long size);
+extern void  kernel_free(void* ptr);
+
+// Set the moment any malloc() call fails during this compile. TCC's own
+// error path may report a confusing/unrelated parse or codegen error when
+// the real cause was a failed allocation deep inside libtcc — checking
+// this latch lets tcc_kernel_cmd_cc() print an unambiguous "out of memory"
+// message instead. Reset at the top of every tcc_kernel_cmd_cc() call.
+static bool g_oom_hit = false;
+
 void* malloc(unsigned long size) {
     if (!size) return nullptr;
-    return ::operator new(size);
+    void* p = kernel_alloc_nofail(size);
+    if (!p) g_oom_hit = true;
+    return p;
 }
 void free(void* ptr) {
-    if (ptr) ::operator delete(ptr);
+    if (ptr) kernel_free(ptr);
 }
+extern unsigned long kernel_alloc_usable_size(void* ptr);
+
 void* realloc(void* ptr, unsigned long size) {
     if (!ptr)  return malloc(size);
     if (!size) { free(ptr); return nullptr; }
     void* n = malloc(size);
-    if (n) { memcpy(n, ptr, size); free(ptr); }
+    if (n) {
+        // Copy only as many bytes as the OLD allocation actually has.
+        // Copying `size` (the NEW, larger request) unconditionally would
+        // read past the end of the original block on every grow — an
+        // out-of-bounds read that silently corrupts whatever heap memory
+        // follows it. kernel_alloc_usable_size() gives a safe upper bound;
+        // fall back to `size` only if it's unavailable (e.g. bump-pool
+        // pointer), which preserves the old (unsafe but pre-existing)
+        // behavior solely for that rare path.
+        unsigned long old_usable = kernel_alloc_usable_size(ptr);
+        unsigned long copy_n = old_usable ? old_usable : size;
+        if (copy_n > size) copy_n = size;
+        memcpy(n, ptr, copy_n);
+        free(ptr);
+    }
     return n;
 }
 void* calloc(unsigned long n, unsigned long size) {
+    if (n != 0 && size > (~0UL) / n) return nullptr;  // overflow guard
     unsigned long t = n * size;
     void* p = malloc(t);
     if (p) memset(p, 0, t);
@@ -430,6 +465,14 @@ void __stack_chk_fail(void) {
 #define FAKE_FD_BASE  500
 #define FAKE_FD_MAX   16   // TCC opens several internal fds during compilation
 
+// Hard ceiling on any single fake-fd output buffer. A 32-bit i386 ELF
+// produced by a single `cc` invocation has no legitimate reason to exceed
+// this. Without a cap, a runaway/corrupt compile would let
+// kfd_write_bytes() double its buffer (65536 -> 128K -> 256K -> ...) until
+// it had eaten the entire 64MB kernel heap and tripped the global
+// allocator's OOM halt, freezing the whole OS over one bad `cc`.
+#define TCC_FD_MAX_BYTES (16u * 1024u * 1024u)  // 16MB per fake-fd buffer
+
 struct KFd {
     bool          active;
     bool          is_write;
@@ -457,6 +500,21 @@ static KFd* kfd_get(int fd) {
 static void kfd_release(int fd) {
     KFd* f=kfd_get(fd);
     if (f) { if(f->buf) free(f->buf); *f={}; }
+}
+
+// Free every fake-fd slot's buffer, active or not. Must be called at the
+// START of every `cc` invocation (before tcc_new()) so that any buffer
+// left behind by a previous failed/aborted compile — e.g. a compile that
+// errored out after open() but before harvest_elf() ran — is released
+// instead of silently accumulating. Without this sweep, repeated `cc`
+// attempts on a broken source file leak ~64KB+ of kernel heap per attempt
+// and never get it back: a slow, easy-to-trigger memory loop.
+static void kfd_reset_all() {
+    for (int i=0;i<FAKE_FD_MAX;i++) {
+        KFd* f=&g_kfds[i];
+        if (f->buf) { free(f->buf); }
+        *f = {};
+    }
 }
 
 #define O_RDONLY   0
@@ -512,9 +570,28 @@ long read(int fd, void* buf, unsigned long n) {
 
 static bool kfd_write_bytes(KFd* f, const void* data, unsigned long n) {
     { char _db[80]; snprintf(_db,sizeof(_db),"[tcc] kfd_write_bytes n=%lu cur_size=%lu\n",n,f->size); console_print(_db); }
-    unsigned long need=f->size+n;
+
+    // Overflow guard: size + n wrapping around would otherwise look like
+    // "no growth needed" and corrupt memory via a too-small buffer.
+    unsigned long need = f->size + n;
+    if (need < f->size) { g_errno_val=12; console_print("[tcc] kfd_write_bytes: size overflow\n"); return false; }
+
+    // Hard cap: refuse to grow past TCC_FD_MAX_BYTES rather than doubling
+    // forever and starving the rest of the kernel heap.
+    if (need > TCC_FD_MAX_BYTES) {
+        g_errno_val=12;
+        console_print("[tcc] kfd_write_bytes: output exceeds cap, aborting\n");
+        return false;
+    }
+
     if (need>f->cap) {
-        unsigned long nc=f->cap*2; while(nc<need) nc*=2;
+        unsigned long nc=f->cap ? f->cap : 4096;
+        while (nc<need) {
+            unsigned long doubled = nc*2;
+            if (doubled <= nc) { nc = need; break; }   // overflow guard on *2
+            nc = doubled;
+        }
+        if (nc > TCC_FD_MAX_BYTES) nc = TCC_FD_MAX_BYTES;
         unsigned char* nb=(unsigned char*)malloc(nc);
         if (!nb) { g_errno_val=12; return false; }
         memcpy(nb,f->buf,f->size); free(f->buf);
@@ -714,6 +791,13 @@ extern "C" void tcc_kernel_cmd_cc(void* terminal_opaque,
                                   const char* src_name,
                                   const char* out_name_arg) {
     g_errlen = 0; g_errbuf[0] = '\0';
+    g_oom_hit = false;
+
+    // Release any fake-fd buffers left behind by a previous compile that
+    // errored out partway through (e.g. failed after open() but before
+    // harvest_elf() ran). Without this, a broken source file recompiled
+    // repeatedly leaks heap on every attempt and never gets it back.
+    kfd_reset_all();
 
     if (!src_name || !src_name[0]) {
         console_print("cc: no source file\n");
@@ -758,7 +842,12 @@ extern "C" void tcc_kernel_cmd_cc(void* terminal_opaque,
     // TCC's internal linker manages its own anonymous section symbols from
     // scratch without any merge step.
     TCCState* s1 = tcc_new();
-    if (!s1) { free(full); console_print("cc: tcc_new failed\n"); return; }
+    if (!s1) {
+        free(full);
+        if (g_oom_hit) console_print("cc: out of memory\n");
+        else           console_print("cc: tcc_new failed\n");
+        return;
+    }
 
     tcc_set_error_func(s1, nullptr, tcc_err_cb);
 
@@ -777,8 +866,12 @@ extern "C" void tcc_kernel_cmd_cc(void* terminal_opaque,
     free(full);
 
     if (rc < 0) {
-        console_print("cc: compile error:\n");
-        if (g_errlen>0) console_print(g_errbuf);
+        if (g_oom_hit) {
+            console_print("cc: out of memory during compilation\n");
+        } else {
+            console_print("cc: compile error:\n");
+            if (g_errlen>0) console_print(g_errbuf);
+        }
         tcc_delete(s1); return;
     }
 
@@ -787,8 +880,12 @@ extern "C" void tcc_kernel_cmd_cc(void* terminal_opaque,
     tcc_delete(s1);
 
     if (rc < 0) {
-        console_print("cc: link error:\n");
-        if (g_errlen>0) console_print(g_errbuf);
+        if (g_oom_hit) {
+            console_print("cc: out of memory during linking\n");
+        } else {
+            console_print("cc: link error:\n");
+            if (g_errlen>0) console_print(g_errbuf);
+        }
         return;
     }
 
@@ -798,7 +895,11 @@ extern "C" void tcc_kernel_cmd_cc(void* terminal_opaque,
 
     if (!elf || elf_size<4 ||
         elf[0]!=0x7F||elf[1]!='E'||elf[2]!='L'||elf[3]!='F') {
-        console_print("cc: bad ELF output\n");
+        if (g_oom_hit) {
+            console_print("cc: out of memory while writing output\n");
+        } else {
+            console_print("cc: bad ELF output (possibly exceeded size cap)\n");
+        }
         if (elf) free(elf);
         return;
     }

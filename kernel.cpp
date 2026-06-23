@@ -823,6 +823,45 @@ void operator delete[](void* ptr, size_t size) noexcept {
     operator delete[](ptr);
 }
 
+// ── Non-halting allocation for callers that must be able to fail cleanly ──
+// kernel_alloc_nofail()/kernel_free() are the same FreeListAllocator +
+// Bochs-pool fallback as operator new/delete above, EXCEPT they return
+// nullptr on exhaustion instead of calling oom_halt(). Anything driven by
+// untrusted/arbitrary user input — most notably the in-kernel TCC compiler
+// in tcc_kernel.cpp, where a malformed or oversized source file can cause
+// runaway allocation — must use this instead of plain `new`, otherwise a
+// single bad `cc <file.c>` permanently freezes the entire OS rather than
+// just failing that one command.
+extern "C" void* kernel_alloc_nofail(size_t size) {
+    void* p = g_allocator.allocate(size);
+    if (!p) p = bochs_pool_alloc(size);
+    return p;   // may be nullptr — caller must check
+}
+
+extern "C" void kernel_free(void* ptr) {
+    if (!ptr) return;
+    if (bochs_pool_owns(ptr)) return;
+    g_allocator.deallocate(ptr);
+}
+
+// Returns the number of bytes actually usable at `ptr` (i.e. safe to read
+// or write), or 0 if unknown (e.g. pointer came from the Bochs bump pool,
+// which keeps no per-allocation size). The FreeListAllocator stores the
+// rounded-up block size (including its own header) immediately before the
+// pointer it returned, so we can recover a safe upper bound here without
+// any extra bookkeeping. Used by tcc_kernel.cpp's realloc() so growing a
+// buffer never reads past the end of the smaller, original allocation —
+// that out-of-bounds read previously corrupted adjacent heap memory on
+// every realloc-to-grow call.
+extern "C" size_t kernel_alloc_usable_size(void* ptr) {
+    if (!ptr) return 0;
+    if (bochs_pool_owns(ptr)) return 0;   // bump pool: no recoverable size
+    size_t block_size = *(size_t*)((char*)ptr - sizeof(size_t));
+    if (block_size <= sizeof(size_t)) return 0;  // corrupt/garbage guard
+    return block_size - sizeof(size_t);
+}
+
+
 
 // =============================================================================
 // SECTION 2: BOOTLOADER INFO, FONT, RTC
