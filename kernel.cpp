@@ -7484,46 +7484,13 @@ void handle_command() {
     // dedicated window rather than scribbling its output across the
     // shell that launched it.
     else {
-        if (is_emulator_window && bochs_reset_done) {
+
             // (b) We ARE the spawned emulator window — run in-place.
             int s = load_and_execute_elf(command, args, this);
             if (s >= 0) captured_elf_slot = s;
-        } else {
-            // (a) Ordinary shell — probe FAT32 for the file. If it
-            // exists and starts with the ELF magic, spawn a fresh
-            // emulator window seeded with the same command line.
-            // Otherwise print "command not found" so the user gets a
-            // clear signal instead of a silent disk-read error.
-            fat_dir_entry_t entry;
-            uint32_t sec = 0, off = 0;
-            bool is_elf = false;
-            if (fat32_find_entry(command, &entry, &sec, &off) == 0) {
-                // Read just enough bytes to check the ELF magic without
-                // pulling the whole binary into memory twice. The disk
-                // read is cheap; we only do it once per typed command.
-                char* probe = fat32_read_file_as_string(command);
-                if (probe) {
-                    if (entry.file_size >= 4 &&
-                        (uint8_t)probe[0] == 0x7F &&
-                        probe[1] == 'E' && probe[2] == 'L' && probe[3] == 'F') {
-                        is_elf = true;
-                    }
-                    delete[] probe;
-                }
-            }
+     
 
-
-            if (is_elf) {
-                // ELF found but not in emulator mode.
-                // Direct the user to type `bochs` first.
-                console_print(command);
-                console_print(": ELF found - type `bochs` to enter emulator mode, then run it\n");
-            } else {
-                // Not a known command and not an ELF on disk.
-                console_print(command);
-                console_print(": command not found\n");
-            }
-        }
+       
     }
 
     if(!in_editor) print_prompt();
@@ -7748,12 +7715,22 @@ public:
             g_test_overlay_owner  = nullptr;
             g_test_overlay_active = false;
         }
-        // Kill the attached ELF process so it disappears from the taskbar
+        // Kill the attached ELF process so it disappears from the taskbar.
+        // Also release the Bochs glue slot and free the slab/stack to avoid
+        // dangling pointers in the memory-handler table and memory leaks.
         if (captured_elf_slot >= 0 && captured_elf_slot < MAX_ELF_PROCESSES) {
             ElfProcess& proc = elf_processes[captured_elf_slot];
             proc.active    = false;
             proc.completed = true;
             proc.terminal  = nullptr;
+            // Unregister the Bochs memory handlers for this slot before
+            // freeing the slab — otherwise the glue holds a dangling
+            // mem_base pointer that any future activate_slot could deref.
+            bochs_release_slot(captured_elf_slot);
+            if (proc.memory_base) { delete[] proc.memory_base; proc.memory_base = nullptr; }
+            if (proc.stack)       { delete[] proc.stack;       proc.stack       = nullptr; }
+            proc.memory_size     = 0;
+            proc.cpu_initialized = false;
         }
         captured_elf_slot = -1;
         is_closed = true;
@@ -8819,21 +8796,12 @@ static bool x86_tick(int slot, int steps) {
         // Re-register the slab (the glue unregisters any previous mapping
         // for the slot first, so this is idempotent). Then hardware-reset
         // the CPU, enter protected mode, and point it at the guest entry.
-        //
-        // ORDER MATTERS: bochs_cpu_init() must come first so the global
-        // Bochs subsystem (BX_MEM, BX_CPU, pc_system) is fully initialised
-        // before bochs_set_process_memory tries to register memory handlers
-        // and call slot_prime_cpu. If set_process_memory runs first it
-        // calls bochs_global_init() internally, but the explicit call here
-        // makes the dependency explicit and avoids the fragile case where
-        // the first sub-call inside set_process_memory triggers global init
-        // mid-function.
         x86_breadcrumb(0, 'L');
-        bochs_cpu_init();
-        x86_breadcrumb(2, 'I');
         bochs_set_process_memory(proc.memory_base, proc.memory_size,
                                  proc.vaddr_base);
         x86_breadcrumb(1, 'M');
+        bochs_cpu_init();
+        x86_breadcrumb(2, 'I');
         bochs_cpu_set_esp(proc.esp);
         x86_breadcrumb(3, 'S');
         bochs_cpu_set_eip(proc.entry_point);
@@ -8889,14 +8857,6 @@ static bool x86_tick(int slot, int steps) {
 
     return true;
 }
-// Persistent flag: set when the last Bochs slot exits, cleared once the
-// output ring buffers have fully drained and bochs_reset_all_slots() fires.
-// Survives across tick_elf_processes frames so the reset isn't lost when
-// output is still pending on the exit frame (any_exited_this_frame is only
-// true on the ONE frame the exit is detected, not on the drain frames that
-// follow it).
-static bool g_bochs_reset_needed = false;
-
 // And definition without default:
 void tick_elf_processes(int steps) {
     bool any_exited_this_frame = false;
@@ -9016,47 +8976,40 @@ void tick_elf_processes(int steps) {
     }
 
     // ── Deferred glue-wide reset ────────────────────────────────────
-    // After all slots have exited, wipe Bochs's glue state back to its
-    // post-boot baseline.
-    //
-    // This is now a SAFETY NET rather than the primary correctness
-    // mechanism. The real guarantee of identical start state comes from
-    // bochs_set_process_memory, which does a full BX_RESET_HARDWARE
-    // before priming each slot (when no peer slots are live). This
-    // deferred reset handles two remaining cases:
-    //
-    //   1. Concurrent slots: when two slots run together, the pre-load
-    //      reset in bochs_set_process_memory is skipped to avoid
-    //      clobbering the peer. Once both exit, this reset cleans up
-    //      any residual glue state so the next solo launch starts clean.
-    //
-    //   2. Belt-and-braces: ensures g_active_slot is reset to -1 and
-    //      all slot mappings are unregistered even if bochs_release_slot
-    //      was somehow missed.
+    // If any process exited this frame AND no other Bochs-emulated
+    // process is still running, wipe Bochs's glue state back to its
+    // post-boot baseline. The next launch will then start from the
+    // same state as launch #1.
     //
     // CRITICAL: do NOT reset while another slot is still running.
+    // bochs_reset_all_slots() unmaps every slab and hardware-resets
+    // BX_CPU(0); doing that to a live slot drops its EIP/CRs/segments
+    // back to the post-reset state. On the very next frame, x86_tick
+    // would re-enter the lazy-init path and bochs_cpu_set_eip would
+    // restart the guest from _start. The visible symptom is a runaway
+    // window spamming "HELLO WOHELLO WO..." for as long as another
+    // window is finishing — exactly because every frame's exit on
+    // window B triggered a reset that restarted window A from the top.
     if (any_exited_this_frame) {
-        bool any_still_active = false;
-        for (int j = 0; j < MAX_ELF_PROCESSES; ++j)
+        // Only wipe the Bochs glue when ALL slots are done AND all
+        // output has been drained. Use two separate loops: the old
+        // single-loop version broke out early on the first active slot,
+        // so any_output_pending was never checked for remaining slots.
+        bool any_still_active   = false;
+        bool any_output_pending = false;
+        for (int j = 0; j < MAX_ELF_PROCESSES; ++j) {
             if (elf_processes[j].active) { any_still_active = true; break; }
-        if (!any_still_active)
-            g_bochs_reset_needed = true;
-    }
-    if (g_bochs_reset_needed) {
-        // Wait until the output ring buffers are fully drained so the
-        // terminal displays the last line of output before the reset
-        // clears the glue state. (The reset does not affect kernel-side
-        // ring buffers — it only touches Bochs internals — but draining
-        // first keeps the visual ordering correct.)
-        bool any_output = false;
-        for (int j = 0; j < MAX_ELF_PROCESSES; ++j)
-            if (!out_empty(j)) { any_output = true; break; }
-        if (!any_output) {
+        }
+        if (!any_still_active) {
+            for (int j = 0; j < MAX_ELF_PROCESSES; ++j) {
+                if (!out_empty(j)) { any_output_pending = true; break; }
+            }
+        }
+        if (!any_still_active && !any_output_pending) {
             bochs_reset_all_slots();
-            g_bochs_reset_needed = false;
         }
     }
-
+     
 }
 
 extern "C" void cmd_exec(const char* code_text) {
@@ -9677,13 +9630,6 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
 // tcc_kernel.cpp is compiled as freestanding C++ and cannot include the full
 // kernel headers. These thin wrappers expose the symbols it needs with plain
 // C linkage so the linker resolves them without name-mangling.
-extern "C" int tcc_kernel_version(void) {2;} // 2 = real in-kernel TCC
-
-// ── tcc_kernel_cmd_cc ─────────────────────────────────────────────────────────
-extern "C" void tcc_kernel_cmd_cc(void*,
-                                  const char*,
-                                  const char*);
-
 
 extern "C" {
 
