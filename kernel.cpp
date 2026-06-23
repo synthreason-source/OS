@@ -6947,9 +6947,7 @@ void handle_command() {
 		}
 	}
 	else if (strcmp(command, "reset") == 0) {
-		if (bochs_reset_done) {
-			console_print("reset: already done for this window\n");
-		} else {
+
 		bochs_reset_done = true;
 		// Run the Bochs CPU reset sequence (test_module_run Phase 1+2)
 		// so BX_CPU(0) is fully initialised and the test slab is wiped.
@@ -6983,7 +6981,7 @@ void handle_command() {
 			console_print("reset: init OK, guest incomplete\n");
 		else
 			console_print("reset: FAILED\n");
-		} // end else (not already reset)
+		
 	}
 	else if (strcmp(command, "aesenc") == 0 || strcmp(command, "aesdec") == 0) {
         bool encrypt = strcmp(command, "aesenc") == 0;
