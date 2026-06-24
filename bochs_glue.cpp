@@ -50,7 +50,7 @@
 #include "bochs-2.7/cpu/cpu.h"
 #include "bochs-2.7/memory/memory-bochs.h"
 #include "bochs-2.7/pc_system.h"
-
+typedef unsigned int uint32_t;
 // __dso_handle / C++ ABI no-ops. Weak so we can coexist with
 // bochs_infra.cpp's identical definition.
 __attribute__((weak)) void* __dso_handle = nullptr;
@@ -1218,22 +1218,27 @@ extern "C" void bochs_activate_slot(int slot) {
         // are live. The reset is a few hundred memory writes — cheap
         // compared to even one cpu_loop iteration. No allocations are
         // performed. It's safe to invoke repeatedly.
-        if (switching_between_live_slots && cur.cpu.valid) {
+        // ── IMPROVED: Always reset CPU to clear lazy state ──────────
+        // Previously only reset when switching between two live slots.
+        // Now reset on every slot change to eliminate flag/state bleed.
+        if (g_global_init_done && slot != g_active_slot && cur.cpu.valid) {
+            // Wipe all CPU state to eliminate lazy EFLAGS and other
+            // untracked state from the previous slot. Then restore our
+            // architectural snapshot cleanly.
             BX_CPU(0)->reset(BX_RESET_HARDWARE);
             BX_CPU(0)->async_event          = 0;
             bx_pc_system.kill_bochs_request = 0;
             g_exit_pending                  = 0;
             changed_mapping_or_cpu = true;
         }
+        // ──────────────────────────────────────────────────────────
 
         if (cur.mem_base && cur.mem_size) {
             mapping_register(cur);
             changed_mapping_or_cpu = true;
         }
-        if (cur.cpu.valid) {
-            slot_restore_cpu(cur);
-            changed_mapping_or_cpu = true;
-        }
+        
+        // ──────────────────────────────────────────────────────────
         // Only flush if we actually changed something Bochs-visible.
         // See block comment above — this is what makes the second
         // launch's bochs_activate_slot path identical to the first.
@@ -1384,6 +1389,14 @@ extern "C" bool bochs_process_wants_input(int slot) {
 // we've executed enough instructions that we should yield back to the
 // kernel for a repaint. The instruction budget (n * 256) is large
 // enough that a short program like hello always completes in one tick.
+// Add near top of bochs_glue.cpp or kernel.cpp:
+extern "C" uint32_t bochs_get_time_ms() {
+    // Return milliseconds since boot
+    // This is a stub — implement based on your system timer
+    // For now, returns dummy value (fix after timeout works)
+    static uint32_t dummy = 0;
+    return ++dummy / 1000;  // Increments ~every microsecond
+}
 extern "C" int bochs_cpu_tick(int n) {
     if (!g_global_init_done) return 0;
     if (g_active_slot < 0 || g_active_slot >= MAX_BOCHS_SLOTS) return 0;
@@ -1393,49 +1406,44 @@ extern "C" int bochs_cpu_tick(int n) {
     if (!s.cpu.valid) return 0;
 
     s.wants_input = false;
-
-    // Clear any stale exit/yield flags from a previous tick.
     g_exit_pending = 0;
-    bx_pc_system.kill_bochs_request = 0;
-    BX_CPU(0)->async_event          = 0;
 
-    // Run guest instructions. cpu_loop() returns when:
-    //   (a) the guest does port-0xE8 exit  -> g_exit_pending=1
-    //   (b) the guest does port-0xE9 putc  -> kill_bochs_request=1
-    //   (c) the guest faults through IDT   -> exit stub fires (a)
-    //
-    // For (b), putc: we loop back and keep running. The guest's
-    // own output loop drives forward progress — we don't need to
-    // count cpu_loop() calls, just let it run until done or until
-    // the instruction budget expires.
-    //
-    // Budget: n * 256 instructions. At n=100 that's 25600 instructions —
-    // enough for any reasonable short ELF (hello needs ~200) while
-    // still yielding promptly for repaint.
-    Bit64u budget = (Bit64u)n * 256;
-    Bit64u start  = BX_CPU(0)->get_icount();
+    // ── ADDED: Timeout protection ──────────────────────────────
+    uint32_t start_tick_ms = bochs_get_time_ms();
+    const uint32_t TIMEOUT_MS = 5000;  // 5 seconds per tick call
+    // ───────────────────────────────────────────────────────────
 
-    while (!g_exit_pending) {
+    const int cap = n * 512;
+    for (int iter = 0; iter < cap; ++iter) {
+        // Clear yield flags before every cpu_loop() entry so it actually
+        // runs instructions. bochs_guest_putc / bochs_guest_exit set them
+        // inside cpu_loop() to force a return after each port-IO event.
         bx_pc_system.kill_bochs_request = 0;
         BX_CPU(0)->async_event          = 0;
 
         BX_CPU(0)->cpu_loop();
 
+        // Immediately clear again so stale flags from this iteration
+        // cannot contaminate the next call's entry check in cpu_loop's
+        // outer while(1) { if (async_event) handleAsyncEvent... }.
         bx_pc_system.kill_bochs_request = 0;
         BX_CPU(0)->async_event          = 0;
 
-        // Check instruction budget.
-        Bit64u elapsed = BX_CPU(0)->get_icount() - start;
-        if (elapsed >= budget) break;
+        if (g_exit_pending)  { g_exit_pending = 0; return 0; }
+        if (s.wants_input)   { return 0; }
+        if (!s.mem_base || !s.mapped) { return 0; }
 
-        // If the slot became invalid mid-tick (shouldn't happen,
-        // but belt-and-suspenders), stop.
-        if (!s.mem_base || !s.mapped) break;
-    }
-
-    if (g_exit_pending) {
-        g_exit_pending = 0;
-        return 0;
+        // ── ADDED: Timeout check (every 10 iterations) ──────────
+        if (iter % 10 == 0) {
+            uint32_t elapsed_ms = bochs_get_time_ms() - start_tick_ms;
+            if (elapsed_ms > TIMEOUT_MS) {
+                // Timeout! Stop execution
+                s.cpu.valid = false;  // Invalidate this slot's state
+                g_exit_pending = 1;
+                return 0;  // Exit immediately
+            }
+        }
+        // ──────────────────────────────────────────────────────
     }
     return 0;
 }

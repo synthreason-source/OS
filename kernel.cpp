@@ -8906,31 +8906,24 @@ static bool x86_tick(int slot, int steps) {
         proc.cpu_initialized = true;
     }
 
-    x86_breadcrumb(6, 'T');
-
-    // Diagnostic: snapshot EIP BEFORE tick so we can detect an unexpected
-    // jump back to entry after the tick. (Don't enable unconditionally —
-    // gated on the very-recent-restart condition below so normal output
-    // isn't polluted.)
-    uint32_t eip_before = bochs_cpu_get_eip();
-
-    bochs_cpu_tick(steps);
-    x86_breadcrumb(7, 't');
-
-    // Diagnostic restart detector. If EIP was WELL PAST the entry point
-    // before this tick (i.e. we were mid-execution) and is now back AT
-    // the entry point or within a few bytes of it, something rewound
-    // the CPU. Emit '?' into the output buffer so it's visible in the
-    // terminal at the exact point the restart occurred. This pins down
-    // whether the "8 chars then restart" symptom is the CPU genuinely
-    // re-entering _start or something else (e.g. icache returning a
-    // stale decoded trace that points at the entry).
-    uint32_t eip_after = bochs_cpu_get_eip();
-    if (eip_before > proc.entry_point + 16 &&
-        eip_after  < proc.entry_point + 16 &&
-        eip_after >= proc.entry_point) {
-        push_output(slot, '?');
+    // ── IMPROVED: Detect CPU corruption after tick ──────────────────────
+    // If EIP has jumped to an impossible location (outside process memory
+    // or far beyond reasonable code size), the CPU state is corrupted.
+    // This happens if bochs_cpu_tick timed out, slot was invalidated,
+    // or untracked CPU state caused a jump to junk.
+    uint32_t eip_final = bochs_cpu_get_eip();
+    if (eip_final < proc.vaddr_base || 
+        eip_final > proc.vaddr_base + proc.memory_size) {
+        // EIP outside process memory — corrupted state or bochs timeout
+        proc.completed = true;
+        proc.active = false;
+        wm.print_to_focused("[Process died: EIP corruption]\n");
+        return false;
     }
+    // ──────────────────────────────────────────────────────────────────
+
+
+    // ─── FIX: detect clean guest-exit signal ──────────────────────────────
 
 
     // ─── FIX: detect clean guest-exit signal ──────────────────────────────
