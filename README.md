@@ -7,9 +7,11 @@ CTRL-Q saves and exits text editor...
 SATA port selection with 'disk_select'
 
 
-TODO: elf's print/memory/tick algorithm glitch free
 
-TODO: bochs keyboard input working and test elf functionality via bochs CPU emulator
+
+TODO: elf's execution glitch free and elf terminal print output wordwrap enabled fully
+
+TODO: bochs keyboard input working and correct bochs reset, inc bochs resume cpu state?
 
 TODO: add ethernet, Lynx_(web_browser)
 
