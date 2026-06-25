@@ -7005,7 +7005,7 @@ void handle_command() {
 			is_emulator_window = true;
 			title = "Bochs Emulator";
 			console_print("=== Bochs i386 CPU emulator ===\n");
-			console_print("Type `reset` to initialise the CPU, then type an ELF name to run it.\n");
+			console_print("Just type an ELF filename to run it -- init happens automatically.\n");
 		}
 	}
 	else if (strcmp(command, "reset") == 0) {
@@ -7532,27 +7532,31 @@ void handle_command() {
     // Fall-through: try to handle 'command' as an ELF file from FAT32.
     // The ELF runs inside the Bochs CPU emulator via x86_tick / cpu_loop.
     //
-    // Two modes:
-    //   (a) Ordinary shell terminal: detect that 'command' refers to an
-    //       ELF on disk, and spawn a *new* TerminalWindow flagged as an
-    //       emulator window. The new window's startup-command rerun
-    //       takes us into branch (b).
-    //   (b) Emulator window (we were spawned for this very ELF): run the
-    //       ELF in-place via load_and_execute_elf; output flows to this
-    //       window's console_print via the elf_io_write callback chain.
-    //
-    // The emulator-window detour exists because the user asked for the
-    // emulator to "load up in its terminal" — i.e. each ELF gets a fresh
-    // dedicated window rather than scribbling its output across the
-    // shell that launched it.
+    // This used to require the user to type `bochs` (enter emulator
+    // mode) and then `reset` (force-run the Bochs init/self-test
+    // sequence) before an ELF filename would actually do anything.
+    // kernel_run_global_ctors_once() now guarantees BX_CPU(0)/bx_mem
+    // are constructed before kernel_main ever reaches init_elf_system(),
+    // so that manual two-step dance is no longer required for
+    // correctness — it was leftover ceremony from before that fix
+    // existed. Do it automatically here instead, exactly once per
+    // window, so any ELF filename "just works" the first time it's
+    // typed, in any terminal, without extra steps.
     else {
 
-            // (b) We ARE the spawned emulator window — run in-place.
-            int s = load_and_execute_elf(command, args, this);
-            if (s >= 0) captured_elf_slot = s;
-     
+        if (!bochs_reset_done) {
+            bochs_reset_done = true;
+            bochs_reset_all_slots();
+            for (int s = 0; s < MAX_ELF_PROCESSES; ++s)
+                bochs_register_io_callbacks(s, elf_io_read, elf_io_write, elf_io_exit);
+        }
 
-       
+        is_emulator_window = true;
+
+        // Run the ELF in-place; output flows to this window's
+        // console_print via the elf_io_write callback chain.
+        int s = load_and_execute_elf(command, args, this);
+        if (s >= 0) captured_elf_slot = s;
     }
 
     if(!in_editor) print_prompt();
@@ -8906,24 +8910,31 @@ static bool x86_tick(int slot, int steps) {
         proc.cpu_initialized = true;
     }
 
-    // ── IMPROVED: Detect CPU corruption after tick ──────────────────────
-    // If EIP has jumped to an impossible location (outside process memory
-    // or far beyond reasonable code size), the CPU state is corrupted.
-    // This happens if bochs_cpu_tick timed out, slot was invalidated,
-    // or untracked CPU state caused a jump to junk.
-    uint32_t eip_final = bochs_cpu_get_eip();
-    if (eip_final < proc.vaddr_base || 
-        eip_final > proc.vaddr_base + proc.memory_size) {
-        // EIP outside process memory — corrupted state or bochs timeout
-        proc.completed = true;
-        proc.active = false;
-        wm.print_to_focused("[Process died: EIP corruption]\n");
-        return false;
+    x86_breadcrumb(6, 'T');
+
+    // Diagnostic: snapshot EIP BEFORE tick so we can detect an unexpected
+    // jump back to entry after the tick. (Don't enable unconditionally —
+    // gated on the very-recent-restart condition below so normal output
+    // isn't polluted.)
+    uint32_t eip_before = bochs_cpu_get_eip();
+
+    bochs_cpu_tick(steps);
+    x86_breadcrumb(7, 't');
+
+    // Diagnostic restart detector. If EIP was WELL PAST the entry point
+    // before this tick (i.e. we were mid-execution) and is now back AT
+    // the entry point or within a few bytes of it, something rewound
+    // the CPU. Emit '?' into the output buffer so it's visible in the
+    // terminal at the exact point the restart occurred. This pins down
+    // whether the "8 chars then restart" symptom is the CPU genuinely
+    // re-entering _start or something else (e.g. icache returning a
+    // stale decoded trace that points at the entry).
+    uint32_t eip_after = bochs_cpu_get_eip();
+    if (eip_before > proc.entry_point + 16 &&
+        eip_after  < proc.entry_point + 16 &&
+        eip_after >= proc.entry_point) {
+        push_output(slot, '?');
     }
-    // ──────────────────────────────────────────────────────────────────
-
-
-    // ─── FIX: detect clean guest-exit signal ──────────────────────────────
 
 
     // ─── FIX: detect clean guest-exit signal ──────────────────────────────
