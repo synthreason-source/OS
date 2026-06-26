@@ -7028,6 +7028,7 @@ void handle_command() {
 					  "  setpass, removepass, unlock, busybox, pself, killelf,\n"
 					  "  killexec, killrun, aesenc, aesdec, test,\n"
 					  "  bochs <elf-file> [args]  -- run ELF in Bochs emulator window\n"
+				  "  testelf <elf-file>       -- boot ELF via test module (Phase1/2 + diagnostics)\n"
 					  "  cc <file.c> [out]        -- compile C in-kernel via TCC\n"
 					  "  hello                   -- shortcut: bochs hello\n"
 					  "  reset                   -- shortcut: bochs reset\n"
@@ -7084,6 +7085,73 @@ void handle_command() {
 		else
 			console_print("reset: FAILED\n");
 		
+	}
+	else if (strcmp(command, "testelf") == 0) {
+		// Boot a real ELF file from disk through the test module's
+		// Phase 1 (BX_CPU init) + Phase 2 (tick) infrastructure, instead
+		// of load_and_execute_elf's normal lazy-init path. Useful as a
+		// diagnostic: it reuses the same panic-recovery/breadcrumb
+		// machinery the `test`/`reset` self-test relies on, with full
+		// visibility into init failures, instead of x86_tick's silent
+		// per-frame lazy init.
+		const char* fname = get_arg(args, 0);
+		if (!fname) {
+			console_print("Usage: testelf <elf-file>\n");
+		} else {
+			fat_dir_entry_t entry;
+			uint32_t sector = 0, offset = 0;
+			if (fat32_find_entry(fname, &entry, &sector, &offset) != 0) {
+				console_print("testelf: file not found\n");
+			} else {
+				char* elfdata = fat32_read_file_as_string(fname);
+				if (!elfdata) {
+					console_print("testelf: failed to read file\n");
+				} else {
+					test_vga_clear();
+					g_test_overlay_active = false;
+					g_test_overlay_owner  = (void*)this;
+
+					TestSink sink;
+					sink.put_line = test_sink_put_line;
+					sink.vga_cell = test_sink_vga_cell;
+					sink.flush    = test_sink_flush;
+
+					TestResult res;
+					res.phase1_ok = 0; res.phase2_ticked = 0;
+					res.guest_exit_seen = 0; res.guest_exit_code = 0;
+					res.guest_out_len = 0; res.guest_out[0] = 0;
+
+					// A real ELF needs far more than the built-in
+					// guest's 32-tick budget. 200000 is a soft cap so a
+					// genuinely runaway guest can't wedge the terminal
+					// forever -- it still blocks the kernel for the
+					// duration of the run, same as `reset`/`test`.
+					test_module_run_elf(&sink, &res,
+						(const unsigned char*)elfdata,
+						entry.file_size, 200000);
+
+					delete[] elfdata;
+
+					// Same big-hammer cleanup as `reset`: wipe the test
+					// slab's CPU/glue state and re-register the normal
+					// per-window ELF I/O callbacks so slot 0 is usable
+					// again by the regular load_and_execute_elf path.
+					bochs_reset_all_slots();
+					for (int s = 0; s < MAX_ELF_PROCESSES; ++s)
+						bochs_register_io_callbacks(s, elf_io_read, elf_io_write, elf_io_exit);
+
+					g_test_overlay_active = false;
+					g_test_overlay_owner  = nullptr;
+
+					if (!res.phase1_ok)
+						console_print("testelf: FAILED (Bochs init)\n");
+					else if (res.guest_exit_seen)
+						console_print("testelf: guest exited\n");
+					else
+						console_print("testelf: tick budget exhausted (guest still running)\n");
+				}
+			}
+		}
 	}
 	else if (strcmp(command, "aesenc") == 0 || strcmp(command, "aesdec") == 0) {
         bool encrypt = strcmp(command, "aesenc") == 0;

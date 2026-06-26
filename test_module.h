@@ -80,6 +80,18 @@ extern "C" {
  * `out` may be null. Returns out->phase1_ok via the struct. */
 void test_module_run(const TestSink* sink, TestResult* out);
 
+/* Like test_module_run, but boots a real ELF file (raw bytes already
+ * read into memory by the caller) through the same Phase 1 init path,
+ * instead of the module's fixed 23-byte built-in guest. `max_ticks`
+ * bounds how many bochs_cpu_tick(1) calls this function will make
+ * before giving up on a guest that never hits the exit sentinel —
+ * test_module_run_elf BLOCKS the caller for the entire run, same as
+ * test_module_run, so pick a max_ticks the kernel can afford to wait
+ * out. `out` and `sink` may be null, same rules as test_module_run. */
+void test_module_run_elf(const TestSink* sink, TestResult* out,
+                          const unsigned char* elf_data, unsigned int elf_size,
+                          int max_ticks);
+
 /* Tell the module the kernel already ran the file-scope C++ ctors at
  * boot, so test_module_run() must NOT walk __init_array again (doing so
  * would re-construct bx_cpu / bx_mem). Call this once before the first
