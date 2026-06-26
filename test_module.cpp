@@ -731,6 +731,16 @@ extern "C" void test_module_run_elf(const TestSink* sink, TestResult* out,
     if (out) out->phase1_ok = 1;
 
     /* ── Phase 2: parse + load the real ELF ──────────────────────── */
+    bochs_register_io_callbacks(0, test_io_read, test_io_write, test_io_exit);
+    bochs_activate_slot(0);
+    bochs_set_process_memory(slab, SLAB_SIZE, SLAB_VADDR_BASE);
+
+    /* Load guest bytes AFTER set_process_memory, same reason as the
+     * fixed guest_program above: set_process_memory owns the table
+     * injection into the low region of the slab, so the guest image
+     * must land after it to guarantee it isn't the one being
+     * overwritten (rather than relying on the two regions just
+     * happening not to overlap). */
     uint32_t entry = 0, esp = 0;
     const char* err = nullptr;
     if (!elf_load_into_slab(elf_data, elf_size, entry, esp, err)) {
@@ -752,9 +762,6 @@ extern "C" void test_module_run_elf(const TestSink* sink, TestResult* out,
 
     sink_line("[Phase 2] ELF parsed and loaded into test slab.\n");
 
-    bochs_register_io_callbacks(0, test_io_read, test_io_write, test_io_exit);
-    bochs_activate_slot(0);
-    bochs_set_process_memory(slab, SLAB_SIZE, SLAB_VADDR_BASE);
     bochs_cpu_set_eip(entry);
     bochs_cpu_set_esp(esp);
 
