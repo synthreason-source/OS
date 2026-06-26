@@ -6470,18 +6470,31 @@ private:
         prompt_visual_lines = seg_count;
     }
 
-    // Append a text fragment to the LAST buffer line (no wrapping, no
-    // newline). Used by push_wrapped_text to continue a line that a
-    // previous console_print() call left unterminated. If the line would
-    // overflow TERM_WIDTH the fragment spills onto a fresh line, so the
-    // ring of guest output still wraps cleanly.
-    void append_to_last_line(const char* frag) {
+    // Append a text fragment to the LAST buffer line (no re-wrapping of
+    // existing content, no newline). Used by push_wrapped_text to
+    // continue a line that a previous console_print() call left
+    // unterminated.
+    //
+    // `cols` is the window's CURRENT visible column count
+    // (term_cols_cont()), not TERM_WIDTH. TERM_WIDTH is just the size of
+    // the internal char buffer (120) — it has nothing to do with how
+    // many characters actually fit on screen. draw_string() draws
+    // glyphs with no clipping against the window border, so a
+    // continuation line that's allowed to grow up to TERM_WIDTH-1 chars
+    // (as it previously did) draws straight past the right edge of any
+    // window narrower than ~119 columns. That was the source of the
+    // "glitchy" streaking/overflow seen with chatty ELF guest output:
+    // each chunk just kept appending to the same on-screen row instead
+    // of wrapping at the column the window can actually display.
+    void append_to_last_line(const char* frag, int cols) {
         if (!frag || !*frag) return;
+        if (cols < 1) cols = 1;
+        if (cols > TERM_WIDTH - 1) cols = TERM_WIDTH - 1;
         if (line_count == 0) push_line("");
         char* line = buffer[line_count - 1];
         int len = (int)strlen(line);
         while (*frag) {
-            if (len >= TERM_WIDTH - 1) {
+            if (len >= cols) {
                 push_line("");
                 line = buffer[line_count - 1];
                 len  = 0;
@@ -6523,8 +6536,10 @@ private:
                 }
             } else if (!output_at_line_start) {
                 // Continue the open buffer line. We intentionally do NOT
-                // re-wrap here; append_to_last_line spills on overflow.
-                append_to_last_line(line);
+                // re-wrap already-drawn content here; append_to_last_line
+                // spills onto a fresh line once it hits the window's
+                // actual visible width.
+                append_to_last_line(line, cols);
             } else {
                 // Fresh line: word-wrap as before.
                 const char* q = line;
@@ -6828,16 +6843,41 @@ bool disk_has_password() {
 // Kill an ELF process
 void kill_elf_process(int slot) {
     if (slot >= 0 && slot < MAX_ELF_PROCESSES && elf_processes[slot].active) {
-        if (elf_processes[slot].memory_base) {
-            elf_free_bytes(elf_processes[slot].memory_base);
+        ElfProcess& proc = elf_processes[slot];
+
+        // Release the Bochs glue's mapping for this slot BEFORE freeing
+        // its backing memory. Without this the glue's SlotState keeps a
+        // mem_base pointer into memory we're about to free; the next
+        // bochs_activate_slot() on this slot (e.g. a new ELF reusing it)
+        // can then dereference that dangling pointer. tick_elf_processes'
+        // normal exit path and TerminalWindow::close() both already do
+        // this — killelf was the one teardown path that skipped it,
+        // which made `killelf` an unsafe way to recover from exactly the
+        // runaway/stuck-process situation it exists to handle.
+        bochs_release_slot(slot);
+
+        if (proc.memory_base) {
+            elf_free_bytes(proc.memory_base);
         }
-        if (elf_processes[slot].stack) {
-            elf_free_bytes(elf_processes[slot].stack);
+        if (proc.stack) {
+            elf_free_bytes(proc.stack);
         }
-        elf_processes[slot].active          = false;
-        elf_processes[slot].cpu_initialized = false;  // <-- ADD THIS
-        elf_processes[slot].memory_base     = nullptr;
-        elf_processes[slot].stack           = nullptr;
+
+        // If a terminal window is still waiting on this slot's input
+        // (captured_elf_slot), release it so the prompt comes back
+        // instead of the window silently swallowing further keystrokes
+        // for a process that no longer exists.
+        if (proc.terminal && proc.terminal->get_elf_slot() == slot) {
+            proc.terminal->captured_elf_slot = -1;
+        }
+
+        proc.active          = false;
+        proc.completed        = true;
+        proc.cpu_initialized = false;
+        proc.memory_base     = nullptr;
+        proc.stack           = nullptr;
+        proc.memory_size     = 0;
+        proc.terminal         = nullptr;
     }
 }
 
