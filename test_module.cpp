@@ -426,57 +426,67 @@ static bool elf_load_into_slab(const unsigned char* elf, unsigned int elf_size,
         err_out = "ELF: no program headers"; return false;
     }
 
-    unsigned min_vaddr = 0xFFFFFFFFu, max_vaddr = 0;
+    /* All size/offset arithmetic below is uint64_t on purpose: a
+     * malformed or corrupt ELF can have garbage p_vaddr/p_memsz/p_filesz
+     * values (e.g. near UINT32_MAX). Doing the bounds checks in plain
+     * 32-bit unsigned would let an addition like p_vaddr + p_memsz wrap
+     * around BEFORE the comparison runs, slipping an out-of-bounds
+     * slab[] write past the check entirely. uint64_t can't wrap for any
+     * combination of 32-bit inputs, so every check below is exact. */
+    uint64_t min_vaddr = 0xFFFFFFFFull, max_vaddr = 0;
     for (unsigned i = 0; i < e_phnum; ++i) {
         unsigned p = e_phoff + i * e_phentsize;
-        if (p + 32 > elf_size) { err_out = "ELF: phdr out of bounds"; return false; }
+        if ((uint64_t)p + 32 > elf_size) { err_out = "ELF: phdr out of bounds"; return false; }
         if (rd32(p + 0) != 1 /* PT_LOAD */) continue;
-        unsigned p_vaddr = rd32(p + 8);
-        unsigned p_memsz = rd32(p + 20);
+        uint64_t p_vaddr = rd32(p + 8);
+        uint64_t p_memsz = rd32(p + 20);
         if (p_memsz == 0) continue;
         if (p_vaddr < min_vaddr) min_vaddr = p_vaddr;
         if (p_vaddr + p_memsz > max_vaddr) max_vaddr = p_vaddr + p_memsz;
     }
-    if (min_vaddr == 0xFFFFFFFFu || max_vaddr <= min_vaddr) {
+    if (min_vaddr == 0xFFFFFFFFull || max_vaddr <= min_vaddr) {
         err_out = "ELF: no PT_LOAD segments"; return false;
     }
     if (e_entry < min_vaddr || e_entry >= max_vaddr) {
         err_out = "ELF: entry point outside image"; return false;
     }
 
-    unsigned image_size = max_vaddr - min_vaddr;
+    uint64_t image_size = max_vaddr - min_vaddr;
     /* Leave room above the image for a stack; ESP starts at the very
      * top of the slab and grows down, same convention as the fixed
      * guest. Require at least 64KB of headroom for the stack. */
-    if (ELF_LOAD_OFF + image_size + (64u * 1024u) > SLAB_SIZE) {
+    if ((uint64_t)ELF_LOAD_OFF + image_size + (64ull * 1024ull) > SLAB_SIZE) {
         err_out = "ELF: image too large for test slab (1MB cap)";
         return false;
     }
 
-    for (unsigned i = ELF_LOAD_OFF; i < ELF_LOAD_OFF + image_size; ++i)
+    for (uint64_t i = ELF_LOAD_OFF; i < ELF_LOAD_OFF + image_size; ++i)
         slab[i] = 0;
 
     for (unsigned i = 0; i < e_phnum; ++i) {
         unsigned p = e_phoff + i * e_phentsize;
         if (rd32(p + 0) != 1) continue;
-        unsigned p_offset = rd32(p + 4);
-        unsigned p_vaddr  = rd32(p + 8);
-        unsigned p_filesz = rd32(p + 16);
-        unsigned p_memsz  = rd32(p + 20);
+        uint64_t p_offset = rd32(p + 4);
+        uint64_t p_vaddr  = rd32(p + 8);
+        uint64_t p_filesz = rd32(p + 16);
+        uint64_t p_memsz  = rd32(p + 20);
         if (p_memsz == 0) continue;
         if (p_offset + p_filesz > elf_size) {
             err_out = "ELF: segment data out of bounds"; return false;
         }
-        unsigned dst = ELF_LOAD_OFF + (p_vaddr - min_vaddr);
+        if (p_filesz > p_memsz) {
+            err_out = "ELF: segment filesz exceeds memsz"; return false;
+        }
+        uint64_t dst = (uint64_t)ELF_LOAD_OFF + (p_vaddr - min_vaddr);
         if (dst + p_memsz > SLAB_SIZE) {
             err_out = "ELF: segment exceeds test slab"; return false;
         }
-        for (unsigned j = 0; j < p_filesz; ++j)
+        for (uint64_t j = 0; j < p_filesz; ++j)
             slab[dst + j] = elf[p_offset + j];
         /* bytes [p_filesz, p_memsz) are already zeroed above (.bss) */
     }
 
-    entry_out = SLAB_VADDR_BASE + ELF_LOAD_OFF + (e_entry - min_vaddr);
+    entry_out = (uint32_t)(SLAB_VADDR_BASE + ELF_LOAD_OFF + (e_entry - min_vaddr));
     esp_out   = SLAB_VADDR_BASE + SLAB_SIZE - 16;
     return true;
 }

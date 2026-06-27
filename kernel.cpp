@@ -7097,6 +7097,18 @@ void handle_command() {
 		const char* fname = get_arg(args, 0);
 		if (!fname) {
 			console_print("Usage: testelf <elf-file>\n");
+		} else if ([]{ for (int i = 0; i < MAX_ELF_PROCESSES; ++i)
+		                   if (elf_processes[i].active) return true;
+		               return false; }()) {
+			// testelf shares the same MAX_BOCHS_SLOTS pool as real
+			// running ELF processes, hardcodes slot 0 for its own use,
+			// and its cleanup calls bochs_reset_all_slots() — which
+			// wipes the mapping AND saved CPU snapshot for every slot,
+			// not just slot 0. Running it while anything else is live
+			// would silently corrupt or kill that process. Refuse
+			// instead of doing that quietly.
+			console_print("testelf: refusing -- another ELF is currently "
+			              "running (use killelf or wait for it to finish)\n");
 		} else {
 			fat_dir_entry_t entry;
 			uint32_t sector = 0, offset = 0;
@@ -7645,19 +7657,16 @@ void handle_command() {
     // sequence) before an ELF filename would actually do anything.
     // kernel_run_global_ctors_once() now guarantees BX_CPU(0)/bx_mem
     // are constructed before kernel_main ever reaches init_elf_system(),
-    // so that manual two-step dance is no longer required for
-    // correctness — it was leftover ceremony from before that fix
-    // existed. Do it automatically here instead, exactly once per
-    // window, so any ELF filename "just works" the first time it's
-    // typed, in any terminal, without extra steps.
+    // and init_elf_system() already registers IO callbacks for every
+    // slot at boot — so no per-window init is actually required for
+    // correctness here. (bochs_reset_done used to also gate a call to
+    // bochs_reset_all_slots() here, but that call is GLOBAL — it wipes
+    // every slot's mapping and CPU snapshot, not just this window's —
+    // so doing it on a per-window "first ELF run" basis meant any
+    // window's first launch could silently kill every other window's
+    // already-running ELF process. Removed; nothing here actually
+    // needed it.)
     else {
-
-        if (!bochs_reset_done) {
-            bochs_reset_done = true;
-            bochs_reset_all_slots();
-            for (int s = 0; s < MAX_ELF_PROCESSES; ++s)
-                bochs_register_io_callbacks(s, elf_io_read, elf_io_write, elf_io_exit);
-        }
 
         is_emulator_window = true;
 
