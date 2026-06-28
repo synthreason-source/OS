@@ -7046,20 +7046,29 @@ void handle_command() {
 		is_emulator_window = true;
 		title = "Bochs Emulator";
 
-		char* bochs_fname = get_arg(args, 0);
+		char* bochs_fname = nullptr;
+		char* bochs_args  = nullptr;
+		if (args) {
+			char* p = args;
+			while (*p == ' ') p++;
+			if (*p) {
+				// Find the end of the first token BEFORE calling
+				// get_arg, which null-terminates the buffer at exactly
+				// this boundary -- compute bochs_args first so it
+				// already points past that mutation point.
+				char* tok_end = p;
+				while (*tok_end && *tok_end != ' ') tok_end++;
+				char* rest = tok_end;
+				while (*rest == ' ') rest++;
+				if (*rest) bochs_args = rest;
+			}
+			bochs_fname = get_arg(args, 0);
+		}
+
 		if (!bochs_fname) {
 			console_print("=== Bochs i386 CPU emulator ===\n");
 			console_print("Just type an ELF filename to run it -- init happens automatically.\n");
 		} else {
-			// Re-split args so the ELF's own argv doesn't include its
-			// own filename: "bochs hello_tcc foo bar" should hand the
-			// guest "foo bar", not "hello_tcc foo bar".
-			char* bochs_args = args;
-			while (bochs_args && *bochs_args == ' ') bochs_args++;
-			while (bochs_args && *bochs_args && *bochs_args != ' ') bochs_args++;
-			while (bochs_args && *bochs_args == ' ') bochs_args++;
-			if (bochs_args && !*bochs_args) bochs_args = nullptr;
-
 			int s = load_and_execute_elf(bochs_fname, bochs_args, this);
 			if (s >= 0) captured_elf_slot = s;
 		}
