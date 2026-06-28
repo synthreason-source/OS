@@ -7295,7 +7295,12 @@ void handle_command() {
                 if (_elf_exists) {
                     console_print("ELF '"); console_print(out_name);
                     console_print("' already on disk. Running now...\n");
-                    if (load_and_execute_elf(out_name, nullptr, this) < 0) {
+                    is_emulator_window = true;
+                    title = "Bochs Emulator";
+                    int s = load_and_execute_elf(out_name, nullptr, this);
+                    if (s >= 0) {
+                        captured_elf_slot = s;
+                    } else {
                         console_print("cc: launch failed (see error above)\n");
                     }
                 }
@@ -7693,6 +7698,7 @@ void handle_command() {
     else {
 
         is_emulator_window = true;
+        title = "Bochs Emulator";
 
         // Run the ELF in-place; output flows to this window's
         // console_print via the elf_io_write callback chain.
