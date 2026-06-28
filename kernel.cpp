@@ -7037,16 +7037,31 @@ void handle_command() {
 					  "  monitor | inspector | about   -- open desktop apps\n");
 	}
 	else if (strcmp(command, "bochs") == 0) {
-		// Enter Bochs emulator mode in this terminal window.
-		// No new window is spawned. Type `reset` to initialise the CPU,
-		// then type an ELF filename to run it here.
-		if (is_emulator_window) {
-			console_print("bochs: already in emulator mode\n");
-		} else {
-			is_emulator_window = true;
-			title = "Bochs Emulator";
+		// Enter Bochs emulator mode in this terminal window. If a
+		// filename was given (the documented usage -- see hello_tcc.c's
+		// own header comment and the `help` text: "bochs <elf-file>
+		// [args]") run it immediately instead of silently discarding
+		// the argument and just printing a banner, which is all this
+		// branch used to do with anything typed after `bochs`.
+		is_emulator_window = true;
+		title = "Bochs Emulator";
+
+		char* bochs_fname = get_arg(args, 0);
+		if (!bochs_fname) {
 			console_print("=== Bochs i386 CPU emulator ===\n");
 			console_print("Just type an ELF filename to run it -- init happens automatically.\n");
+		} else {
+			// Re-split args so the ELF's own argv doesn't include its
+			// own filename: "bochs hello_tcc foo bar" should hand the
+			// guest "foo bar", not "hello_tcc foo bar".
+			char* bochs_args = args;
+			while (bochs_args && *bochs_args == ' ') bochs_args++;
+			while (bochs_args && *bochs_args && *bochs_args != ' ') bochs_args++;
+			while (bochs_args && *bochs_args == ' ') bochs_args++;
+			if (bochs_args && !*bochs_args) bochs_args = nullptr;
+
+			int s = load_and_execute_elf(bochs_fname, bochs_args, this);
+			if (s >= 0) captured_elf_slot = s;
 		}
 	}
 	else if (strcmp(command, "reset") == 0) {
