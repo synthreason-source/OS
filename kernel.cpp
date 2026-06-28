@@ -7784,7 +7784,25 @@ int load_and_execute_elf(const char* filename, const char* args, TerminalWindow*
             break;
         }
 
-        uint32_t memsize = imgsize + ELFHEAPSIZE;
+        // Reserve a dead-zone buffer offset before the real image so
+        // bochs_set_process_memory's table injection (GDT/IDT/stub,
+        // written into the first ~0x900 bytes of whatever buffer it's
+        // given) can NEVER land on the program's own code -- regardless
+        // of whether the ELF was linked with one of the project's
+        // special "slab_reserved" linker scripts (hello.ld/guest.ld/
+        // tcc_guest.ld) or with a normal toolchain that knows nothing
+        // about this kernel's memory layout. Without this, any ELF
+        // whose lowest PT_LOAD segment lands at buffer offset 0 -- which
+        // is every ELF, unless its own linker script manually pads --
+        // has its first instructions silently corrupted before it ever
+        // runs. vaddr_base shifts down by the same RESERVE amount, so
+        // the guest-visible absolute address of the real image (and
+        // therefore every address the compiler/linker baked into the
+        // program) is completely unchanged -- only the underlying
+        // buffer layout moves.
+        const uint32_t ELF_SLOT_RESERVE = 0x1000;
+
+        uint32_t memsize = imgsize + ELFHEAPSIZE + ELF_SLOT_RESERVE;
         if (memsize > 6 * 1024 * 1024) {
             if (terminal) terminal->console_print("ELF: image+heap exceeds 6MB limit\n");
             break;
@@ -7799,13 +7817,13 @@ int load_and_execute_elf(const char* filename, const char* args, TerminalWindow*
         memset(mem, 0, memsize);
         proc->memory_base = mem;
         proc->memory_size = memsize;
-        proc->vaddr_base = minvaddr;
+        proc->vaddr_base = minvaddr - ELF_SLOT_RESERVE;
         proc->vaddr_end = maxvaddr;
 
         bool copy_bad = false;
         for (int i = 0; i < ehdr.e_phnum; i++) {
             if (phdr[i].p_type != PT_LOAD) continue;
-            uint32_t dstoff = phdr[i].p_vaddr - minvaddr;
+            uint32_t dstoff = ELF_SLOT_RESERVE + (phdr[i].p_vaddr - minvaddr);
             if (dstoff + phdr[i].p_filesz > memsize) { copy_bad = true; break; }
             memcpy(mem + dstoff, elfdata + phdr[i].p_offset, phdr[i].p_filesz);
             if (phdr[i].p_memsz > phdr[i].p_filesz) {
