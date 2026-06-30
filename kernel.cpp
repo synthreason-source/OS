@@ -7069,8 +7069,17 @@ void handle_command() {
 			console_print("=== Bochs i386 CPU emulator ===\n");
 			console_print("Just type an ELF filename to run it -- init happens automatically.\n");
 		} else {
-			int s = load_and_execute_elf(bochs_fname, bochs_args, this);
-			if (s >= 0) captured_elf_slot = s;
+			// Was: load_and_execute_elf() + the per-window x86_tick lazy-init
+			// path, which gets the CPU stuck mid-tick (see breadcrumb trail:
+			// reaches 'T' -- about to call bochs_cpu_tick() -- and never
+			// reaches 't', with no HOST FAULT overlay, i.e. cpu_loop() itself
+			// wedges rather than faulting cleanly). The `test`/`reset`/
+			// `testelf` path through test_module_run_elf does not have this
+			// problem, so route general ELF execution through the same
+			// helper testelf uses instead of debugging two parallel,
+			// differently-laid-out loader implementations.
+			run_elf_via_test_module(bochs_fname);
+			(void)bochs_args; // not yet wired through to argv for the guest
 		}
 	}
 	else if (strcmp(command, "reset") == 0) {
@@ -7297,12 +7306,7 @@ void handle_command() {
                     console_print("' already on disk. Running now...\n");
                     is_emulator_window = true;
                     title = "Bochs Emulator";
-                    int s = load_and_execute_elf(out_name, nullptr, this);
-                    if (s >= 0) {
-                        captured_elf_slot = s;
-                    } else {
-                        console_print("cc: launch failed (see error above)\n");
-                    }
+                    run_elf_via_test_module(out_name);
                 }
             }
         }
@@ -7702,12 +7706,99 @@ void handle_command() {
 
         // Run the ELF in-place; output flows to this window's
         // console_print via the elf_io_write callback chain.
-        int s = load_and_execute_elf(command, args, this);
-        if (s >= 0) captured_elf_slot = s;
+        (void)args; // not yet wired through to argv for the guest
+        run_elf_via_test_module(command);
     }
 
     if(!in_editor) print_prompt();
 }
+	// Run an ELF file through the SAME test_module_run_elf path that
+	// `testelf`/`test`/`reset` use -- proven to actually reach a working
+	// tick loop, unlike the parallel ElfProcess/x86_tick machinery used
+	// by load_and_execute_elf (see the long debugging trail above
+	// load_and_execute_elf and around x86_tick's breadcrumb comments).
+	// This blocks the kernel for the duration of the run, same as
+	// `testelf`/`reset` already do -- it's a direct port of the testelf
+	// command body so `bochs <elf>` gets the same working code path
+	// instead of a parallel, currently-broken one.
+	bool run_elf_via_test_module(const char* fname) {
+		if (!fname) { console_print("Usage: bochs <elf-file> [args]\n"); return false; }
+
+		for (int i = 0; i < MAX_ELF_PROCESSES; ++i) {
+			if (elf_processes[i].active) {
+				console_print("bochs: refusing -- another ELF is currently "
+				              "running (use killelf or wait for it to finish)\n");
+				return false;
+			}
+		}
+
+		fat_dir_entry_t entry;
+		uint32_t sector = 0, offset = 0;
+		if (fat32_find_entry(fname, &entry, &sector, &offset) != 0) {
+			console_print("bochs: file not found\n");
+			return false;
+		}
+
+		char* elfdata = fat32_read_file_as_string(fname);
+		if (!elfdata) {
+			console_print("bochs: failed to read file\n");
+			return false;
+		}
+
+		test_vga_clear();
+		g_test_overlay_active = false;
+		g_test_overlay_owner  = (void*)this;
+
+		TestSink sink;
+		sink.put_line = test_sink_put_line;
+		sink.vga_cell = test_sink_vga_cell;
+		sink.flush    = test_sink_flush;
+
+		TestResult res;
+		res.phase1_ok = 0; res.phase2_ticked = 0;
+		res.guest_exit_seen = 0; res.guest_exit_code = 0;
+		res.guest_out_len = 0; res.guest_out[0] = 0;
+
+		// Same generous tick budget testelf uses -- real ELFs need far
+		// more than the built-in 32-tick self-test guest.
+		test_module_run_elf(&sink, &res,
+			(const unsigned char*)elfdata, entry.file_size, 200000);
+
+		delete[] elfdata;
+
+		// Same big-hammer cleanup `reset`/`testelf` use: wipe the test
+		// slab's CPU/glue state and re-register the normal per-window
+		// ELF I/O callbacks so all slots are usable again afterwards.
+		bochs_reset_all_slots();
+		for (int s = 0; s < MAX_ELF_PROCESSES; ++s)
+			bochs_register_io_callbacks(s, elf_io_read, elf_io_write, elf_io_exit);
+
+		g_test_overlay_active = false;
+		g_test_overlay_owner  = nullptr;
+
+		// The test module writes its own progress lines via the sink
+		// (which goes to the VGA overlay, not this terminal's console
+		// buffer) -- mirror the guest's actual stdout into the terminal
+		// so `bochs <elf>` behaves like a normal command that prints to
+		// the window the user is looking at.
+		if (res.guest_out_len > 0) {
+			console_print(res.guest_out);
+			if (res.guest_out[res.guest_out_len - 1] != '\n') console_print("\n");
+		}
+
+		if (!res.phase1_ok) {
+			console_print("bochs: FAILED (Bochs init)\n");
+			return false;
+		} else if (res.guest_exit_seen) {
+			console_print("bochs: process exited\n");
+			return true;
+		} else {
+			console_print("bochs: tick budget exhausted (guest still running)\n");
+			return false;
+		}
+	}
+
+
 int load_and_execute_elf(const char* filename, const char* args, TerminalWindow* terminal) {
     char* elfdata = fat32_read_file_as_string(filename);
     if (!elfdata) {
@@ -7932,7 +8023,8 @@ public:
     // Public wrapper so tcc_kernel.cpp's bridge can launch an ELF without
     // needing access to the private load_and_execute_elf directly.
     int exec_elf(const char* filename, const char* args) {
-        return load_and_execute_elf(filename, args, this);
+        (void)args; // not yet wired through to argv for the guest
+        return run_elf_via_test_module(filename) ? 0 : -1;
     }
 
     // is_emulator_window=true marks this terminal as a window that was
