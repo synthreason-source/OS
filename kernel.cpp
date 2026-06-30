@@ -8959,6 +8959,14 @@ static bool start_elf_process(int slot, const unsigned char* elf, unsigned int e
     ElfProcess& proc = elf_processes[slot];
     unsigned int entry = 0;
 
+    // Init the CPU FIRST, before any slot is activated or process memory
+    // registered -- this is the order test_module_run/test_module_run_elf
+    // use (Phase 1: bochs_cpu_init() with nothing else live yet; Phase 2:
+    // only then activate a slot and register memory). load_elf_image_to_slab
+    // below calls bochs_activate_slot + bochs_set_process_memory, so
+    // bochs_cpu_init() must run before that call, not after it.
+    bochs_cpu_init();
+
     // load_elf_image_to_slab calls bochs_activate_slot + bochs_set_process_memory
     // and populates proc.memory_base / proc.memory_size / proc.vaddr_base.
     if (!load_elf_image_to_slab(slot, elf, elf_size, entry)) return false;
@@ -8974,8 +8982,7 @@ static bool start_elf_process(int slot, const unsigned char* elf, unsigned int e
     proc.esp = stack_top - 16;
     proc.brk_addr = proc.vaddr_base + proc.memory_size - ELF_HEAP_SIZE;
 
-    // Finish CPU wiring: init once, then point at entry.
-    bochs_cpu_init();
+    // Finish CPU wiring: point at entry (init already done above, first).
     bochs_cpu_set_esp(proc.esp);
     bochs_cpu_set_eip(proc.entry_point);
     bochs_set_brk(slot, proc.brk_addr);
@@ -9044,28 +9051,43 @@ static bool x86_tick(int slot, int steps) {
     // its port-0xE9 output never reached the terminal display.
     if (!proc.active || proc.completed) return false;
 
-    bochs_activate_slot(slot);
-
     // Lazy first-time wiring. Both load paths (the "bb"/"x" command and
     // load_and_execute_elf) populate the ElfProcess struct and set
     // cpu_initialized=false. We finish the wiring on the first tick
     // because calling bochs_cpu_init() at kernel startup would reset the
     // virtual CPU before any process exists and triple-fault it.
+    //
+    // Ordering note: this used to call bochs_activate_slot() and
+    // bochs_set_process_memory() BEFORE bochs_cpu_init(), which is the
+    // reverse of the order the `test`/`reset`/`testelf` self-test path
+    // uses in test_module.cpp (Phase 1: bochs_cpu_init() FIRST, with no
+    // slot active and no process memory registered yet -- Phase 2 only
+    // afterwards calls register_io_callbacks/activate_slot/
+    // set_process_memory). That self-test path is the one that
+    // demonstrably works, so the general loader's lazy-init now mirrors
+    // its order exactly: init the CPU first, against no live mapping,
+    // then activate the slot and register this process's memory, then
+    // point EIP/ESP at the loaded image.
     if (!proc.cpu_initialized) {
         if (!proc.memory_base || proc.memory_size == 0) {
             proc.active    = false;
             proc.completed = true;
             return false;
         }
-        // Re-register the slab (the glue unregisters any previous mapping
-        // for the slot first, so this is idempotent). Then hardware-reset
-        // the CPU, enter protected mode, and point it at the guest entry.
+        // Hardware-reset the CPU FIRST, before this (or any) process's
+        // memory mapping is active -- same precondition Phase 1 of
+        // test_module_run/test_module_run_elf runs under.
         x86_breadcrumb(0, 'L');
+        bochs_cpu_init();
+        x86_breadcrumb(1, 'I');
+        // Now activate this slot and register the slab (the glue
+        // unregisters any previous mapping for the slot first, so this
+        // is idempotent), then point it at the guest entry -- mirrors
+        // Phase 2 of the test module exactly.
+        bochs_activate_slot(slot);
         bochs_set_process_memory(proc.memory_base, proc.memory_size,
                                  proc.vaddr_base);
-        x86_breadcrumb(1, 'M');
-        bochs_cpu_init();
-        x86_breadcrumb(2, 'I');
+        x86_breadcrumb(2, 'M');
         bochs_cpu_set_esp(proc.esp);
         x86_breadcrumb(3, 'S');
         bochs_cpu_set_eip(proc.entry_point);
@@ -9073,6 +9095,8 @@ static bool x86_tick(int slot, int steps) {
         bochs_set_brk(slot, proc.vaddr_base + proc.memory_size - ELFHEAPSIZE);
         x86_breadcrumb(5, 'B');
         proc.cpu_initialized = true;
+    } else {
+        bochs_activate_slot(slot);
     }
 
     x86_breadcrumb(6, 'T');
