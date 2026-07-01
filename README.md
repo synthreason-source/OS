@@ -9,7 +9,7 @@ SATA port selection with 'disk_select'
 
 
 
-TODO: elf's execution glitch free and elf terminal print output wordwrap enabled fully
+TODO: elf's execution glitch free and elf terminal print output wordwrap enabled fully(revert bochs to v2.0)
 
 TODO: bochs keyboard input working and correct bochs reset, inc bochs resume cpu state?
 
