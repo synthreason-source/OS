@@ -21,15 +21,17 @@
 // asked to yield. The kernel itself is never longjmp'd.
 // =====================================================================
 
-#include "bochs-2.7/bochs.h"
-#include "bochs-2.7/cpu/cpu.h"
-#include "bochs-2.7/memory/memory-bochs.h"
-#include "bochs-2.7/cpu/icache.h"
-#include "bochs-2.7/iodev/iodev.h"
-#include "bochs-2.7/pc_system.h"
-#include "bochs-2.7/plugin.h"
-#include "bochs-2.7/gui/siminterface.h"
-#include "bochs-2.7/gui/paramtree.h"
+// NOTE (Bochs 2.0 port): this old codebase has NO include guards in
+// bochs.h/cpu.h/pc_system.h/memory.h/siminterface.h/etc - you are
+// meant to include "bochs.h" exactly once and let its own internal
+// chain pull in everything (cpu, memory, pc_system, siminterface,
+// iodev, plugin, ...). Re-including any of those directly, as this
+// file used to for the Bochs 2.7 layout, causes hard "redefinition of
+// class ..." errors. cpu/icache.h and gui/paramtree.h don't exist in
+// 2.0 at all (icache.h was removed/merged; the paramtree.cc split
+// happened in 2.5 - in 2.0 those classes live in gui/siminterface.h,
+// which bochs.h already includes).
+#include "bochs.h"
 #include <stdarg.h>
 #include <cstring>     // std::strstr — needed by routed get_param_string()
 
@@ -39,17 +41,29 @@
 extern "C" void bochs_guest_exit(int code);
 
 // ═══ logfunctions ═══════════════════════════════════════════════════════════
+//
+// NOTE (Bochs 2.0 port): logfunctions/iofunctions have a noticeably
+// different member list here than 2.7 - notably put() takes a plain
+// (non-const) char*, there's no two-arg put() overload, fatal() takes
+// 4 args (no leading facility int), there's no separate fatal1() or
+// warn() method at all, and iofunctions::out() takes 5 args (with an
+// explicit "level" alongside "facility"). A few methods declared in
+// the class body have no inline definition and would need one if
+// ever called from linked code (pass, settype, the init_log()
+// overloads, set_log_prefix, add_logfn) - stubbed cheaply below so we
+// never hit a surprise "undefined reference" at link time.
 
 int logfunctions::default_onoff[N_LOGLEV] = {0, 0, 0, 0};
 
 logfunctions::logfunctions(void)                  { prefix = nullptr; logio = nullptr; }
 logfunctions::logfunctions(class iofunctions* io) { prefix = nullptr; logio = io; }
 logfunctions::~logfunctions(void) {}
-void logfunctions::put(const char*)              {}
-void logfunctions::put(const char*, const char*) {}
+void logfunctions::put(char*)                    {}
 void logfunctions::info (const char*, ...)       {}
 void logfunctions::error(const char*, ...)       {}
+void logfunctions::pass (const char*, ...)       {}
 void logfunctions::ldebug(const char*, ...)      {}
+void logfunctions::settype(int)                  {}
 
 // Panic / fatal paths. All three end up at the same place: ask the
 // active slot to exit. cpu_loop will yield on its next iteration and
@@ -86,15 +100,13 @@ void logfunctions::panic (const char* fmt, ...) {
     bx_capture_panic(fmt);
     bochs_guest_exit(-1);
 }
-void logfunctions::fatal1(const char* fmt, ...) {
-    bx_capture_panic(fmt);
-    bochs_guest_exit(-2);
-}
-void logfunctions::fatal (int, const char* p, const char* fmt, va_list, int) {
+// Bochs 2.0's logfunctions::fatal takes (prefix, fmt, ap, exit_status) -
+// no separate fatal1() exists at all in this version (that was a later
+// addition), and there's no leading facility/level int either.
+void logfunctions::fatal (const char* p, const char* fmt, va_list, int) {
     bx_capture_panic(fmt ? fmt : p);
     bochs_guest_exit(-3);
 }
-void logfunctions::warn(int, const char*, const char*, va_list) {}
 void logfunctions::ask (int, const char*, const char*, va_list) {}
 void logfunctions::setio(class iofunctions* io) { logio = io; }
 
@@ -103,18 +115,29 @@ iofunctions::iofunctions(FILE*)         {}
 iofunctions::iofunctions(int)           {}
 iofunctions::iofunctions(const char*)   {}
 iofunctions::~iofunctions(void)         {}
-void iofunctions::out(int, const char*, const char*, va_list) {}
+// 5 args in 2.0: (facility, level, prefix, fmt, ap) - 2.7 dropped
+// "level" as a separate parameter from this particular call, but 2.0
+// still has it.
+void iofunctions::out(int, int, const char*, const char*, va_list) {}
 void iofunctions::set_log_action(int, int) {}
+void iofunctions::init_log(const char*) {}
+void iofunctions::init_log(int)         {}
+void iofunctions::init_log(FILE*)       {}
+void iofunctions::set_log_prefix(const char*) {}
+void iofunctions::add_logfn(logfunc_t*) {}
 
 static logfunc_t s_log;
 logfunc_t* genlog            = &s_log;
 logfunc_t* pluginlog         = &s_log;
-logfunc_t* siminterface_log  = &s_log;
 iofunc_t*  io                = nullptr;
 
 // ═══ bochs globals ═══════════════════════════════════════════════════════════
+//
+// NOTE (Bochs 2.0 port): bx_cpu_c has no user-declared constructor in
+// this version (implicit default only) - the old "bx_cpu(0)" call
+// doesn't match anything and was removed.
 
-BX_CPU_C        bx_cpu(0);
+BX_CPU_C        bx_cpu;
 static BX_CPU_C* s_cpu_ptr = &bx_cpu;
 BX_CPU_C**      bx_cpu_array = &s_cpu_ptr;
 
@@ -124,138 +147,40 @@ Bit8u           bx_cpu_count = 1;
 Bit32u          apic_id_mask = 0;
 extern int      simulate_xapic;
 
-// ─── BX_MEM_C::init_memory override ───────────────────────────────────────
-//
-// Stock init_memory in libmemory.a touches SIM->get_param_bool to read
-// the PCI-enabled flag. We have a working dummy param tree so that
-// part is actually safe now — but stock also tries to call
-// register_state() which builds a savestate tree we never use. We
-// keep our own implementation because:
-//   (a) it's smaller / simpler to audit;
-//   (b) it makes the order of allocations explicit, which matters
-//       for the kernel heap which is finite;
-//   (c) it lets us hard-code pci_enabled=false without depending on
-//       a SIM-> round-trip.
-//
-// Step list:
-//   1. Allocate vector[] of size (host + BIOSROMSZ + EXROMSIZE + 4K),
-//      4 KiB aligned.
-//   2. Set up rom/bogus pointers; zero the ROM shadow region.
-//   3. Allocate blocks table for the guest range.
-//   4. Allocate memory_handlers table for the full physical address
-//      space (BX_MEM_HANDLERS entries — see header).
-//   5. NULL-initialise the handlers table.
-//   6. Hard-code pci_enabled = false.
-//   7. Initialise misc fields (ROM flags, SMRAM flags, memory_type).
+// NOTE (Bochs 2.0 port): BX_MEM_C::init_memory(int) and
+// ::register_state() used to be overridden here for 2.7, where stock
+// init_memory touched SIM->get_param_bool(). In 2.0, memory/
+// misc_mem.cc's stock init_memory(int memsize) is completely
+// self-contained (allocates via alloc_vector_aligned -> operator
+// new[], which routes through our malloc() stub in bochs_cstubs.c;
+// zeroes memory; marks the ROM area 0xff) with no SIM-> dependency at
+// all, and register_state() doesn't exist as a method on this
+// version's bx_mem_c in the first place. Both overrides have been
+// removed - the version already linked in via libmemory.a is used
+// directly. See mapping_register()/mapping_unregister() in
+// bochs_glue.cpp for how per-slot memory now gets swapped into
+// bx_mem.vector directly, since this version's bx_mem_c also has no
+// registerMemoryHandlers()-style per-range handler mechanism at all
+// (that was added well after 2.0) - the flat vector/len model here
+// only supports one physical memory image at a time, which is
+// swapped on every slot activation instead.
 
-// Pull in the visible-halt helper from bochs_glue.cpp. We use it
-// here so a silent allocator failure inside Bochs-init becomes a
-// visible "Z<digit>" marker on screen instead of a NULL-pointer
-// memset that corrupts physical memory.
-extern "C" void live_breadcrumb(int slot, char ch);
-static void bochs_infra_panic_halt(char tag) {
-    live_breadcrumb(50, 'Z');
-    live_breadcrumb(51, tag);
-    for (;;) { __asm__ volatile ("cli; hlt"); }
-}
-
-void BX_MEM_C::init_memory(Bit64u guest, Bit64u host)
-{
-    #ifndef BX_MEM_HANDLERS
-    #define BX_MEM_HANDLERS ((BX_CONST64(1) << BX_PHY_ADDRESS_WIDTH) >> 20)
-    #endif
-    #ifndef BX_MEM_VECTOR_ALIGN
-    #define BX_MEM_VECTOR_ALIGN 4096
-    #endif
-
-    // (1) vector[].
-    //
-    // The compiler optimises away upstream's `if (actual_vector == 0)
-    // BX_PANIC(...)` because operator new in standard C++ throws
-    // bad_alloc rather than returning NULL — so the compiler treats
-    // the NULL branch as unreachable. Our freestanding malloc DOES
-    // return NULL when out of pool, and that silent NULL was being
-    // propagated into a bogus rom = &vector[host] = 0x1000000 memset
-    // that wrote 2.1 MiB of 0xFF into stray physical memory before
-    // wedging. The check below is in our own TU (compiled with
-    // -fno-exceptions but the optimiser can't see through us), so it
-    // survives optimisation. If it ever fires we halt visibly at
-    // slot 50/51 with 'Z' and a tag char; that's the signal to either
-    // shrink the host arg or grow BHEAP_BYTES in bochs_cstubs.c.
-    BX_MEM_THIS vector = alloc_vector_aligned(
-        host + BIOSROMSZ + EXROMSIZE + 4096, BX_MEM_VECTOR_ALIGN);
-    if (!BX_MEM_THIS vector) {
-        bochs_infra_panic_halt('1');   // Z1 = vector alloc failed
-    }
-
-    // (2) rom/bogus pointers, zero ROM shadow.
-    BX_MEM_THIS len       = guest;
-    BX_MEM_THIS allocated = host;
-    BX_MEM_THIS rom       = &BX_MEM_THIS vector[host];
-    BX_MEM_THIS bogus     = &BX_MEM_THIS vector[host + BIOSROMSZ + EXROMSIZE];
-    memset(BX_MEM_THIS rom, 0xff, BIOSROMSZ + EXROMSIZE + 4096);
-
-    // (3) blocks table.
-    Bit32u num_blocks = (Bit32u)(BX_MEM_THIS len / BX_MEM_BLOCK_LEN);
-    if (num_blocks == 0) num_blocks = 1;
-    BX_MEM_THIS blocks      = new Bit8u*[num_blocks];
-    if (!BX_MEM_THIS blocks) {
-        bochs_infra_panic_halt('3');   // Z3 = blocks[] alloc failed
-    }
-    for (Bit32u i = 0; i < num_blocks; i++) BX_MEM_THIS blocks[i] = nullptr;
-    BX_MEM_THIS used_blocks = 0;
-
-    // (4 & 5) memory_handlers table — NULL-initialised. The glue layer
-    // calls registerMemoryHandlers to install entries as slots become
-    // active.
-    BX_MEM_THIS memory_handlers =
-        new struct memory_handler_struct *[BX_MEM_HANDLERS];
-    if (!BX_MEM_THIS memory_handlers) {
-        bochs_infra_panic_halt('4');   // Z4 = memory_handlers alloc failed
-    }
-    for (Bit32u idx = 0; idx < BX_MEM_HANDLERS; idx++) {
-        BX_MEM_THIS memory_handlers[idx] = nullptr;
-    }
-
-    // (6) hard-code pci_enabled = false.
-    BX_MEM_THIS pci_enabled = false;
-
-    // (7) field assignments.
-    BX_MEM_THIS bios_write_enabled = 0;
-    BX_MEM_THIS bios_rom_addr      = 0xffff0000;
-    BX_MEM_THIS flash_type         = 0;
-    BX_MEM_THIS flash_status       = 0x80;
-    BX_MEM_THIS smram_available    = 0;
-    BX_MEM_THIS smram_enable       = 0;
-    BX_MEM_THIS smram_restricted   = 0;
-    for (int i = 0; i < 65; i++) BX_MEM_THIS rom_present[i] = 0;
-    for (int i = 0; i <= BX_MEM_AREA_F0000; i++) {
-        BX_MEM_THIS memory_type[i][0] = 0;
-        BX_MEM_THIS memory_type[i][1] = 0;
-    }
-}
-
-// register_state is required by the link but never reached (we don't
-// save state). Stock builds a savestate tree under a nullptr root,
-// which is unsafe here.
-void BX_MEM_C::register_state() {}
 
 // ═══ bx_devices_c ════════════════════════════════════════════════════════════
+//
+// NOTE (Bochs 2.0 port): this version's bx_devices_c has a completely
+// different member layout (pluginXxx/stubXxx device pointers, a
+// private read_handler_id[] table, etc. - see iodev/iodev.h) with no
+// read_port_to_handler/io_read_handlers/sound_device_count members at
+// all. We don't link the stock iodev/devices.cc (too much unrelated
+// device-model machinery), so this constructor just needs to leave a
+// blank, safe object; init_stubs() and exit() don't exist as methods
+// on this version's class at all and have been dropped.
 
 bx_devices_c bx_devices;
 
-bx_devices_c::bx_devices_c() {
-    read_port_to_handler  = nullptr;
-    write_port_to_handler = nullptr;
-    io_read_handlers.next         = nullptr;
-    io_read_handlers.handler_name = nullptr;
-    io_write_handlers.next         = nullptr;
-    io_write_handlers.handler_name = nullptr;
-    for (unsigned i = 0; i < BX_MAX_IRQS; i++) irq_handler_name[i] = nullptr;
-    sound_device_count = 0;
-}
+bx_devices_c::bx_devices_c() {}
 bx_devices_c::~bx_devices_c() {}
-void bx_devices_c::init_stubs() {}
 
 extern "C" void bochs_guest_putc(char c);
 // bochs_guest_exit already forward-declared at top.
@@ -271,257 +196,85 @@ void   bx_devices_c::outp(Bit16u port, Bit32u val, unsigned) {
     // All other ports are silently dropped.
 }
 void bx_devices_c::reset(unsigned) {}
-void bx_devices_c::exit()          {}
 
 // ═══ bx_pc_system_c ══════════════════════════════════════════════════════════
 //
-// We pull in bochs's own pc_system.cc as a separate object (see the
-// Makefile) for the constructor + initialize() + timer arithmetic.
-// The methods below are the ones we override to stub out the parts
-// we don't want — countdownEvent / Reset / timer ticks. Timer-driven
-// events are not used in this kernel.
+// NOTE (Bochs 2.0 port): pc_system.cc (linked as bochs_pc_system.o -
+// see the Makefile) already provides real, complete implementations
+// of countdownEvent/deactivate_timer/activate_timer_ticks/
+// register_timer_ticks/exit/init_ips/etc. for THIS version, and none
+// of them touch SIM-> at all (confirmed by inspection) - so unlike
+// the 2.7 port, there is nothing here to override; doing so would
+// just be duplicate-definition link errors against pc_system.cc's
+// own symbols. There's also no Reset(unsigned)/kill_bochs_request
+// member on bx_pc_system_c in this version at all (kill_bochs_request
+// moved to bx_cpu_c - see bochs_glue.cpp) and no initialize() (use
+// init_ips() instead, which pc_system.cc already provides).
 
 bx_pc_system_c bx_pc_system;
-
-void bx_pc_system_c::countdownEvent() {}
-int  bx_pc_system_c::Reset(unsigned) { return 0; }
-void bx_pc_system_c::deactivate_timer(unsigned) {}
-void bx_pc_system_c::activate_timer_ticks(unsigned, Bit64u, bool) {}
-int  bx_pc_system_c::register_timer_ticks(void*, bx_timer_handler_t,
-                                          Bit64u, bool, bool,
-                                          const char*) {
-    return 0;
-}
 
 // ═══ Param tree globals ══════════════════════════════════════════════════════
 
 bx_list_c* root_param = nullptr;
 
-// ═══ KernelSIM — minimal bx_simulator_interface_c implementation ═════════════
+// ═══ bx_list_c text UI stubs ═════════════════════════════════════════════════
 //
-// Every virtual in bx_simulator_interface_c must have a body here or
-// the vtable will be incomplete and the linker emits "undefined
-// reference to vtable for KernelSIM". Methods that should never be
-// called (quit_sim) tell the active slot to exit; everything else
-// returns a safe zero/null/false.
+// NOTE (Bochs 2.0 port): bx_list_c::text_print/text_ask are declared
+// (behind #if BX_UI_TEXT, which this build has enabled) in
+// gui/siminterface.h but only ever implemented in gui/control.cc,
+// which we don't link (it pulls in a text-mode config menu we have
+// no use for). Nothing in cpu/, memory/, fpu/, or our own glue code
+// calls these - they're only reachable via the vtable, which still
+// needs real symbols to link.
+void bx_list_c::text_print(FILE*) {}
+int  bx_list_c::text_ask(FILE*, FILE*) { return -1; }
 
+// ═══ bx_simulator_interface_c base constructor ═══════════════════════════════
+//
+// NOTE (Bochs 2.0 port): this used to come from linking
+// gui/siminterface.cc directly (as bochs_paramtree.o - see the
+// Makefile history). That pulls in the WHOLE translation unit as one
+// object file, including bx_real_sim_c (a separate, unrelated,
+// heavyweight class in the same file) and its dependencies on
+// bx_options/bx_find_bochsrc/bx_read_configuration/etc - a whole
+// bochsrc-parsing subsystem we have no use for and don't link. The
+// only thing our KernelSIM (which derives from bx_simulator_
+// interface_c) actually needs from that file is this base
+// constructor, which is empty in the real source anyway - providing
+// it directly here lets us drop gui/siminterface.cc from the build
+// entirely.
+bx_simulator_interface_c::bx_simulator_interface_c() {}
+
+
+//
+// NOTE (Bochs 2.0 port): unlike 2.7, every virtual in this version's
+// bx_simulator_interface_c has a safe no-op default body written
+// directly in the header (gui/siminterface.h) - none are pure
+// virtual. A derived class only needs to override what it actually
+// cares about; everything else falls through to the base class's
+// default automatically. This also means bx_id (an enum), not
+// "const char* name", is how parameters are looked up in this
+// version - and confirmed by inspection, nothing in cpu/, memory/,
+// or fpu/ ever calls SIM->get_param_*() at all in Bochs 2.0 (that
+// CPUID-database-driven config path was added in 2.5+), so the
+// elaborate dummy-param plumbing this file used to carry for 2.7 is
+// dead weight here and has been dropped entirely.
 class KernelSIM : public bx_simulator_interface_c {
 public:
-    // ── lifecycle ────────────────────────────────────────────────────────
-    void quit_sim(int)              override { bochs_guest_exit(-4); }
-    int  get_exit_code()            override { return 0; }
-    void set_quit_context(jmp_buf*) override {}
-
-    // ── init flags ───────────────────────────────────────────────────────
-    bool get_init_done()       override { return false; }
-    int  set_init_done(bool)   override { return 0; }
-    void reset_all_param()     override {}
-
-    // ── param tree (declared here; defined below the class) ──────────────
-    bx_param_c*        get_param       (const char*, bx_param_c* = nullptr) override;
-    bx_param_num_c*    get_param_num   (const char*, bx_param_c* = nullptr) override;
-    bx_param_string_c* get_param_string(const char*, bx_param_c* = nullptr) override;
-    bx_param_bool_c*   get_param_bool  (const char*, bx_param_c* = nullptr) override;
-    bx_param_enum_c*   get_param_enum  (const char*, bx_param_c* = nullptr) override;
-    unsigned           gen_param_id()  override { return 0; }
-
-    // ── logging ──────────────────────────────────────────────────────────
-    int          get_n_log_modules()              override { return 0; }
-    const char*  get_logfn_name(int)              override { return ""; }
-    int          get_logfn_id(const char*)        override { return 0; }
-    const char*  get_prefix(int)                  override { return ""; }
-    int          get_log_action(int, int)         override { return 0; }
-    void         set_log_action(int, int, int)    override {}
-    int          get_default_log_action(int)      override { return 0; }
-    void         set_default_log_action(int, int) override {}
-    const char*  get_action_name(int)             override { return ""; }
-    int          is_action_name(const char*)      override { return 0; }
-    const char*  get_log_level_name(int)          override { return ""; }
-    int          get_max_log_level()              override { return 0; }
-
-    // ── RC / log file paths ──────────────────────────────────────────────
-    int get_default_rc(char*, int)         override { return -1; }
-    int read_rc(const char*)               override { return -1; }
-    int write_rc(const char*, int)         override { return -1; }
-    int get_log_file(char*, int)           override { return -1; }
-    int set_log_file(const char*)          override { return -1; }
-    int get_log_prefix(char*, int)         override { return -1; }
-    int set_log_prefix(const char*)        override { return -1; }
-    int get_debugger_log_file(char*, int)  override { return -1; }
-    int set_debugger_log_file(const char*) override { return -1; }
-
-    // ── event / notify ───────────────────────────────────────────────────
-    void      set_notify_callback(bxevent_handler, void*)   override {}
-    void      get_notify_callback(bxevent_handler*, void**) override {}
-    BxEvent*  sim_to_ci_event(BxEvent* e)                   override { return e; }
-    int       log_dlg(const char*, int, const char*, int)   override { return 0; }
-    void      log_msg(const char*, int, const char*)        override {}
-    void      set_log_viewer(bool)                          override {}
-    bool      has_log_viewer() const                        override { return false; }
-
-    // ── ask / dialog ─────────────────────────────────────────────────────
-    int  ask_param(bx_param_c*)                                        override { return 0; }
-    int  ask_param(const char*)                                        override { return 0; }
-    int  ask_filename(const char*, int, const char*, const char*, int) override { return -1; }
-    int  ask_yes_no(const char*, const char*, bool the_default)        override { return (int)the_default; }
-    void message_box(const char*, const char*)                         override {}
-
-    // ── periodic / refresh ───────────────────────────────────────────────
-    void periodic()      override {}
-    void refresh_ci()    override {}
-    void refresh_vga()   override {}
-    void handle_events() override {}
-
-    // ── disk / PCI / device queries ──────────────────────────────────────
-    int         create_disk_image(const char*, int, bool) override { return -1; }
-    bx_param_c* get_first_hd()                            override { return nullptr; }
-    bx_param_c* get_first_cdrom()                         override { return nullptr; }
-    bool        is_pci_device(const char*)                override { return false; }
-    bool        is_agp_device(const char*)                override { return false; }
-
-    // ── config interface ─────────────────────────────────────────────────
-    void register_configuration_interface(const char*, config_interface_callback_t, void*) override {}
-    int  configuration_interface(const char*, ci_command_t)                                override { return 0; }
-    int  begin_simulation(int, char*[])                                                    override { return 0; }
-
-    // ── runtime config ───────────────────────────────────────────────────
-    int  register_runtime_config_handler(void*, rt_conf_handler_t) override { return 0; }
-    void unregister_runtime_config_handler(int)                    override {}
-    void update_runtime_options()                                  override {}
-
-    // ── threading ────────────────────────────────────────────────────────
-    void set_sim_thread_func(is_sim_thread_func_t f) override { is_sim_thread_func = f; }
-    bool is_sim_thread()        override { return false; }
-    bool is_wx_selected() const override { return false; }
-
-    // ── GUI mode ─────────────────────────────────────────────────────────
-    void set_debug_gui(bool)            override {}
-    bool has_debug_gui() const          override { return false; }
-    void set_display_mode(disp_mode_t)  override {}
-    bool test_for_text_console()        override { return false; }
-
-    // ── addon options ────────────────────────────────────────────────────
-    bool    register_addon_option(const char*, addon_option_parser_t,
-                                  addon_option_save_t)         override { return false; }
-    bool    unregister_addon_option(const char*)               override { return false; }
-    bool    is_addon_option(const char*)                       override { return false; }
-    Bit32s  parse_addon_option(const char*, int, char*[])      override { return 0; }
-    Bit32s  save_addon_options(FILE*)                          override { return 0; }
-
-    // ── statistics ───────────────────────────────────────────────────────
-    void       init_statistics()     override {}
-    void       cleanup_statistics()  override {}
-    bx_list_c* get_statistics_root() override { return nullptr; }
-
-    // ── save / restore ───────────────────────────────────────────────────
-    void       init_save_restore()                                       override {}
-    void       cleanup_save_restore()                                    override {}
-    bool       save_state(const char*)                                   override { return false; }
-    bool       restore_config()                                          override { return false; }
-    bool       restore_logopts()                                         override { return false; }
-    bool       restore_hardware()                                        override { return false; }
-    bx_list_c* get_bochs_root()                                          override { return nullptr; }
-    bool       restore_bochs_param(bx_list_c*, const char*, const char*) override { return false; }
-
-    // ── plugin ctrl ──────────────────────────────────────────────────────
-    bool opt_plugin_ctrl(const char*, bool) override { return false; }
-
-    // ── NIC / USB helpers ────────────────────────────────────────────────
-    void init_std_nic_options(const char*, bx_list_c*)                    override {}
-    int  parse_param_from_list(const char*, const char*, bx_list_c*)      override { return 0; }
-    int  parse_nic_params(const char*, const char*, bx_list_c*)           override { return 0; }
-    int  parse_usb_port_params(const char*, const char*, int, bx_list_c*) override { return 0; }
-    int  split_option_list(const char*, const char*, char**, int)         override { return 0; }
-    int  write_param_list(FILE*, bx_list_c*, const char*, bool)           override { return 0; }
-    int  write_usb_options(FILE*, int, bx_list_c*)                        override { return 0; }
+    void quit_sim(int) override { bochs_guest_exit(-4); }
 };
 
 static KernelSIM s_sim;
 bx_simulator_interface_c* SIM = &s_sim;
 
-// ─── Dummy param objects (sized for real CPUID consumers) ─────────────────
-//
-// libcpu.a's generic_cpuid.cc and friends do things like
-//
-//   const char* brand  = (const char*)SIM->get_param_string(BXPN_BRAND_STRING)->getptr();
-//   const Bit8u* vend  = (const Bit8u*)SIM->get_param_string(BXPN_VENDOR_STRING)->getptr();
-//   unsigned model     = SIM->get_param_enum(BXPN_CPU_MODEL)->get();
-//   unsigned apic      = SIM->get_param_enum(BXPN_CPUID_APIC)->get();
-//
-// A nullptr return on get_param_enum was triple-faulting init. The
-// vendor/brand strings get read with [i] indexing up to 12 / 48 bytes,
-// so they need backing storage of that size, not the old 1-byte dummy.
-//
-// All objects are constructed by the __init_array pass before kernel_main.
-// We are linked with bochs_paramtree.o (paramtree.cc) so their real
-// constructors are present.
-
-// (a) bool param. get() → false. Used for all the BXPN_CPUID_MMX,
-//     BXPN_CPUID_XSAVE, BXPN_CPUID_AES… off-by-default switches.
-static bx_param_bool_c   s_dummy_bool   (nullptr, "dummy_b", "dummy_b", "dummy_b", 0, 0);
-
-// (b) num param. get() → 0. Used for BXPN_CPUID_LEVEL (becomes 0 →
-//     no Pentium/P6 enables, only X87+486), BXPN_CPUID_VMX → 0, etc.
-static bx_param_num_c    s_dummy_num    (nullptr, "dummy_n", "dummy_n", "dummy_n",
-                                         0, 0xFFFFFFFFll, 0, 0);
-
-// (c) String params. We split into three:
-//   - vendor: needs 12+ bytes; CPUID leaf 0 reads ebx/edx/ecx as 12 chars.
-//   - brand:  needs 48+ bytes; CPUID 0x80000002..4 reads 16 chars each.
-//   - generic: empty path / MSR file / etc — must just be a non-null,
-//              null-terminated, readable buffer.
-//
-// "GenuineIntel" matches what the bx_generic CPUID actually emits when
-// no custom vendor is set; we keep it ASCII so any future strcmp lands
-// somewhere sane. The brand is padded to 47 chars + NUL to fill all
-// three brand-string CPUID leaves.
-static bx_param_string_c s_dummy_vendor (nullptr, "vendor", "vendor", "vendor",
-                                         "GenuineIntel",                     16);
-static bx_param_string_c s_dummy_brand  (nullptr, "brand",  "brand",  "brand",
-                                         "           Bochs CPU                           ", 64);
-static bx_param_string_c s_dummy_string (nullptr, "dummy_s","dummy_s","dummy_s",
-                                         "",                                 16);
-
-// (d) Enum param.
-//
-//   - BXPN_CPU_MODEL: 0 → bx_cpudb_bx_generic → create_bx_generic_cpuid (the
-//     only model that doesn't pull a cpudb/ creator we haven't linked).
-//   - BXPN_CPUID_APIC: 0 → BX_CPUID_SUPPORT_LEGACY_APIC. Inside generic_cpuid
-//     the panic check `if (cpu_level < 6 && apic != LEGACY && apic != XAPIC)`
-//     requires LEGACY (0) or XAPIC (1) when cpu_level is 0 (our default).
-//   - BXPN_CPUID_SIMD: 0 → BX_CPUID_SUPPORT_NOSSE. SIMD is off, no panics.
-//
-// All three want default 0, so a single enum object suffices. Choices
-// only need a non-null array terminated by NULL; the [val-min] lookup
-// only happens via get_selected() which Bochs init paths don't call.
-static const char* s_zero_choices[] = { "zero", nullptr };
-static bx_param_enum_c s_dummy_enum  (nullptr, "dummy_e", "dummy_e", "dummy_e",
-                                      s_zero_choices, 0, 0);
-
-bx_param_c*        KernelSIM::get_param       (const char*, bx_param_c*) { return &s_dummy_num;    }
-bx_param_num_c*    KernelSIM::get_param_num   (const char*, bx_param_c*) { return &s_dummy_num;    }
-bx_param_bool_c*   KernelSIM::get_param_bool  (const char*, bx_param_c*) { return &s_dummy_bool;   }
-bx_param_enum_c*   KernelSIM::get_param_enum  (const char*, bx_param_c*) { return &s_dummy_enum;   }
-
-// String lookup: route brand/vendor names to the wider buffers, everything
-// else to the generic empty string. We can't use std::strstr from a
-// freestanding TU, but bochs_infra.cpp IS the system-header TU — std::
-// strstr is available.
-bx_param_string_c* KernelSIM::get_param_string(const char* n, bx_param_c*) {
-    if (n) {
-        // BXPN names like "cpuid.vendor_string", "cpuid.brand_string".
-        if (std::strstr(n, "vendor")) return &s_dummy_vendor;
-        if (std::strstr(n, "brand"))  return &s_dummy_brand;
-    }
-    return &s_dummy_string;
-}
-
 // ═══ bx_user_quit ════════════════════════════════════════════════════════════
 bool bx_user_quit = false;
 
 // ═══ bx_gui stub ═════════════════════════════════════════════════════════════
+// NOTE (Bochs 2.0 port): bx_gui_c has no cleanup() method in this
+// version - dropped. bx_gui stays nullptr regardless (we never
+// instantiate a real bx_gui_c), so nothing would call it anyway.
 bx_gui_c* bx_gui = nullptr;
-void bx_gui_c::cleanup() {}
 
 // ═══ Misc ════════════════════════════════════════════════════════════════════
 void print_statistics_tree(bx_param_c*, int) {}
@@ -562,20 +315,24 @@ void operator delete(void*, unsigned int, std::align_val_t) noexcept {}
 
 // ═══ Plugin function pointers ════════════════════════════════════════════════
 // All null — we don't load any plugins.
-int  (*pluginRegisterIOReadHandler)        (void*, ioReadHandler_t,  unsigned,           const char*, Bit8u) = nullptr;
-int  (*pluginRegisterIOWriteHandler)       (void*, ioWriteHandler_t, unsigned,           const char*, Bit8u) = nullptr;
-int  (*pluginUnregisterIOReadHandler)      (void*, ioReadHandler_t,  unsigned,           Bit8u)              = nullptr;
-int  (*pluginUnregisterIOWriteHandler)     (void*, ioWriteHandler_t, unsigned,           Bit8u)              = nullptr;
-int  (*pluginRegisterIOReadHandlerRange)   (void*, ioReadHandler_t,  unsigned, unsigned, const char*, Bit8u) = nullptr;
-int  (*pluginRegisterIOWriteHandlerRange)  (void*, ioWriteHandler_t, unsigned, unsigned, const char*, Bit8u) = nullptr;
-int  (*pluginUnregisterIOReadHandlerRange) (void*, ioReadHandler_t,  unsigned, unsigned, Bit8u)              = nullptr;
-int  (*pluginUnregisterIOWriteHandlerRange)(void*, ioWriteHandler_t, unsigned, unsigned, Bit8u)              = nullptr;
-int  (*pluginRegisterDefaultIOReadHandler) (void*, ioReadHandler_t,  const char*, Bit8u) = nullptr;
-int  (*pluginRegisterDefaultIOWriteHandler)(void*, ioWriteHandler_t, const char*, Bit8u) = nullptr;
+//
+// NOTE (Bochs 2.0 port): plugin.h in this version declares these as
+// `extern` (we're providing the storage/definition here, which must
+// match its declared signature exactly), and it only declares FOUR
+// IO-handler pointers - no Unregister*Handler or *HandlerRange
+// variants exist in 2.0 at all (those were added later), so those
+// definitions have been dropped. The last parameter of all four is
+// `unsigned len`, not `Bit8u` as in 2.7.
+int  (*pluginRegisterIOReadHandler)        (void*, ioReadHandler_t,  unsigned, const char*, unsigned) = nullptr;
+int  (*pluginRegisterIOWriteHandler)       (void*, ioWriteHandler_t, unsigned, const char*, unsigned) = nullptr;
+int  (*pluginRegisterDefaultIOReadHandler) (void*, ioReadHandler_t,  const char*, unsigned) = nullptr;
+int  (*pluginRegisterDefaultIOWriteHandler)(void*, ioWriteHandler_t, const char*, unsigned) = nullptr;
 void (*pluginRegisterIRQ)       (unsigned, const char*) = nullptr;
 void (*pluginUnregisterIRQ)     (unsigned, const char*) = nullptr;
 void (*pluginSetHRQ)            (unsigned)              = nullptr;
 void (*pluginSetHRQHackCallback)(void (*)(void))        = nullptr;
 
-// ═══ bx_pci_device_c stubs ═══════════════════════════════════════════════════
-Bit32u bx_pci_device_c::pci_read_handler (Bit8u, unsigned)        { return 0; }
+// NOTE (Bochs 2.0 port): bx_pci_device_c doesn't exist as a class in
+// this version - PCI support here (BX_PCI_SUPPORT, off by default) is
+// plain #ifdef'd code, not a device-model class hierarchy, so there is
+// nothing to stub out here. Dropped.

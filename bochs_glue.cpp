@@ -46,11 +46,13 @@
 //       The kernel main loop is never longjmp'd into.
 // =====================================================================
 
-#include "bochs-2.7/bochs.h"
-#include "bochs-2.7/cpu/cpu.h"
-#include "bochs-2.7/memory/memory-bochs.h"
-#include "bochs-2.7/pc_system.h"
-typedef unsigned int uint32_t;
+// NOTE (Bochs 2.0 port): see bochs_infra.cpp for why this only
+// includes "bochs.h" now - the old Bochs 2.7-layout direct includes
+// of pc_system.h/memory-bochs.h caused "redefinition of class ..."
+// errors, since none of these headers have include guards in 2.0.
+#include "bochs.h"
+
+
 // __dso_handle / C++ ABI no-ops. Weak so we can coexist with
 // bochs_infra.cpp's identical definition.
 __attribute__((weak)) void* __dso_handle = nullptr;
@@ -87,7 +89,10 @@ extern "C" {
 // slot's view of the single global BX_CPU_C so we can multiplex it.
 
 struct SavedCpuState {
-    Bit32u  gen_reg[BX_GENERAL_REGISTERS];
+    // NOTE (Bochs 2.0 port): BX_GENERAL_REGISTERS isn't defined in
+    // this version's headers (gen_reg[] is just hardcoded to 8
+    // entries in cpu.h) - hardcoded here to match.
+    Bit32u  gen_reg[8];
     Bit32u  eip;
     Bit32u  prev_rip;
     Bit32u  eflags;
@@ -107,21 +112,32 @@ struct SavedCpuState {
     Bit32u  cr3;
     Bit32u  cr4;
 
-    // Async / activity state. Must be 0/ACTIVE before re-entering
-    // cpu_loop.
+    // NOTE (Bochs 2.0 port): bx_cpu_c has no activity_state member at
+    // all in this version (HLT/sleep-state modeling was added later).
+    // Field kept for struct-layout stability elsewhere in the file,
+    // but it's no longer read from or written to a real cpu-> field -
+    // always 0.
     Bit32u  activity_state;
     Bit32u  async_event;
 
     // Lazy-EFLAGS shadow. Bochs evaluates OF/SF/ZF/AF/PF/CF lazily
-    // from this struct; setEFlagsOSZAPC only writes the decoded bits
-    // back into cpu->eflags, it does NOT restore result/auxbits. Without
-    // saving these, a slot switch leaves the shadow holding the OTHER
-    // slot's last arithmetic operation — causing conditional jumps
-    // (test/jne in put_str's null-terminator loop) to read the wrong ZF
-    // and mis-terminate, producing "HELLO WO" (8 chars) instead of the
-    // full "HELLO WORLD\n".
-    Bit32u  oszapc_result;
-    Bit32u  oszapc_auxbits;
+    // from this struct; setEFlags only writes the decoded bits back
+    // into cpu->eflags.val32, it does NOT restore the lazy shadow.
+    // Without saving this, a slot switch leaves the shadow holding
+    // the OTHER slot's last arithmetic operation — causing
+    // conditional jumps (test/jne in put_str's null-terminator loop)
+    // to read the wrong ZF and mis-terminate, producing "HELLO WO"
+    // (8 chars) instead of the full "HELLO WORLD\n".
+    //
+    // NOTE (Bochs 2.0 port): 2.0's bx_lf_flags_entry (lazy_flags.h)
+    // stores width-specific op1/op2/result fields (op1_32/result_32
+    // etc, plus an "instr" tag) rather than 2.7's unified
+    // result+auxbits pair - the two layouts aren't reducible to each
+    // other field-by-field. Storing the real struct wholesale side-
+    // steps that entirely: it's POD, so a plain struct assignment
+    // (cs.oszapc = cpu->oszapc) is a byte-exact save/restore
+    // regardless of which fields Bochs actually used internally.
+    bx_lf_flags_entry oszapc;
 
     bool    valid;        // true once we've saved this slot at least once
 };
@@ -181,110 +197,65 @@ static void flush_after_switch ();
 // behaviour of an x86 system with no physical RAM at the address.
 // =====================================================================
 
-static bool mem_read_handler(bx_phy_address addr, unsigned len,
-                             void* data, void* /*param*/) {
-    if (g_active_slot < 0 || g_active_slot >= MAX_BOCHS_SLOTS) {
-        __builtin_memset(data, 0, len);
-        return true;
-    }
-    SlotState& s = g_slots[g_active_slot];
-    if (!s.mem_base) {
-        __builtin_memset(data, 0, len);
-        return true;
-    }
+// NOTE (Bochs 2.0 port): mem_read_handler/mem_write_handler used to
+// be registered with BX_MEM(0)->registerMemoryHandlers() here. That
+// mechanism doesn't exist in Bochs 2.0 (see the note above
+// mapping_register() below), so these are dead code with no caller
+// and have been removed - they also used the bx_phy_address type,
+// which doesn't exist in this version (bx_address is the equivalent).
 
-    Bit64u a    = (Bit64u)addr;
-    Bit64u base = (Bit64u)s.vaddr_base;
-    Bit64u end  = base + (Bit64u)s.mem_size;
-
-    // Reject anything that doesn't fit fully inside the slot's window.
-    // Full containment, not just "starts inside" — prevents a buffer
-    // overrun off the end of mem_base on a multi-byte access.
-    if (a < base || a + (Bit64u)len > end) {
-        __builtin_memset(data, 0, len);
-        return true;
-    }
-
-    __builtin_memcpy(data, s.mem_base + (Bit32u)(a - base), len);
-    return true;
-}
-
-static bool mem_write_handler(bx_phy_address addr, unsigned len,
-                              void* data, void* /*param*/) {
-    if (g_active_slot < 0 || g_active_slot >= MAX_BOCHS_SLOTS) return true;
-    SlotState& s = g_slots[g_active_slot];
-    if (!s.mem_base) return true;
-
-    Bit64u a    = (Bit64u)addr;
-    Bit64u base = (Bit64u)s.vaddr_base;
-    Bit64u end  = base + (Bit64u)s.mem_size;
-
-    if (a < base || a + (Bit64u)len > end) return true;  // drop
-
-    __builtin_memcpy(s.mem_base + (Bit32u)(a - base), data, len);
-    return true;
-}
-
-// Direct-access handler used by Bochs's TLB / prefetch fast path.
-// Returning a host pointer here lets Bochs cache a page-granular
-// mapping in its TLB; the CPU then reads/writes through that pointer
-// without re-entering us. That is what we want for performance, but
-// it has two safety constraints:
-//
-//   D1. The returned pointer must remain valid until the next
-//       TLB flush. We guarantee that by issuing TLB_flush() on every
-//       slot switch (flush_after_switch) and on every mapping change
-//       (mapping_unregister, mapping_register).
-//
-//   D2. The pointer plus a full page (4 KiB) must still be inside
-//       our allocation. Otherwise the TLB-cached pointer could slide
-//       off the end of the slab on a wide unaligned access. We
-//       enforce this by refusing direct access for any address whose
-//       containing 4 KiB page is not fully covered by the slot.
-static Bit8u* mem_da_handler(bx_phy_address addr, unsigned /*rw*/,
-                             void* /*param*/) {
-    if (g_active_slot < 0 || g_active_slot >= MAX_BOCHS_SLOTS) return nullptr;
-    SlotState& s = g_slots[g_active_slot];
-    if (!s.mem_base) return nullptr;
-
-    Bit64u a    = (Bit64u)addr;
-    Bit64u base = (Bit64u)s.vaddr_base;
-    Bit64u end  = base + (Bit64u)s.mem_size;
-
-    if (a < base || a >= end) return nullptr;
-
-    // Page containment check. If the containing 4 KiB page extends
-    // past the end of our slab — or starts before our slab — refuse
-    // direct access. Bochs falls back to mem_read_handler /
-    // mem_write_handler, which clamp per access.
-    Bit64u page_start = a & ~(Bit64u)0xFFFu;
-    Bit64u page_end   = page_start + 0x1000u;
-    if (page_end > end)        return nullptr;
-    if (page_start < base)     return nullptr;
-
-    return s.mem_base + (Bit32u)(a - base);
-}
+// Direct-access handler used by Bochs's TLB / prefetch fast path in
+// later Bochs versions. Bochs 2.0 has no such per-range handler hook
+// at all (registerMemoryHandlers()/unregisterMemoryHandlers() and the
+// mem_read_handler/mem_write_handler/mem_da_handler mechanism above
+// don't exist in this version's bx_mem_c - see memory/memory.h). All
+// physical accesses in 2.0 go straight through bx_mem.vector[addr]
+// with no interception point, so mem_read_handler/mem_write_handler/
+// mem_da_handler above are dead code here and unused; the bounds-
+// checked translation they used to do doesn't have anywhere to plug
+// into anymore.
 
 // =====================================================================
-// Mapping registration
+// Mapping registration (Bochs 2.0)
 // =====================================================================
-
+//
+// NOTE (Bochs 2.0 port): bx_mem_c here is just { actual_vector,
+// vector, len, megabytes } - a single flat physical-memory image, no
+// per-range handler registration at all (that mechanism was added
+// well after 2.0). Since bx_cpu/bx_mem are both single global
+// instances that get repointed at whichever slot is "active" (rather
+// than true concurrent per-slot memory), the direct equivalent is to
+// repoint bx_mem.vector itself at the slot's backing buffer on every
+// activation:
+//
+//   bx_mem.vector = s.mem_base - s.vaddr_base
+//     so that vector[addr] == mem_base[addr - vaddr_base] for any
+//     guest-physical addr, matching what the old handler-based
+//     translation did for in-range accesses.
+//   bx_mem.len = s.vaddr_base + s.mem_size
+//     upper bound for whatever internal range checks bx_mem_c does.
+//
+// CAVEAT: unlike the old handler-based approach, there is no per-
+// access bounds clamp any more for addresses below vaddr_base or at/
+// past vaddr_base+mem_size - a guest that strays outside its own
+// window will read/write adjacent host memory instead of getting a
+// clean "no RAM here" response. A well-behaved guest confined to its
+// own slot's window is unaffected; this is a real behavioral gap
+// worth runtime-testing against a misbehaving/malicious guest.
 static void mapping_register(SlotState& s) {
     if (!s.mem_base || !s.mem_size || s.mapped) return;
-    BX_MEM(0)->registerMemoryHandlers(
-        nullptr,
-        mem_read_handler, mem_write_handler, mem_da_handler,
-        (bx_phy_address)s.vaddr_base,
-        (bx_phy_address)(s.vaddr_base + s.mem_size - 1));
+    bx_mem.vector = s.mem_base - s.vaddr_base;
+    bx_mem.len    = (size_t)s.vaddr_base + (size_t)s.mem_size;
     s.mapped = true;
 }
 
 static void mapping_unregister(SlotState& s) {
     if (!s.mapped) return;
-    BX_MEM(0)->unregisterMemoryHandlers(
-        nullptr,
-        (bx_phy_address)s.vaddr_base,
-        (bx_phy_address)(s.vaddr_base + s.mem_size - 1));
+    // Single global bx_mem - nothing to "unregister" per se now that
+    // there's no per-range table; just stop claiming this slot owns
+    // the mapping. The next mapping_register() (for whichever slot
+    // becomes active next) will repoint bx_mem.vector again before
+    // any guest code runs.
     s.mapped = false;
 }
 
@@ -400,11 +371,17 @@ static void slot_save_cpu(SlotState& s) {
     BX_CPU_C* cpu = BX_CPU(0);
     SavedCpuState& cs = s.cpu;
 
-    for (int i = 0; i < BX_GENERAL_REGISTERS; ++i)
+    // NOTE (Bochs 2.0 port): BX_GENERAL_REGISTERS isn't defined here;
+    // gen_reg[] is hardcoded to 8 entries in cpu.h.
+    for (int i = 0; i < 8; ++i)
         cs.gen_reg[i] = cpu->gen_reg[i].dword.erx;
 
-    cs.eip      = cpu->gen_reg[BX_32BIT_REG_EIP].dword.erx;
-    cs.prev_rip = (Bit32u)cpu->prev_rip;
+    // NOTE (Bochs 2.0 port): EIP is NOT part of gen_reg[] in this
+    // version - it lives in its own cpu->dword.eip field (see
+    // cpu/cpu.h). prev_rip -> prev_eip (renamed; still bx_address/
+    // Bit32u on a 32-bit build).
+    cs.eip      = cpu->dword.eip;
+    cs.prev_rip = (Bit32u)cpu->prev_eip;
     // EFLAGS: must use read_eflags() (which calls force_flags()) — NOT
     // a direct field read. Bochs implements OF/SF/ZF/AF/PF/CF lazily:
     // each flag-setting instruction writes its result into the oszapc
@@ -426,24 +403,29 @@ static void slot_save_cpu(SlotState& s) {
     cs.gdtr = cpu->gdtr;
     cs.idtr = cpu->idtr;
 
+    // NOTE (Bochs 2.0 port): cr0 here is a plain struct with BOTH a
+    // raw val32 field and individually-cached bitfield members (pg,
+    // pe, ts, ...) that Bochs's own hot paths (paging.cc, io.cc)
+    // check directly rather than deriving from val32 - reading
+    // val32 for a snapshot is safe (see slot_restore_cpu for why
+    // restoring needs more care than a raw field write).
     cs.cr0 = cpu->cr0.val32;
     cs.cr2 = (Bit32u)cpu->cr2;
     cs.cr3 = (Bit32u)cpu->cr3;
-    cs.cr4 = cpu->cr4.val32;
+    cs.cr4 = cpu->cr4.registerValue;
 
-    cs.activity_state = cpu->activity_state;
+    // NOTE (Bochs 2.0 port): no activity_state member on bx_cpu_c in
+    // this version - always 0 (see the field comment in SavedCpuState).
+    cs.activity_state = 0;
     cs.async_event    = cpu->async_event;
 
     // Save the raw lazy-EFLAGS shadow. read_eflags() above forced the
     // decoded bits into cs.eflags, but the shadow struct itself must
-    // also be snapshotted so slot_restore_cpu can put it back exactly —
-    // setEFlagsOSZAPC re-decodes the bits, but that round-trip is lossy
-    // for operations whose oszapc encoding is not uniquely invertible
-    // from the six flag bits alone (e.g. different ADD results can
-    // produce the same OSZAPC pattern). Restoring result/auxbits
-    // directly preserves the exact lazy encoding the guest left behind.
-    cs.oszapc_result  = cpu->oszapc.result;
-    cs.oszapc_auxbits = cpu->oszapc.auxbits;
+    // also be snapshotted so slot_restore_cpu can put it back exactly.
+    // NOTE (Bochs 2.0 port): whole-struct copy (see SavedCpuState's
+    // oszapc field comment for why this is more correct here than
+    // trying to save individual 2.7-shaped result/auxbits fields).
+    cs.oszapc = cpu->oszapc;
 
     cs.valid = true;
 }
@@ -452,59 +434,56 @@ static void slot_restore_cpu(SlotState& s) {
     BX_CPU_C* cpu = BX_CPU(0);
     SavedCpuState& cs = s.cpu;
 
-    for (int i = 0; i < BX_GENERAL_REGISTERS; ++i)
+    for (int i = 0; i < 8; ++i)
         cpu->gen_reg[i].dword.erx = cs.gen_reg[i];
 
-    cpu->gen_reg[BX_32BIT_REG_EIP].dword.erx = cs.eip;
-    cpu->prev_rip = cs.prev_rip;
-    // EFLAGS: write the saved value into cpu->eflags AND into the
-    // lazy oszapc shadow. The previous direct assignment
-    // `cpu->eflags = cs.eflags` only wrote the eflags field; the
-    // oszapc shadow was left in whatever state the cross-slot
-    // hardware reset (in bochs_activate_slot) had left it
-    // (post-reset SET_FLAGS_OSZAPC_LOGIC_32(1)). The next
-    // conditional-jump instruction of the resumed slot reads from
-    // oszapc, not from cpu->eflags — so it would see post-reset
-    // flag values rather than the slot's actually-saved flags.
+    cpu->dword.eip = cs.eip;
+    cpu->prev_eip  = cs.prev_rip;
+    // EFLAGS: write the saved value into cpu->eflags.val32 AND into
+    // the lazy oszapc shadow. A bare val32 write only sets the raw
+    // eflags field; the oszapc shadow would be left in whatever state
+    // the cross-slot hardware reset (in bochs_activate_slot) had left
+    // it. The next conditional-jump instruction of the resumed slot
+    // reads from oszapc, not from cpu->eflags directly — so it would
+    // see post-reset flag values rather than the slot's actually-
+    // saved flags.
     //
-    // setEFlagsOSZAPC writes the OF/SF/ZF/AF/PF/CF bits from the
-    // saved eflags back into the lazy shadow. We then assign the
-    // FULL eflags into cpu->eflags directly to also catch the
-    // non-OSZAPC bits (IF, DF, TF, IOPL, NT, RF, VM, AC, VIF, VIP,
-    // ID, plus the reserved-1 bit at position 1). We deliberately
-    // do NOT call setEFlags() here because setEFlags has side
-    // effects (invalidate_prefetch_q on RF transitions,
-    // handleInterruptMaskChange on IF transitions,
-    // handleAlignmentCheck on AC, handleCpuModeChange on VM) that
-    // are about to be re-done anyway by the
-    // flush_after_switch -> handleCpuContextChange call. Doing
-    // them twice is wasteful and the IF-mask handler in particular
-    // examines other CPU state that's still mid-restore at this
-    // point. The current direct write + lazy-shadow update is the
-    // minimal correct sequence.
-    cpu->eflags   = cs.eflags;
-    cpu->setEFlagsOSZAPC(cs.eflags);
-    // Restore the raw lazy shadow AFTER setEFlagsOSZAPC. The call above
-    // writes decoded flag bits into oszapc using SET_FLAGS_OSZAPC_LOGIC_32,
-    // which is correct for the OSZAPC flag values but does NOT reproduce
-    // the exact result/auxbits the guest's last arithmetic instruction
-    // left there. Overwrite now with the snapshotted values so the next
-    // conditional jump sees this slot's own lazy state, not a re-encoded
-    // approximation of it.
-    cpu->oszapc.result  = cs.oszapc_result;
-    cpu->oszapc.auxbits = cs.oszapc_auxbits;
+    // NOTE (Bochs 2.0 port): 2.7's setEFlagsOSZAPC() macro doesn't
+    // exist here; setEFlags(Bit32u) is this version's real accessor -
+    // it sets eflags.val32 plus the VM_cached/protectedMode/v8086Mode
+    // derived state in one call (see cpu.h), so a separate raw
+    // eflags.val32 assignment isn't needed alongside it.
+    cpu->setEFlags(cs.eflags);
+    // Restore the raw lazy shadow AFTER setEFlags. setEFlags does not
+    // touch oszapc at all in this version, so this isn't strictly
+    // "overwriting a re-encoded approximation" the way it was for
+    // 2.7's setEFlagsOSZAPC - but we still want the exact snapshotted
+    // shadow (not whatever the last real instruction on this cpu
+    // happened to leave there) so the next conditional jump sees this
+    // slot's own lazy state.
+    cpu->oszapc = cs.oszapc;
 
     for (int i = 0; i < 6; ++i) cpu->sregs[i] = cs.sregs[i];
 
     cpu->gdtr = cs.gdtr;
     cpu->idtr = cs.idtr;
 
-    cpu->cr0.val32 = cs.cr0;
+    // NOTE (Bochs 2.0 port): cr0 has individually-cached bitfields
+    // (pg, pe, ts, ...) alongside val32 that Bochs's own hot paths
+    // check directly (see paging.cc, io.cc) rather than deriving from
+    // val32 on the fly - a bare `cr0.val32 = cs.cr0` write (like the
+    // 2.7 version of this function did) would leave those stale.
+    // SetCR0(Bit32u) is this version's real accessor (used by Bochs's
+    // own MOV-CR0 instruction handler in proc_ctrl.cc) and keeps
+    // everything in sync correctly, including any paging-mode-switch
+    // side effects a genuine CR0 write should have.
+    cpu->SetCR0(cs.cr0);
     cpu->cr2       = cs.cr2;
     cpu->cr3       = cs.cr3;
-    cpu->cr4.val32 = cs.cr4;
+    cpu->cr4.registerValue = cs.cr4;
 
-    cpu->activity_state = cs.activity_state;
+    // NOTE (Bochs 2.0 port): no activity_state member on bx_cpu_c in
+    // this version - nothing to restore.
     cpu->async_event    = cs.async_event;
 }
 
@@ -515,7 +494,7 @@ static void slot_restore_cpu(SlotState& s) {
 static void slot_prime_cpu(SlotState& s) {
     SavedCpuState& cs = s.cpu;
 
-    for (int i = 0; i < BX_GENERAL_REGISTERS; ++i) cs.gen_reg[i] = 0;
+    for (int i = 0; i < 8; ++i) cs.gen_reg[i] = 0;
     cs.eip      = 0;
     cs.prev_rip = 0;
     cs.eflags   = 0x00000002u;      // reserved bit 1 must be 1
@@ -563,8 +542,17 @@ static void slot_prime_cpu(SlotState& s) {
 
     cs.activity_state = 0;    // BX_ACTIVITY_STATE_ACTIVE
     cs.async_event    = 0;
-    cs.oszapc_result  = 1;   // 1 = all-flags-clear: ZF=SF=CF=OF=0 (result != 0)
-    cs.oszapc_auxbits = 0;
+    // NOTE (Bochs 2.0 port): synthesize "all flags clear" (ZF=SF=CF=
+    // OF=0) directly as a real bx_lf_flags_entry, since there's no
+    // live cpu->oszapc to copy from here (this is priming a not-yet-
+    // run slot) and this version has no unified result/auxbits pair
+    // to set directly - see SavedCpuState's oszapc field comment.
+    // BX_INSTR_OR32(0, 1) -> result_32=1: OR always clears CF/OF, a
+    // nonzero positive result clears ZF and SF too.
+    cs.oszapc.instr    = BX_INSTR_OR32;
+    cs.oszapc.op1_32   = 0;
+    cs.oszapc.op2_32   = 1;
+    cs.oszapc.result_32 = 1;
     cs.valid          = true;
 
     s.cpu_primed = true;
@@ -596,45 +584,40 @@ static void slot_prime_cpu(SlotState& s) {
 // handleInterruptMaskChange + handleAlignmentCheck + handleCpuModeChange
 // (+ SSE/AVX mode on cpu-level>=6). This is exactly what a slot switch
 // needs.
+// NOTE (Bochs 2.0 port): this version has no dynamic-translation
+// instruction cache at all (that optimization was added well after
+// 2.0), so there's nothing for flushICaches() to invalidate - the
+// stale-decoded-instruction problem the original comment describes
+// doesn't exist here in the first place. handleCpuContextChange() and
+// updateFetchModeMask() don't exist either; the cpu_mode/
+// protectedMode/v8086Mode resync they used to trigger now happens
+// automatically inside SetCR0() itself (see slot_restore_cpu, which
+// calls it instead of a raw cr0.val32 write) - SetCR0 calls
+// enter_protected_mode() and updates protectedMode/v8086Mode/realMode
+// directly whenever CR0.PE transitions, which is the real fix for the
+// "stuck interpreting CS as real-mode" bug this function was guarding
+// against. What's left to do by hand is exactly what the pre-
+// handleCpuContextChange version of this function did: TLB_flush +
+// invalidate_prefetch_q.
 static void flush_after_switch() {
     BX_CPU_C* cpu = BX_CPU(0);
 
-    // (a) Flush the instruction cache. THIS IS ESSENTIAL.
-    //
-    // The iCache stores *decoded* instructions keyed by guest physical
-    // address (+ a fetchModeMask). A slot switch replaces the physical
-    // memory contents under the CPU — slot 0's program and slot 1's
-    // program can sit at the very same guest physical addresses. The
-    // iCache cannot tell them apart, so without a flush, getICacheEntry()
-    // returns a STALE decoded entry from a previous slot (or from the
-    // post-reset / prewarm state) and never calls serveICacheMiss to
-    // re-decode. The symptom is a cpu_loop that spins forever:
-    // getICacheEntry hands back a bogus zero-length entry, RIP advances
-    // by ilen()==0, the no-op "instruction" executes, repeat — guest EIP
-    // frozen, no fault, no port output.
-    //
-    // flushICaches() does iCache.flushICacheEntries(), sets the
-    // STOP_TRACE async bit, and resets pageWriteStampTable — the full,
-    // correct "physical memory changed behind your back" reset.
-    flushICaches();
+    // (a) Flush the TLB. Physical memory access is bx_mem.vector,
+    // which mapping_register() just repointed at a different slot's
+    // backing buffer - any cached guest-virtual -> host-physical
+    // translations from the PREVIOUS slot are now pointing at the
+    // wrong data and must be dropped. Bit32u argument matches
+    // bx_bool's real underlying type in this version; 1 = also
+    // invalidate global pages.
+    cpu->TLB_flush(1);
 
-    // (b) Recompute cpu_mode / fetchModeMask / lazy-eflags / stack cache
-    // / interrupt-mask shadow from the architectural registers that
-    // slot_restore_cpu poked directly. Without this cpu_mode stays
-    // BX_MODE_IA32_REAL even though we set CR0.PE=1.
-    cpu->handleCpuContextChange();
+    // (b) Drop the prefetch queue so the next fetch re-reads from the
+    // (possibly just-swapped) memory instead of serving stale bytes.
+    cpu->invalidate_prefetch_q();
 
-    // (c) updateFetchModeMask depends on CS.cache.d_b and cpu_mode;
-    // ensure the fetch decoder picks the 32-bit tables.
-    cpu->updateFetchModeMask();
-
-    // (d) Clear sticky async-yield flags from the previous run. Do this
-    // AFTER flushICaches() — flushICaches sets BX_ASYNC_EVENT_STOP_TRACE
-    // in async_event, and we don't want a spurious yield on the first
-    // tick. The STOP_TRACE bit only matters for handler-chaining traces,
-    // which we don't use.
+    // (c) Clear sticky async-yield flags from the previous run.
     cpu->async_event = 0;
-    bx_pc_system.kill_bochs_request = 0;
+    BX_CPU(0)->kill_bochs_request = 0;
 }
 
 // =====================================================================
@@ -648,11 +631,11 @@ static void flush_after_switch() {
 // the parts we don't have — config file loading, plugin init, device
 // init, BIOS load):
 //
-//   1. bx_pc_system.initialize(ips)        — sets m_ips so timing math
+//   1. bx_pc_system.init_ips(ips)        — sets m_ips so timing math
 //                                             doesn't divide by zero.
 //   2. BX_MEM(0)->init_memory(g, h)        — allocate vector / blocks /
 //                                             memory_handlers table.
-//   3. BX_CPU(0)->initialize()             — register CPUID params and
+//   3. BX_CPU(0)->init(BX_MEM(0))             — register CPUID params and
 //                                             build cpuid feature info.
 //   4. BX_CPU(0)->reset(BX_RESET_HARDWARE) — bring CPU to architectural
 //                                             reset state.
@@ -668,7 +651,7 @@ static void bochs_global_init() {
     live_breadcrumb(30, '0');
 
     // (1) pc_system: only stores ips and zeros a few timer fields.
-    bx_pc_system.initialize(50000000u);
+    bx_pc_system.init_ips(50000000u);
 
     // (1a) Enable the A20 line. CRITICAL.
     //
@@ -688,9 +671,11 @@ static void bochs_global_init() {
 
     live_breadcrumb(31, '1');
 
-    // (2) memory subsystem. Our overridden init_memory in
-    // bochs_infra.cpp doesn't touch SIM-> at all, so this is safe.
-    BX_MEM(0)->init_memory(16u * 1024u * 1024u, 16u * 1024u * 1024u);
+    // (2) memory subsystem. Bochs 2.0's stock init_memory(int memsize)
+    // (memory/misc_mem.cc, already linked via libmemory.a) doesn't
+    // touch SIM-> at all, so this is safe to call directly - single
+    // arg in this version, not the (guest, host) pair 2.7 used.
+    BX_MEM(0)->init_memory(16 * 1024 * 1024);
     live_breadcrumb(32, '2');
 
     // (3) CPU feature registration. With the dummy-param objects in
@@ -702,11 +687,11 @@ static void bochs_global_init() {
     // DIAGNOSTIC: the trail used to jump 32 -> 33 across this whole call,
     // so a hang reported only "somewhere after init_memory". Bracket the
     // two heavy sub-steps separately:
-    //   ...2 a        frozen  => hang is INSIDE BX_CPU(0)->initialize()
+    //   ...2 a        frozen  => hang is INSIDE BX_CPU(0)->init(BX_MEM(0))
     //   ...2 a 3 b    frozen  => hang is INSIDE BX_CPU(0)->reset()
     //   ...2 a 3 b 4         => both completed, init is fine
     live_breadcrumb(38, 'a');           // entering initialize()
-    BX_CPU(0)->initialize();
+    BX_CPU(0)->init(BX_MEM(0));
     live_breadcrumb(33, '3');           // initialize() returned
 
     // (4) hardware reset.
@@ -719,7 +704,7 @@ static void bochs_global_init() {
 
     // Clear sticky yield flags that reset() may have set.
     BX_CPU(0)->async_event           = 0;
-    bx_pc_system.kill_bochs_request  = 0;
+    BX_CPU(0)->kill_bochs_request  = 0;
 
     g_global_init_done = true;
     live_breadcrumb(36, '6');
@@ -819,16 +804,21 @@ extern "C" void bochs_set_process_memory(Bit8u* base, Bit32u size,
         if (!peer_live) {
             // No concurrent slots — full hardware reset for a clean slate.
             BX_CPU(0)->reset(BX_RESET_HARDWARE);
-            BX_CPU(0)->oszapc.result          = 1;   // ZF=0 (result!=0 means no-zero-flag)
-            BX_CPU(0)->oszapc.auxbits         = 0;
+            // NOTE (Bochs 2.0 port): the oszapc poke that used to be
+            // here is redundant now - slot_restore_cpu() below
+            // unconditionally copies the whole s.cpu.oszapc struct
+            // (set to the correct all-flags-clear state by
+            // slot_prime_cpu() a few lines down) into the live CPU,
+            // so setting it here first would just be overwritten.
             BX_CPU(0)->async_event            = 0;
-            bx_pc_system.kill_bochs_request   = 0;
+            BX_CPU(0)->kill_bochs_request   = 0;
             g_exit_pending                    = 0;
             // Re-zero pc_system counters so cpu_loop yields at the same
             // instruction count as it did on the first launch.
-            bx_pc_system.initialize(50000000u);
+            bx_pc_system.init_ips(50000000u);
             bx_pc_system.set_enable_a20(true);
-            flushICaches();
+            // NOTE (Bochs 2.0 port): no iCache exists in this version
+            // to flush - see flush_after_switch()'s note above for why.
         }
     }
 
@@ -845,14 +835,35 @@ extern "C" void bochs_set_process_memory(Bit8u* base, Bit32u size,
     // live CPU is still in its post-reset state (CS=F000, EIP=FFF0,
     // unreal mode) and the next cpu_loop entry would execute BIOS
     // entry code instead of guest code. slot_restore_cpu copies every
-    // architectural register from s.cpu into the live CPU.
+    // architectural register from s.cpu into the live CPU, including
+    // the all-flags-clear oszapc state slot_prime_cpu just set.
     slot_restore_cpu(s);
-    BX_CPU(0)->oszapc.result     = 1;   // all-flags-clear: ZF=SF=CF=OF=0
-    BX_CPU(0)->oszapc.auxbits    = 0;
 
     // Flush Bochs caches that might still reference a previous
     // mapping for this slot.
     flush_after_switch();
+    
+    // CRITICAL FIX: After registering new memory and restoring CPU state,
+    // explicitly clear CR3 and flush TLB to ensure the CPU re-walks the
+    // page tables on the next memory access. The CPU reset left CR3 at its
+    // post-reset value, which may still be pointing at cached page tables
+    // from a previous guest. This causes the CPU to fetch stale TLB entries
+    // for memory addresses that happen to overlap between guests.
+    //
+    // Without this, running two programs sequentially or concurrently causes
+    // the second program to read memory from the first program's slab, leading
+    // to "echo" of previous output and data corruption.
+    //
+    // The triple flush pattern (flush, clear, flush) ensures that:
+    // 1. No stale TLB entries from previous guest remain
+    // 2. CR3 is cleared to point at identity-mapped kernel tables (or zero)
+    // 3. The CPU re-fetches page table entries on first access
+    //
+    // NOTE (Bochs 2.0 port): TLB_flush takes a bx_bool argument in
+    // this version (1 = also invalidate global pages).
+    BX_CPU(0)->TLB_flush(1);
+    BX_CPU(0)->cr3 = 0;
+    BX_CPU(0)->TLB_flush(1);
 }
 
 extern "C" void bochs_finalize_process_memory() {
@@ -1012,10 +1023,13 @@ extern "C" void bochs_reset_all_slots() {
     // Clear sticky yield flags that reset() may have set, the same
     // way bochs_global_init() does after its boot-time reset.
     BX_CPU(0)->reset(BX_RESET_HARDWARE);
-    BX_CPU(0)->oszapc.result  = 1;   // all-flags-clear: ZF=0 (non-zero result)
-    BX_CPU(0)->oszapc.auxbits = 0;   // add this
+    // NOTE (Bochs 2.0 port): the oszapc poke that used to be here is
+    // redundant - bochs_set_process_memory's slot_prime_cpu +
+    // slot_restore_cpu sequence (which runs next for whichever slot
+    // launches next) sets the correct all-flags-clear oszapc state
+    // and copies it into the live CPU unconditionally.
     BX_CPU(0)->async_event = 0;
-    bx_pc_system.kill_bochs_request = 0;
+    BX_CPU(0)->kill_bochs_request = 0;
     g_exit_pending                  = 0;
 
     // Re-zero bx_pc_system's timer/tick counters so the next launch
@@ -1036,7 +1050,7 @@ extern "C" void bochs_reset_all_slots() {
     // re-zeroed pc_system + already-allocated mem tables is the
     // closest reproducible "just after boot init" state we can
     // construct without re-running the heavy allocator path.
-    bx_pc_system.initialize(50000000u);
+    bx_pc_system.init_ips(50000000u);
     bx_pc_system.set_enable_a20(true);
 
     // Wipe the stale-panic diagnostic buffer so a panic captured
@@ -1051,13 +1065,23 @@ extern "C" void bochs_reset_all_slots() {
         bx_last_panic_msg[i] = 0;
     }
 
-    // Flush every Bochs cache that might still reference a slab
-    // mapping or decoded instruction from the previous guest.
-    // (BX_CPU::reset() already calls flushICaches() at its end, but
-    // we call it again for clarity / symmetry with bochs_global_init's
-    // contract: "after reset, the CPU's caches are empty.")
-    flushICaches();
+    // NOTE (Bochs 2.0 port): no iCache exists in this version to
+    // flush (see flush_after_switch()'s note) - nothing to do here.
 }
+
+// ── New function: Surgical per-slot cleanup ────────────────────────────
+// Instead of resetting the entire Bochs CPU (which destroys all slots),
+// this function clears only the specified slot's mapping and CPU state,
+// leaving the live CPU and other slots untouched.
+//
+// CRITICAL for concurrent slot support: when slot A exits while slot B is
+// running, we MUST NOT call bochs_reset_all_slots() (which resets BX_CPU).
+// Instead, call bochs_release_slot(A) to unmap A's memory and invalidate
+// A's CPU snapshot, then continue executing B.
+//
+// Only call bochs_reset_all_slots() when we're absolutely sure that NO
+// slots are active (checked in tick_elf_processes).
+
 
 // Switch active slot. If a different slot was active before, snapshot
 // its CPU state and unregister its mapping; then register the new
@@ -1218,27 +1242,22 @@ extern "C" void bochs_activate_slot(int slot) {
         // are live. The reset is a few hundred memory writes — cheap
         // compared to even one cpu_loop iteration. No allocations are
         // performed. It's safe to invoke repeatedly.
-        // ── IMPROVED: Always reset CPU to clear lazy state ──────────
-        // Previously only reset when switching between two live slots.
-        // Now reset on every slot change to eliminate flag/state bleed.
-        if (g_global_init_done && slot != g_active_slot && cur.cpu.valid) {
-            // Wipe all CPU state to eliminate lazy EFLAGS and other
-            // untracked state from the previous slot. Then restore our
-            // architectural snapshot cleanly.
+        if (switching_between_live_slots && cur.cpu.valid) {
             BX_CPU(0)->reset(BX_RESET_HARDWARE);
             BX_CPU(0)->async_event          = 0;
-            bx_pc_system.kill_bochs_request = 0;
+            BX_CPU(0)->kill_bochs_request = 0;
             g_exit_pending                  = 0;
             changed_mapping_or_cpu = true;
         }
-        // ──────────────────────────────────────────────────────────
 
         if (cur.mem_base && cur.mem_size) {
             mapping_register(cur);
             changed_mapping_or_cpu = true;
         }
-        
-        // ──────────────────────────────────────────────────────────
+        if (cur.cpu.valid) {
+            slot_restore_cpu(cur);
+            changed_mapping_or_cpu = true;
+        }
         // Only flush if we actually changed something Bochs-visible.
         // See block comment above — this is what makes the second
         // launch's bochs_activate_slot path identical to the first.
@@ -1253,15 +1272,25 @@ extern "C" void bochs_activate_slot(int slot) {
 // the value if the kernel switches slots before the first tick.
 extern "C" void bochs_cpu_set_eip(Bit32u eip) {
     BX_CPU_C* cpu = BX_CPU(0);
-    cpu->gen_reg[BX_32BIT_REG_EIP].dword.erx = eip;
-    cpu->prev_rip = eip;
+    
+    // CRITICAL: Full pipeline flush BEFORE setting EIP to ensure no stale
+    // cached instruction traces from the previous process remain.
     cpu->invalidate_prefetch_q();
-    // The kernel typically writes the guest program into the slab and
-    // THEN calls this. Any iCache entry covering the new EIP's physical
-    // page may predate that write, so flush. Cheap, and only happens
-    // once per process launch.
-    flushICaches();
+    // NOTE (Bochs 2.0 port): no iCache exists in this version (see
+    // flush_after_switch()'s note) - the flushICaches() calls that
+    // used to bracket this are gone; invalidate_prefetch_q() +
+    // TLB_flush() are the real equivalent available here.
+    cpu->TLB_flush(1);  // CRITICAL: Flush TLB to clear stale page mappings
+    
+    // NOTE (Bochs 2.0 port): EIP lives in cpu->dword.eip directly in
+    // this version, not gen_reg[] (see slot_save_cpu's note); prev_rip
+    // -> prev_eip (renamed).
+    cpu->dword.eip = eip;
+    cpu->prev_eip  = eip;
     cpu->async_event = 0;
+    
+    // Re-flush AFTER setting EIP to catch any micro-ops already decoded
+    cpu->invalidate_prefetch_q();
 
     if (g_active_slot >= 0 && g_active_slot < MAX_BOCHS_SLOTS) {
         SlotState& s = g_slots[g_active_slot];
@@ -1278,8 +1307,8 @@ extern "C" void bochs_cpu_set_esp(Bit32u esp_val) {
     }
 }
 
-extern "C" Bit32u bochs_cpu_get_eip() { return BX_CPU(0)->get_eip(); }
-extern "C" unsigned int bochs_cpu_geteip() { return (unsigned int)BX_CPU(0)->get_eip(); }
+extern "C" Bit32u bochs_cpu_get_eip() { return BX_CPU(0)->get_EIP(); }
+extern "C" unsigned int bochs_cpu_geteip() { return (unsigned int)BX_CPU(0)->get_EIP(); }
 extern "C" Bit32u bochs_cpu_get_eax() {
     return BX_CPU(0)->gen_reg[BX_32BIT_REG_EAX].dword.erx;
 }
@@ -1297,7 +1326,7 @@ extern "C" void bochs_guest_putc(char c) {
     // poll input, repaint. Both flags must be set: kill_bochs_request
     // alone is only checked inside handleAsyncEvent, which is only
     // entered when async_event != 0.
-    bx_pc_system.kill_bochs_request = 1;
+    BX_CPU(0)->kill_bochs_request = 1;
     BX_CPU(0)->async_event = 1;
 }
 
@@ -1349,7 +1378,7 @@ extern "C" void bochs_guest_exit(int code) {
     if (s.exit_cb) s.exit_cb(g_active_slot, code);
 
     g_exit_pending = 1;
-    bx_pc_system.kill_bochs_request = 1;
+    BX_CPU(0)->kill_bochs_request = 1;
     BX_CPU(0)->async_event = 1;
 }
 
@@ -1389,14 +1418,6 @@ extern "C" bool bochs_process_wants_input(int slot) {
 // we've executed enough instructions that we should yield back to the
 // kernel for a repaint. The instruction budget (n * 256) is large
 // enough that a short program like hello always completes in one tick.
-// Add near top of bochs_glue.cpp or kernel.cpp:
-extern "C" uint32_t bochs_get_time_ms() {
-    // Return milliseconds since boot
-    // This is a stub — implement based on your system timer
-    // For now, returns dummy value (fix after timeout works)
-    static uint32_t dummy = 0;
-    return ++dummy / 1000;  // Increments ~every microsecond
-}
 extern "C" int bochs_cpu_tick(int n) {
     if (!g_global_init_done) return 0;
     if (g_active_slot < 0 || g_active_slot >= MAX_BOCHS_SLOTS) return 0;
@@ -1406,44 +1427,51 @@ extern "C" int bochs_cpu_tick(int n) {
     if (!s.cpu.valid) return 0;
 
     s.wants_input = false;
+
     g_exit_pending = 0;
+    BX_CPU(0)->kill_bochs_request = 0;
+    BX_CPU(0)->async_event          = 0;
 
-    // ── ADDED: Timeout protection ──────────────────────────────
-    uint32_t start_tick_ms = bochs_get_time_ms();
-    const uint32_t TIMEOUT_MS = 5000;  // 5 seconds per tick call
-    // ───────────────────────────────────────────────────────────
+    // Reinitialise the pc_system countdown before every tick so
+    // cpu_loop() always has a fresh budget of instructions to run.
+    // Without this, once currCountdown reaches 0 (after the first
+    // 50M-instruction budget), countdownEvent() is a no-op stub and
+    // currCountdown stays at 0 — cpu_loop() returns immediately on
+    // every subsequent entry without executing a single instruction,
+    // icount never advances, elapsed stays 0, and the budget loop here
+    // spins forever.
+    bx_pc_system.init_ips(50000000u);
+    bx_pc_system.set_enable_a20(true);
 
-    const int cap = n * 512;
-    for (int iter = 0; iter < cap; ++iter) {
-        // Clear yield flags before every cpu_loop() entry so it actually
-        // runs instructions. bochs_guest_putc / bochs_guest_exit set them
-        // inside cpu_loop() to force a return after each port-IO event.
-        bx_pc_system.kill_bochs_request = 0;
-        BX_CPU(0)->async_event          = 0;
+    // NOTE (Bochs 2.0 port): this version's cpu_loop(Bit32s
+    // max_instr_count) takes the instruction budget as a direct
+    // argument and internally loops, executing guest instructions
+    // until either max_instr_count is reached or something sets
+    // kill_bochs_request (our outp() handler does this via
+    // bochs_guest_exit()/bochs_guest_putc() on port 0xE8/0xE9) - it
+    // returns to us either way. There's no get_icount() in this
+    // version to measure exactly how many instructions actually ran,
+    // so the old "poll icount, loop calling cpu_loop() with the
+    // remaining budget" pattern doesn't have anywhere to plug in the
+    // "elapsed" half of that comparison. A single call with the full
+    // budget is the direct equivalent: cpu_loop() already handles the
+    // internal yield/resume via kill_bochs_request exactly the way
+    // the old outer while-loop assumed each individual cpu_loop() call
+    // would.
+    Bit64u budget = (Bit64u)n * 256;
+    if (budget > 0x7FFFFFFFull) budget = 0x7FFFFFFFull;  // Bit32s range
 
-        BX_CPU(0)->cpu_loop();
+    BX_CPU(0)->kill_bochs_request = 0;
+    BX_CPU(0)->async_event          = 0;
 
-        // Immediately clear again so stale flags from this iteration
-        // cannot contaminate the next call's entry check in cpu_loop's
-        // outer while(1) { if (async_event) handleAsyncEvent... }.
-        bx_pc_system.kill_bochs_request = 0;
-        BX_CPU(0)->async_event          = 0;
+    BX_CPU(0)->cpu_loop((Bit32s)budget);
 
-        if (g_exit_pending)  { g_exit_pending = 0; return 0; }
-        if (s.wants_input)   { return 0; }
-        if (!s.mem_base || !s.mapped) { return 0; }
+    BX_CPU(0)->kill_bochs_request = 0;
+    BX_CPU(0)->async_event          = 0;
 
-        // ── ADDED: Timeout check (every 10 iterations) ──────────
-        if (iter % 10 == 0) {
-            uint32_t elapsed_ms = bochs_get_time_ms() - start_tick_ms;
-            if (elapsed_ms > TIMEOUT_MS) {
-                // Timeout! Stop execution
-                s.cpu.valid = false;  // Invalidate this slot's state
-                g_exit_pending = 1;
-                return 0;  // Exit immediately
-            }
-        }
-        // ──────────────────────────────────────────────────────
+    if (g_exit_pending) {
+        g_exit_pending = 0;
+        return 0;
     }
     return 0;
 }

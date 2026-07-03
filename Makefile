@@ -16,12 +16,43 @@ CXXFLAGS := -ffreestanding -O2 -Wall -Wextra \
             -include fixes.h                  \
             -include instrument_stub.h
 
-# ── Bochs 2.7 ────────────────────────────────────────────────
-BOCHS_VERSION   := 2.7
+# ── Bochs 2.0 ────────────────────────────────────────────────
+# Source: the official bochs-emu/Bochs GitHub mirror, tag REL_2_0_FINAL
+# (verified to exist and download correctly; the old SourceForge
+# "bochs-2.0.tar.gz" path used previously could not be confirmed to
+# exist and was producing bad downloads). The tag archive's top-level
+# layout is Bochs-REL_2_0_FINAL/bochs/... , so extraction strips 2
+# path components to land the real source tree directly at $(BOCHS_DIR).
+#
+# Bochs 2.0's internals are structurally different from what
+# bochs_glue.cpp/bochs_infra.cpp were written against (Bochs 2.7):
+#   - no gui/paramtree.cc split (param-tree classes live in
+#     gui/siminterface.cc instead, with an older API)
+#   - no cpu/cpudb/ (CPU model database; added in 2.5)
+#   - fpu/ is a top-level directory here, not cpu/fpu/ (that move
+#     happened in 2.6.1)
+# The $(BOCHS_CPU_LIB) recipe below also applies several small source
+# patches (via patch-bochs-2.0.sh) needed to build this 2003-era code
+# with a modern (GCC 13 / glibc) toolchain - see that script for the
+# details of each fix. cpu/, fpu/, and memory/ have been verified to
+# build cleanly after these patches; the remaining glue-code port
+# (paramtree API -> siminterface API) is still in progress.
+BOCHS_VERSION   := 2.0
+BOCHS_TAG       := REL_$(subst .,_,$(BOCHS_VERSION))_FINAL
 BOCHS_DIR       := bochs-$(BOCHS_VERSION)
-BOCHS_ARCHIVE   := $(BOCHS_DIR).tar.gz
-BOCHS_URL       := https://downloads.sourceforge.net/project/bochs/bochs/$(BOCHS_VERSION)/$(BOCHS_ARCHIVE)
+BOCHS_ARCHIVE   := $(BOCHS_DIR)-src.tar.gz
+BOCHS_URL       := https://codeload.github.com/bochs-emu/Bochs/tar.gz/refs/tags/$(BOCHS_TAG)
 BOCHS_CPU_LIB   := $(BOCHS_DIR)/cpu/libcpu.a
+
+# Base64-encoded copy of the Bochs 2.0 patch script, embedded directly
+# so the fix can never go stale relative to a separate file on disk -
+# this IS the source of truth; patch-bochs-2.0.sh is (re)written from it
+# fresh on every build. See the comments inside the script (or run it
+# with no args after decoding) for what each numbered fix addresses.
+define BOCHS_PATCH_SCRIPT_B64
+IyEvYmluL3NoCiMgcGF0Y2gtYm9jaHMtMi4wLnNoIOKAlCBmaXggQm9jaHMgMi4wICgyMDAzKSBzb3VyY2UgdG8gYnVpbGQgd2l0aCBhCiMgbW9kZXJuIEdDQy9nbGliYyB0b29sY2hhaW4uIFJ1biBvbmNlLCByaWdodCBhZnRlciBleHRyYWN0aW5nIHRoZQojIHRhcmJhbGwgYW5kIGJlZm9yZSAuL2NvbmZpZ3VyZS4gSWRlbXBvdGVudCAoc2FmZSB0byByZS1ydW4pLgojCiMgVXNhZ2U6IC4vcGF0Y2gtYm9jaHMtMi4wLnNoIDxib2Nocy0yLjAtZGlyPgpzZXQgLWUKRElSPSIkMSIKaWYgWyAteiAiJERJUiIgXSB8fCBbICEgLWQgIiRESVIiIF07IHRoZW4KICAgIGVjaG8gInVzYWdlOiAkMCA8Ym9jaHMtMi4wLXNvdXJjZS1kaXI+IiA+JjIKICAgIGV4aXQgMQpmaQpTRU5USU5FTD0iJERJUi8uY2xhdWRlLXBhdGNoZWQiCmlmIFsgLWYgIiRTRU5USU5FTCIgXTsgdGhlbgogICAgZWNobyAiPj4+ICRESVIgYWxyZWFkeSBwYXRjaGVkLCBza2lwcGluZy4iCiAgICBleGl0IDAKZmkKCmVjaG8gIj4+PiBQYXRjaGluZyAkRElSIGZvciBtb2Rlcm4tdG9vbGNoYWluIGNvbXBhdGliaWxpdHkuLi4iCgojIC0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQojIEZpeCAxICYgMjogZnB1L3N0dWJzL2xpbnV4L3R5cGVzLmggYW5kIGZwdS9zdHVicy9hc20vdHlwZXMuaCBzaGFkb3cKIyB0aGUgcmVhbCBzeXN0ZW0gPGxpbnV4L3R5cGVzLmg+IC8gPGFzbS90eXBlcy5oPiAodGhleSBjbGFpbSB0aGUKIyBzYW1lIGluY2x1ZGUgZ3VhcmQgd2l0aG91dCBwcm92aWRpbmcgdGhlIF9fdTY0L19fczY0L2V0YyB0eXBlZGVmcwojIHRoYXQgbW9kZXJuIGdsaWJjJ3MgPGJpdHMvc3RhdHguaD4gbmVlZHMpLiBCb2NocyB3cm90ZSB0aGVzZSBpbgojIDIwMDMgZm9yIHBsYXRmb3JtcyBsYWNraW5nIExpbnV4IGtlcm5lbCBoZWFkZXJzOyBvbiBhIHJlYWwgTGludXgKIyBob3N0IHRoZXkgbXVzdCBmYWxsIHRocm91Z2ggdG8gdGhlIHJlYWwgaGVhZGVycyBpbnN0ZWFkLgojIC0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQpjYXQgPiAiJERJUi9mcHUvc3R1YnMvbGludXgvdHlwZXMuaCIgPDwgJ0VPRicKI2lmIGRlZmluZWQoX19saW51eF9fKQovKiBPbiBhIHJlYWwgTGludXggaG9zdCB0aGUgc3lzdGVtIGFscmVhZHkgaGFzIGEgY29tcGxldGUsIGNvcnJlY3QKICogPGxpbnV4L3R5cGVzLmg+IChuZWVkZWQgdHJhbnNpdGl2ZWx5IGJ5IG1vZGVybiBnbGliYydzCiAqIDxiaXRzL3N0YXR4Lmg+IGZvciBfX3U2NC9fX3M2NC9ldGMpLiBUaGlzIDIwMDMtZXJhIHN0dWIgcHJlZGF0ZXMKICogdGhhdCBkZXBlbmRlbmN5OyBpdCB1c2VkIHRvIGRlZmluZSB0aGUgU0FNRSBpbmNsdWRlIGd1YXJkCiAqIChfTElOVVhfVFlQRVNfSCkgYXMgdGhlIHJlYWwgaGVhZGVyIHdpdGhvdXQgcHJvdmlkaW5nIHRob3NlCiAqIHR5cGVkZWZzLCB3aGljaCBtYWRlIHRoZSByZWFsIGhlYWRlciBlZmZlY3RpdmVseSB1bnJlYWNoYWJsZQogKiAoaXRzIG93biBndWFyZCBhbHJlYWR5IGxvb2tlZCAiY2xhaW1lZCIpIGFuZCBsZWZ0IF9fdTY0IGV0Yy4KICogdW5kZWZpbmVkLiBGaXg6IGxldCB0aGUgcmVhbCBoZWFkZXIgY2xhaW0gaXRzIG93biBndWFyZCB2aWEKICogI2luY2x1ZGVfbmV4dCBGSVJTVCwgdGhlbiBhZGQgYm9jaHMncyBleHRyYSBCU0Qtc3R5bGUgYWxpYXNlcwogKiBiZWxvdyB1bmRlciBhIGRpZmZlcmVudCBndWFyZCBzbyB3ZSBuZXZlciBjb2xsaWRlIGFnYWluLiAqLwojaW5jbHVkZV9uZXh0IDxsaW51eC90eXBlcy5oPgojZW5kaWYKCiNpZm5kZWYgX0JYX0xJTlVYX1RZUEVTX1NUVUJfSAojZGVmaW5lIF9CWF9MSU5VWF9UWVBFU19TVFVCX0gKCiNpZm5kZWYgX19BU1NFTUJMWV9fCgojZGVmaW5lIHVfY2hhciBieF91X2NoYXIKI2RlZmluZSB1X3Nob3J0IGJ4X3Vfc2hvcnQKI2RlZmluZSB1X2ludCBieF91X2ludAojZGVmaW5lIHVfbG9uZyBieF91X2xvbmcKI2RlZmluZSB1bmNoYXIgYnhfdW5jaGFyCiNkZWZpbmUgdXNob3J0IGJ4X3VzaG9ydAojZGVmaW5lIHVpbnQgYnhfdWludAojZGVmaW5lIHVsb25nIGJ4X3Vsb25nCgovKiBic2QgKi8KdHlwZWRlZiB1bnNpZ25lZCBjaGFyICAgICAgICAgICB1X2NoYXI7CnR5cGVkZWYgdW5zaWduZWQgc2hvcnQgICAgICAgICAgdV9zaG9ydDsKdHlwZWRlZiB1bnNpZ25lZCBpbnQgICAgICAgICAgICB1X2ludDsKdHlwZWRlZiB1bnNpZ25lZCBsb25nICAgICAgICAgICB1X2xvbmc7CgovKiBzeXN2ICovCnR5cGVkZWYgdW5zaWduZWQgY2hhciAgICAgICAgICAgdW5jaGFyOwp0eXBlZGVmIHVuc2lnbmVkIHNob3J0ICAgICAgICAgIHVzaG9ydDsKdHlwZWRlZiB1bnNpZ25lZCBpbnQgICAgICAgICAgICB1aW50Owp0eXBlZGVmIHVuc2lnbmVkIGxvbmcgICAgICAgICAgIHVsb25nOwoKI2lmbmRlZiBOVUxMCiNkZWZpbmUgTlVMTCAoKHZvaWQgKikgMCkKI2VuZGlmCgojZW5kaWYKCiNlbmRpZiAvKiBfQlhfTElOVVhfVFlQRVNfU1RVQl9IICovCkVPRgoKY2F0ID4gIiRESVIvZnB1L3N0dWJzL2FzbS90eXBlcy5oIiA8PCAnRU9GJwojaWZuZGVmIF9JMzg2X1RZUEVTX0gKI2RlZmluZSBfSTM4Nl9UWVBFU19ICgojaWZuZGVmIF9fQVNTRU1CTFlfXwojaWYgZGVmaW5lZChfX2xpbnV4X18pCi8qIFNhbWUgaXNzdWUgYXMgZnB1L3N0dWJzL2xpbnV4L3R5cGVzLmg6IHRoaXMgMjAwMy1lcmEgZW1wdHkgc3R1YgogKiBzaGFkb3dzIHRoZSByZWFsIHN5c3RlbSA8YXNtL3R5cGVzLmg+ICh3aGljaCBkZWZpbmVzIF9fdTY0L19fczY0LwogKiBldGMpIHZpYSAtSS4vc3R1YnMgY29taW5nIGJlZm9yZSB0aGUgc3lzdGVtIGluY2x1ZGUgcGF0aC4gRmFsbAogKiB0aHJvdWdoIHRvIHRoZSByZWFsIGhlYWRlciBpbnN0ZWFkIG9mIHNpbGVudGx5IHByb3ZpZGluZyBub3RoaW5nLiAqLwojaW5jbHVkZV9uZXh0IDxhc20vdHlwZXMuaD4KI2VuZGlmCiNlbmRpZgoKI2VuZGlmICAvKiBfSTM4Nl9UWVBFU19IICovCkVPRgoKIyAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KIyBGaXggMzogYm9jaHMncyBvd24gdG9wLWxldmVsIGRlYnVnLyBkaXJlY3RvcnkgKHRoZSBpbnRlcmFjdGl2ZQojIGRlYnVnZ2VyIHN1YnN5c3RlbSkgY29udGFpbnMgYSBkZWJ1Zy5oIGZpbGUgdGhhdCBjb2xsaWRlcyB3aXRoCiMgbGlic3RkYysrJ3Mgb3duIDxkZWJ1Zy9kZWJ1Zy5oPiAodXNlZCBpbnRlcm5hbGx5IGJ5IDxiaXRzLwojIHN0bF9hbGdvYmFzZS5oPiBmb3IgaXRlcmF0b3IgZGVidWctbW9kZSBkZWNsYXJhdGlvbnMpLiBCZWNhdXNlIC1JLi4KIyBwdXRzIHRoZSBib2NocyByb290IG9uIHRoZSBpbmNsdWRlIHBhdGgsIGFueSBDKysgZmlsZSB0aGF0IHB1bGxzIGluCiMgPG1hdGguaD4vPGNtYXRoPiBlbmRzIHVwIGZpbmRpbmcgQk9DSFMncyBkZWJ1Zy9kZWJ1Zy5oIGluc3RlYWQgb2YKIyB0aGUgcmVhbCBzeXN0ZW0gb25lLCB3aGljaCBzaWxlbnRseSBkcm9wcyB0aGUgZm9yd2FyZCBkZWNsYXJhdGlvbgojIG9mICJuYW1lc3BhY2UgX19nbnVfZGVidWciIGFuZCBicmVha3MgdGhlIFNUTCBoZWFkZXJzIHdpdGgKIyBjb25mdXNpbmcgImV4cGVjdGVkIGluaXRpYWxpemVyIGJlZm9yZSAnPCcgdG9rZW4iIGVycm9ycy4KIyBHQ0MgYWx3YXlzIHByZWZlcnMgaXRzIG93biBkZWZhdWx0IHN5c3RlbSBkaXJzJyAqcG9zaXRpb24qIGZvcgojIHBhdGhzIHRoYXQgbWF0Y2ggdGhlbSwgc28gcmVvcmRlcmluZyAtSSBmbGFncyBjYW5ub3QgZml4IHRoaXMgLSB0aGUKIyBjb2xsaWRpbmcgZmlsZW5hbWUgaGFzIHRvIGdvLiBSZW5hbWluZyBqdXN0IHRoZSBmaWxlIChub3QgdGhlCiMgd2hvbGUgZGVidWcvIGRpcmVjdG9yeSwgd2hpY2ggY29uZmlndXJlJ3MgQUNfT1VUUFVUIHN0aWxsIGV4cGVjdHMKIyB0byBmaW5kIGF0IHRoYXQgcGF0aCkgaXMgdGhlIG1pbmltYWwgZml4LgojIC0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQppZiBbIC1mICIkRElSL2RlYnVnL2RlYnVnLmgiIF07IHRoZW4KICAgIG12ICIkRElSL2RlYnVnL2RlYnVnLmgiICIkRElSL2RlYnVnL2J4ZGVidWcuaCIKICAgIHNlZCAtaSAncyNpbmNsdWRlICJkZWJ1Zy9kZWJ1Z1wuaCIjaW5jbHVkZSAiZGVidWcvYnhkZWJ1Zy5oIiMnICIkRElSL2JvY2hzLmgiCiAgICAjIFVwZGF0ZSB0aGUgKG5vbi1mdW5jdGlvbmFsLCBkZXBlbmRlbmN5LXRyYWNraW5nLW9ubHkpIE1ha2VmaWxlLmluCiAgICAjIHJlZmVyZW5jZXMgdG9vLCBzbyBgbWFrZWAgZG9lc24ndCBjaG9rZSBsb29raW5nIGZvciBhIHJ1bGUgdG8KICAgICMgYnVpbGQgYSBmaWxlIHRoYXQgbm8gbG9uZ2VyIGV4aXN0cy4KICAgIGdyZXAgLXJsICJkZWJ1Zy9kZWJ1Z1wuaCIgIiRESVIiLyovTWFrZWZpbGUuaW4gIiRESVIiL01ha2VmaWxlLmluIDI+L2Rldi9udWxsIHwgXAogICAgICAgIHhhcmdzIC1yIHNlZCAtaSAncyNkZWJ1Zy9kZWJ1Z1wuaCNkZWJ1Zy9ieGRlYnVnLmgjZycKZmkKCiMgLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tCiMgRml4IDQ6IGZwdS9zdHVicy9saW51eC9saW5rYWdlLmgncyAiYXNtbGlua2FnZSIgbWFjcm8gYWRkcwojIF9fYXR0cmlidXRlX18oKHJlZ3Bhcm0oMCkpKSBvbiBpMzg2LCBtaW1pY2tpbmcgdGhlIExpbnV4IGtlcm5lbCdzCiMgY2FsbGluZyBjb252ZW50aW9uIGZvciBhc21saW5rYWdlIGZ1bmN0aW9ucy4gZnB1X3Byb3RvLmggZGVjbGFyZXMKIyBmdW5jdGlvbnMgbGlrZSBhcml0aF9vdmVyZmxvdygpIFdJVEhPVVQgdGhpcyBhdHRyaWJ1dGUsIGJ1dCB0aGUKIyBjb3JyZXNwb25kaW5nIGRlZmluaXRpb25zIGluIGVycm9ycy5jIHVzZSAiYXNtbGlua2FnZSIgYW5kIHNvCiMgRE8gaGF2ZSBpdC4gT2xkZXIgR0NDIHRvbGVyYXRlZCB0aGUgbWlzbWF0Y2g7IEdDQyAxMyB0cmVhdHMgYQojIHJlZ3Bhcm0gZGlmZmVyZW5jZSBiZXR3ZWVuIGEgZGVjbGFyYXRpb24gYW5kIGl0cyBkZWZpbml0aW9uIGFzIGEKIyBoYXJkICJjb25mbGljdGluZyB0eXBlcyIgZXJyb3IuIFNpbmNlIGZwdS8gaGVyZSBpcyBhIHBsYWluCiMgdXNlcnNwYWNlIHN0YXRpYyBsaWJyYXJ5IChub3QgbGlua2VkIGFnYWluc3QgcmVhbCBrZXJuZWwgb2JqZWN0CiMgY29kZSksIHRoZSBrZXJuZWwtQUJJIGF0dHJpYnV0ZSBzZXJ2ZXMgbm8gcHVycG9zZSAtIGRyb3AgaXQuCiMgLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tCmlmIFsgLWYgIiRESVIvZnB1L3N0dWJzL2xpbnV4L2xpbmthZ2UuaCIgXTsgdGhlbgogICAgc2VkIC1pIFwKICAgICAgICAncy9eI2lmIGRlZmluZWQgX19pMzg2X18gXCZcJiAoX19HTlVDX18gPiAyIHx8IF9fR05VQ19NSU5PUl9fID4gNykkLyNpZiAwIFwmXCYgZGVmaW5lZCBfX2kzODZfXyBcJlwmIChfX0dOVUNfXyA+IDIgfHwgX19HTlVDX01JTk9SX18gPiA3KSBcLyogcmVncGFybSgwKSBkaXNhYmxlZDogc2VlIHBhdGNoLWJvY2hzLTIuMC5zaCAqXC8vJyBcCiAgICAgICAgIiRESVIvZnB1L3N0dWJzL2xpbnV4L2xpbmthZ2UuaCIKZmkKCiMgLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tCiMgRml4IDU6IGNvbmZpZ3VyZSdzIHJlYWRsaW5lIGRldGVjdGlvbiAoImNoZWNraW5nIGlmIHJlYWRsaW5lIHdvcmtzCiMgd2l0aG91dC93aXRoIC1sY3Vyc2VzIikgdXNlcyBBQ19UUllfUlVOLCB3aGljaCBuZWVkcyB0byBhY3R1YWxseQojIEVYRUNVVEUgYSBjb21waWxlZCAzMi1iaXQgdGVzdCBwcm9ncmFtLiBQYXNzaW5nIC0taG9zdD1pNjg2LWxpbnV4LWdudQojIGRvZXNuJ3QgYnkgaXRzZWxmIG1ha2UgYXV0b2NvbmYgcmVmdXNlIHRoaXMgKGl0IGRlY2lkZXMgYmFzZWQgb24KIyB3aGV0aGVyIGEgY29tcGlsZWQgdGVzdCBiaW5hcnkgYWN0dWFsbHkgcnVucywgbm90IG9uIHRoZSAtLWhvc3QKIyBzdHJpbmcpLCBidXQgb24gaG9zdHMgdGhhdCBjYW4gY29tcGlsZSAzMi1iaXQgYmluYXJpZXMgeWV0IGNhbid0CiMgZXhlY3V0ZSB0aGVtIChlLmcuIG5vIGkzODYgZXhlY3V0aW9uIHN1cHBvcnQgYXQgYWxsKSwgYXV0b2NvbmYKIyBjb25jbHVkZXMgInllcywgY3Jvc3MgY29tcGlsaW5nIiBhbmQgdGhpcyBzcGVjaWZpYyBjaGVjayAtIHVubGlrZQojIG1vc3QgYXV0b2NvbmYgY2hlY2tzIC0gaGFzIG5vIGNyb3NzLWNvbXBpbGUgZmFsbGJhY2ssIHNvIGl0IGhhcmQtCiMgYWJvcnRzIGNvbmZpZ3VyZSB3aXRoICJjYW5ub3QgcnVuIHRlc3QgcHJvZ3JhbSB3aGlsZSBjcm9zcwojIGNvbXBpbGluZyIgaW5zdGVhZCBvZiBqdXN0IGFuc3dlcmluZyAibm8iIGxpa2UgZXZlcnl0aGluZyBlbHNlIGRvZXMuCiMgV2UgZG9uJ3QgdXNlIHRoZSBpbnRlcmFjdGl2ZSBkZWJ1Z2dlciAoYW5kIHRoZXJlZm9yZSBuZXZlciBuZWVkCiMgcmVhZGxpbmUpIGluIHRoaXMgaGVhZGxlc3MgYnVpbGQsIHNvIGp1c3QgbWFrZSB0aGVzZSB0d28gY2hlY2tzCiMgZmFsbCB0aHJvdWdoIGFuZCB0cnkgZXhlY3V0aW9uIHVuY29uZGl0aW9uYWxseTsgaWYgdGhlIGJpbmFyeSBjYW4ndAojIHJ1biB0aGV5IGxhbmQgb24gdGhlIHNhbWUgIm5vIiByZXN1bHQgdGhpcyB3b3VsZCBoYXZlIHByb2R1Y2VkCiMgYW55d2F5LCB3aXRob3V0IHRoZSBoYXJkIGFib3J0LgojIC0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQppZiBbIC1mICIkRElSL2NvbmZpZ3VyZSIgXTsgdGhlbgogICAgcHl0aG9uMyAtICIkRElSL2NvbmZpZ3VyZSIgPDwgJ1BZRU9GJwppbXBvcnQgc3lzCnBhdGggPSBzeXMuYXJndlsxXQp3aXRoIG9wZW4ocGF0aCkgYXMgZjoKICAgIHRleHQgPSBmLnJlYWQoKQptYXJrZXIgPSAnaWYgdGVzdCAiJGNyb3NzX2NvbXBpbGluZyIgPSB5ZXM7IHRoZW4nCiMgU2NvcGUgc3RyaWN0bHkgdG8gdGhlIHJlYWRsaW5lIHRlc3QgcHJvZ3JhbSAocmxfaW5pdGlhbGl6ZSksIG5vdCB0aGUKIyBnZW5lcmljIGNyb3NzLWNvbXBpbGUgZXJyb3IgdGV4dCwgd2hpY2ggaXMgc2hhcmVkIGJvaWxlcnBsYXRlIHVzZWQKIyBieSBtYW55IE9USEVSIEFDX1RSWV9SVU4gY2hlY2tzIGluIHRoaXMgY29uZmlndXJlIHNjcmlwdCAoc2l6ZW9mLAojIGVuZGlhbm5lc3MsIGV0Yy4pIHRoYXQgbXVzdCBrZWVwIGZhaWxpbmcgbG91ZGx5IGlmIHRoZXkgY2FuJ3QKIyBhY3R1YWxseSBleGVjdXRlIGEgdGVzdCBiaW5hcnkgLSBvbmx5IHJlYWRsaW5lJ3MgaXMgc2FmZSB0byBza2lwLgpuZWVkbGUgPSAncmxfaW5pdGlhbGl6ZScKY291bnQgPSAwCm91dCA9IFtdCmkgPSAwCndoaWxlIFRydWU6CiAgICBqID0gdGV4dC5maW5kKG1hcmtlciwgaSkKICAgIGlmIGogPT0gLTE6CiAgICAgICAgb3V0LmFwcGVuZCh0ZXh0W2k6XSkKICAgICAgICBicmVhawogICAgd2luZG93ID0gdGV4dFtqOmorNjAwXQogICAgaWYgbmVlZGxlIGluIHdpbmRvdzoKICAgICAgICBvdXQuYXBwZW5kKHRleHRbaTpqXSkKICAgICAgICBvdXQuYXBwZW5kKCdpZiBmYWxzZTsgdGhlbicpCiAgICAgICAgY291bnQgKz0gMQogICAgICAgIGkgPSBqICsgbGVuKG1hcmtlcikKICAgIGVsc2U6CiAgICAgICAgb3V0LmFwcGVuZCh0ZXh0W2k6aitsZW4obWFya2VyKV0pCiAgICAgICAgaSA9IGogKyBsZW4obWFya2VyKQp3aXRoIG9wZW4ocGF0aCwgJ3cnKSBhcyBmOgogICAgZi53cml0ZSgnJy5qb2luKG91dCkpCnByaW50KGYiPj4+IG5ldXRyYWxpemVkIHtjb3VudH0gcmVhZGxpbmUgY3Jvc3MtY29tcGlsZSBjaGVjayhzKSBpbiBjb25maWd1cmUiKQppZiBjb3VudCAhPSAyOgogICAgcHJpbnQoZiJXQVJOSU5HOiBleHBlY3RlZCBleGFjdGx5IDIgcmVhZGxpbmUgY2hlY2tzLCBuZXV0cmFsaXplZCB7Y291bnR9IC0gdmVyaWZ5IGNvbmZpZ3VyZS5pbiBzdHJ1Y3R1cmUgaGFzbid0IGNoYW5nZWQiKQpQWUVPRgpmaQoKdG91Y2ggIiRTRU5USU5FTCIKZWNobyAiPj4+IFBhdGNoaW5nIGNvbXBsZXRlLiIK
+endef
+
 
 # ── BusyBox 32-bit static (musl) ─────────────────────────────
 BUSYBOX_URL := https://busybox.net/downloads/binaries/1.35.0-i686-linux-musl/busybox
@@ -31,6 +62,23 @@ BUSYBOX_BIN := busybox
 #  Top-level targets
 # ============================================================
 all: $(MAIN) $(DISK_IMG)
+
+# world: one-shot bootstrap for a totally fresh checkout.
+#   1. Downloads + builds Bochs 2.0 (cpu/fpu/memory static libs)
+#   2. Downloads + builds TCC (i386-tcc, libtcc.a, and the in-kernel
+#      i386-libtcc-kern.a)
+#   3. Links the kernel against both and produces main.iso + disk.img
+# Equivalent to running setup-tcc then `make BOCHS=1`, but as a single
+# command with clear ordering. Safe to re-run: each step is skipped
+# automatically once its outputs already exist.
+world: $(BOCHS_CPU_LIB) setup-tcc $(MAIN) $(DISK_IMG)
+	@echo ">>> world build complete: main.iso + disk.img are ready."
+	@echo "    Run: qemu-system-i386 -M q35 -m 2048M -vga std \\"
+	@echo "             -drive id=cd0,file=main.iso,format=raw,if=none,media=cdrom \\"
+	@echo "             -drive id=disk0,file=disk.img,format=raw,if=none \\"
+	@echo "             -device ahci,id=ahci \\"
+	@echo "             -device ide-cd,drive=cd0,bus=ahci.0 \\"
+	@echo "             -device ide-hd,drive=disk0,bus=ahci.1 -boot d"
 
 # ── Disk image ────────────────────────────────────────────────
 # 128 MB FAT32 image, 8 sectors/cluster, 32 reserved sectors.
@@ -70,9 +118,9 @@ clean:
 	rm -rf *.o main.iso iso hello hello_blob.o tcc_tool libtcc_glue.so i386-libtcc-kern.a
 
 # distclean removes build artifacts and the disk image, but KEEPS the
-# prebuilt bochs-2.7/ tree and the local TCC build.
+# downloaded bochs-2.0/ tree and the local TCC build.
 distclean: clean
-	# NOTE: bochs-2.7/ is intentionally NOT removed (offline bundle).
+	# NOTE: bochs-2.0/ is intentionally NOT removed (avoids re-downloading).
 	# NOTE: tcc-local/ and tcc-src/ are also kept so `make cc` works
 	#       without re-downloading. Remove them by hand if needed:
 	#         rm -rf tcc-local tcc-src tcc-mob.tar.gz
@@ -82,7 +130,7 @@ distclean: clean
 tcc-clean:
 	rm -rf $(TCC_LOCAL) $(TCC_SRC_DIR) $(TCC_ARCHIVE)
 
-.PHONY: all clean distclean tcc-clean iso test_main run-test cc tcc setup-tcc download-tcc
+.PHONY: all world clean distclean tcc-clean iso test_main run-test cc tcc setup-tcc download-tcc
 
 # ============================================================
 #  TCC glue — host-side C compiler for guest ELFs
@@ -258,41 +306,73 @@ endif
 	@echo ">>> Done. Boot the OS and type '$(or $(OUT),$(basename $(notdir $(SRC))))' to run it."
 
 # ============================================================
-#  Bochs CPU/FPU/cpudb/memory static libraries
+#  Bochs CPU/FPU/memory static libraries
 # ------------------------------------------------------------
-#  OFFLINE BUNDLE: this tree ships with bochs-2.7/ already
-#  configured and with the four static libs prebuilt
-#  (cpu/libcpu.a, cpu/fpu/libfpu.a, cpu/cpudb/libcpudb.a,
-#  memory/libmemory.a). When those libs are present "make"
-#  uses them directly and performs NO download / configure.
+#  Downloads Bochs 2.0 from the official bochs-emu/Bochs GitHub
+#  mirror (tag REL_2_0_FINAL), extracts it, applies
+#  patch-bochs-2.0.sh (source-level fixes needed to build this
+#  2003-era code with a modern GCC/glibc toolchain - see that
+#  script for details on each one), configures --with-nogui, and
+#  builds the static libs needed by the glue code: cpu/libcpu.a,
+#  fpu/libfpu.a, memory/libmemory.a. If $(BOCHS_CPU_LIB) already
+#  exists (e.g. from a previous run) the whole step is skipped.
 #
-#  If the prebuilt libs are absent, the rule falls back to the
-#  original behaviour: download the tarball, extract, configure
-#  --with-nogui, and build the four libs.
+#  NOTE: unlike later Bochs releases, 2.0 has no cpu/cpudb/ (CPU
+#  model database, added in 2.5) and fpu/ lives at the bochs root
+#  rather than under cpu/ (that move happened in 2.6.1) - so
+#  neither is referenced here.
 # ============================================================
 $(BOCHS_ARCHIVE):
 	wget -O $@ "$(BOCHS_URL)" || curl -L -o $@ "$(BOCHS_URL)"
+	@gzip -t $@ 2>/dev/null || { \
+	    echo ""; \
+	    echo "ERROR: $@ is not a valid gzip file."; \
+	    echo "       The download likely failed (404 / HTML error page /"; \
+	    echo "       redirect page saved instead of the real tarball)."; \
+	    echo "       URL used: $(BOCHS_URL)"; \
+	    echo "       Try opening that URL in a browser, then either fix"; \
+	    echo "       BOCHS_URL/BOCHS_TAG in the Makefile or download it"; \
+	    echo "       manually to $@ in this directory."; \
+	    echo ""; \
+	    rm -f $@; \
+	    exit 1; \
+	}
 
 $(BOCHS_DIR)/.extracted: $(BOCHS_ARCHIVE)
-	tar -xzf $(BOCHS_ARCHIVE)
+	rm -rf $(BOCHS_DIR)
+	mkdir -p $(BOCHS_DIR)
+	tar -xzf $(BOCHS_ARCHIVE) --strip-components=2 -C $(BOCHS_DIR)
+	@if [ ! -f "$(BOCHS_DIR)/configure" ]; then \
+	    echo ""; \
+	    echo "ERROR: extracting $(BOCHS_ARCHIVE) did not produce"; \
+	    echo "       $(BOCHS_DIR)/configure as expected."; \
+	    echo "       Run 'tar tzf $(BOCHS_ARCHIVE) | head' to see the"; \
+	    echo "       archive's actual top-level layout and adjust the"; \
+	    echo "       --strip-components value above if it changed."; \
+	    echo ""; \
+	    exit 1; \
+	fi
+	@echo "$(BOCHS_PATCH_SCRIPT_B64)" | base64 -d > patch-bochs-2.0.sh
+	chmod +x patch-bochs-2.0.sh
+	rm -f $(BOCHS_DIR)/.claude-patched
+	./patch-bochs-2.0.sh $(BOCHS_DIR)
 	touch $@
 
-# libcpu.a is prebuilt in the offline bundle. The download+configure
-# +build recipe only runs if the file is genuinely missing.
 $(BOCHS_CPU_LIB):
-	@if [ -f "$(BOCHS_CPU_LIB)" ]; then \
-	    echo ">>> Using prebuilt Bochs libs in $(BOCHS_DIR) (offline bundle)."; \
+	@set -e; \
+	if [ -f "$(BOCHS_CPU_LIB)" ]; then \
+	    echo ">>> Using existing Bochs libs in $(BOCHS_DIR)."; \
 	else \
-	    echo ">>> Prebuilt Bochs libs not found - downloading and building..."; \
+	    echo ">>> Bochs libs not found - downloading and building $(BOCHS_DIR)..."; \
 	    $(MAKE) $(BOCHS_DIR)/.extracted; \
 	    cd $(BOCHS_DIR) && ./configure \
 	        --enable-cpu-level=6 --enable-fpu --with-nogui \
-	        --host=i686-linux-gnu --enable-x86-64 \
-	        CXXFLAGS="-O2 -m32 -fno-stack-protector -fno-pie" \
-	        CFLAGS="-O2 -m32 -fno-stack-protector -fno-pie" && cd ..; \
+	        --host=i686-linux-gnu \
+	        CXXFLAGS="-O2 -m32 -fno-stack-protector -fno-pie -fno-rtti -fno-exceptions" \
+	        CFLAGS="-O2 -m32 -fno-stack-protector -fno-pie"; \
+	    cd ..; \
 	    $(MAKE) -C $(BOCHS_DIR)/cpu; \
-	    $(MAKE) -C $(BOCHS_DIR)/cpu/fpu; \
-	    $(MAKE) -C $(BOCHS_DIR)/cpu/cpudb; \
+	    $(MAKE) -C $(BOCHS_DIR)/fpu; \
 	    $(MAKE) -C $(BOCHS_DIR)/memory; \
 	fi
 
@@ -359,10 +439,14 @@ hello_blob.o: hello
 
 
 
-BOCHS_OBJ    := bochs_glue.o bochs_infra.o bochs_paramtree.o bochs_pc_system.o bochs_cstubs.o setjmp.o test_module.o tcc_kernel.o
+BOCHS_OBJ    := bochs_glue.o bochs_infra.o bochs_pc_system.o bochs_cstubs.o setjmp.o test_module.o tcc_kernel.o
+# libcpudb.a (per-model CPU database) is intentionally NOT linked here:
+# Bochs 2.0 predates cpu/cpudb/, so it never gets built (see the
+# $(BOCHS_CPU_LIB) rule above). If you later bump BOCHS_VERSION to a
+# release that does have cpu/cpudb/, add
+# "$(BOCHS_DIR)/cpu/cpudb/libcpudb.a" back to this list.
 BOCHS_LIBS   := $(BOCHS_DIR)/cpu/libcpu.a \
-                $(BOCHS_DIR)/cpu/fpu/libfpu.a \
-                $(BOCHS_DIR)/cpu/cpudb/libcpudb.a \
+                $(BOCHS_DIR)/fpu/libfpu.a \
                 $(BOCHS_DIR)/memory/libmemory.a
 BOCHS_IFLAGS := -I$(BOCHS_DIR) -I$(BOCHS_DIR)/cpu \
                 -I$(BOCHS_DIR)/iodev -I$(BOCHS_DIR)/gui
@@ -395,13 +479,14 @@ bochs_infra.o: bochs_infra.cpp $(BOCHS_DIR)/instrument.h $(BOCHS_CPU_LIB)
 	    -include instrument_stub.h \
 	    -c bochs_infra.cpp -o bochs_infra.o
 
-# bochs_paramtree.o — provides bx_list_c, bx_shadow_num_c, bx_param_num_c etc.
-bochs_paramtree.o: $(BOCHS_DIR)/gui/paramtree.cc $(BOCHS_CPU_LIB)
-	g++ -m32 -O2 $(BOCHS_IFLAGS) \
-	    -fno-exceptions -fno-rtti -fno-pie -fno-pic \
-	    -std=c++17 \
-	    -include instrument_stub.h \
-	    -c $(BOCHS_DIR)/gui/paramtree.cc -o bochs_paramtree.o
+# NOTE (Bochs 2.0 port): gui/siminterface.cc is intentionally NOT
+# compiled/linked (there used to be a bochs_paramtree.o rule here).
+# Linking that whole file pulled in bx_real_sim_c - a separate, unused
+# class in the same translation unit - and its bochsrc-parsing
+# dependencies (bx_options, bx_find_bochsrc, bx_read_configuration,
+# etc), none of which we need. The only symbol we actually needed from
+# it (bx_simulator_interface_c's empty base constructor) is now
+# provided directly in bochs_infra.cpp instead.
 
 # bochs_pc_system.o — provides bx_pc_system_c constructor and timer methods
 bochs_pc_system.o: $(BOCHS_DIR)/pc_system.cc $(BOCHS_CPU_LIB)
