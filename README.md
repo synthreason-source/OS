@@ -62,6 +62,8 @@ qemu-system-i386 -cdrom test_main.iso -m 256 -debugcon stdio -no-reboot -no-shut
 ## Full kernel build
 
 ```bash
+make clean
+rm -rf bochs-2.0 bochs-2.0-src.tar.gz tcc-src tcc-local i386-libtcc-kern.a i386-libtcc.a
 make world
 ```
 
