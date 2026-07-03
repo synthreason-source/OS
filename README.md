@@ -62,7 +62,7 @@ qemu-system-i386 -cdrom test_main.iso -m 256 -debugcon stdio -no-reboot -no-shut
 ## Full kernel build
 
 ```bash
-make clean && make BOCHS=1
+make world
 ```
 
 Run in QEMU:
