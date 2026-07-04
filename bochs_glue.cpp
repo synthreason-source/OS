@@ -287,19 +287,12 @@ static void inject_slab_tables(SlotState& s) {
 // Shared tail:      E6 E8    (out al, 0xE8)
 //                   F4       (hlt)
 //                   EB FE    (jmp .)
-Bit32u entries_off = 0x300;                 // well clear of GDT (0x80) and old stub (0xE0)
-Bit32u tail_off    = entries_off + 256 * 4; // right after the 256 entries
+// Reserve 0x900..0xD05 for 256 tiny per-vector stubs + one shared tail.
+// This range sits right after the existing IDT table (which ends at
+// 0x900) and well before the end of the guaranteed-reserved page
+// (0xFFF) — it does NOT overlap the GDT (0x80), old stub (0xE0), or
+// the IDT itself (0x100..0x900).
 
-static const Bit8u tail[5] = { 0xE6, 0xE8, 0xF4, 0xEB, 0xFE };
-__builtin_memcpy(s.mem_base + tail_off, tail, sizeof(tail));
-
-for (int v = 0; v < 256; ++v) {
-    Bit8u* e = s.mem_base + entries_off + v * 4;
-    e[0] = 0xB0;                 // mov al, imm8
-    e[1] = (Bit8u)v;             //   <- vector number becomes the exit code
-    e[2] = 0xEB;                 // jmp rel8
-    e[3] = (Bit8u)(tail_off - (entries_off + v * 4 + 4));
-}
 
     // Place the stub at a FIXED offset inside the GDT/IDT injection
     // band (0x80..0xFF). This band is reserved for kernel-injected
@@ -322,8 +315,7 @@ for (int v = 0; v < 256; ++v) {
     // Putting the stub at a fixed offset eliminates the fallback
     // entirely: the IDT always points somewhere valid, and a fault
     // always exits the slot cleanly via port 0xE8.
-    Bit32u stub_off = 0xE0;
-    __builtin_memcpy(s.mem_base + stub_off, tail, sizeof(tail));
+
 
     // ── GDT at slab offset 0x80 ────────────────────────────────────
     // Three descriptors:
@@ -341,21 +333,47 @@ for (int v = 0; v < 256; ++v) {
     __builtin_memcpy(gdt_base +  8, code_desc, 8);
     __builtin_memcpy(gdt_base + 16, data_desc, 8);
 
-    // ── IDT at slab offset 0x100 ───────────────────────────────────
-    // 256 trap gates all pointing at the exit-trap stub.
-    Bit32u handler_va = s.vaddr_base + stub_off;
-    Bit8u* idt_base   = s.mem_base + 0x100;
+    // ── Per-vector exit stubs at slab offset 0x900..0xD05 ──────────
+    // Sits right after the IDT (which ends at 0x900) and well inside
+    // the guaranteed-reserved page (ends 0xFFF). Does NOT overlap the
+    // GDT (0x80), the old shared stub (0xE0), or the IDT (0x100..0x900).
+    //
+    // Each vector gets a 4-byte entry: mov al, <vector>; jmp tail.
+    // The tail (shared) does the actual out/hlt. This means the exit
+    // code reaching elf_io_exit() is now the real fault vector number
+    // instead of always being hard-coded to 0 — 0 only means a genuine
+    // kexit(0), not "some fault masquerading as 0".
+    Bit32u entries_off = 0x900;
+    Bit32u tail_off    = entries_off + 256 * 4;   // 0xD00
 
-    Bit8u gate[8] = {
-        (Bit8u)(handler_va & 0xFF),
-        (Bit8u)((handler_va >> 8) & 0xFF),
-        0x08, 0x00,         // selector = code segment 0x08
-        0x00,
-        0x8E,               // P=1 DPL=0 32-bit interrupt gate
-        (Bit8u)((handler_va >> 16) & 0xFF),
-        (Bit8u)((handler_va >> 24) & 0xFF),
-    };
+    static const Bit8u tail[5] = { 0xE6, 0xE8, 0xF4, 0xEB, 0xFE };
+    __builtin_memcpy(s.mem_base + tail_off, tail, sizeof(tail));
+
+    for (int v = 0; v < 256; ++v) {
+        Bit8u* e = s.mem_base + entries_off + v * 4;
+        e[0] = 0xB0;                 // mov al, imm8
+        e[1] = (Bit8u)v;             // vector number -> becomes the exit code
+        e[2] = 0xEB;                 // jmp rel8
+        e[3] = (Bit8u)(tail_off - (entries_off + v * 4 + 4));
+    }
+
+    // ── IDT at slab offset 0x100 ───────────────────────────────────
+    // 256 trap gates, each now pointing at its OWN entry stub above
+    // (previously all 256 pointed at the same stub, so the exit code
+    // could never tell you which vector actually fired).
+    Bit8u* idt_base = s.mem_base + 0x100;
+
     for (int i = 0; i < 256; ++i) {
+        Bit32u handler_va = s.vaddr_base + entries_off + i * 4;
+        Bit8u gate[8] = {
+            (Bit8u)(handler_va & 0xFF),
+            (Bit8u)((handler_va >> 8) & 0xFF),
+            0x08, 0x00,         // selector = code segment 0x08
+            0x00,
+            0x8E,               // P=1 DPL=0 32-bit interrupt gate
+            (Bit8u)((handler_va >> 16) & 0xFF),
+            (Bit8u)((handler_va >> 24) & 0xFF),
+        };
         __builtin_memcpy(idt_base + i * 8, gate, 8);
     }
 
@@ -367,7 +385,6 @@ for (int v = 0; v < 256; ++v) {
     s.cpu.idtr.base  = s.vaddr_base + 0x100;
     s.cpu.idtr.limit = 256 * 8 - 1;
 }
-
 // =====================================================================
 // CPU state save / restore
 //

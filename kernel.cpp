@@ -8812,23 +8812,14 @@ static int  elf_io_read (int slot) { return pop_input(slot); }
 static void elf_io_write(int slot, char c) { push_output(slot, c); }
 static void elf_io_exit (int slot, int code) {
     if (slot >= 0 && slot < MAX_ELF_PROCESSES) {
-        // The diagnostic print was using an UNINITIALIZED `buf[64]`. That
-        // shoved whatever stack garbage was sitting there into the
-        // terminal — sometimes empty, sometimes including control bytes
-        // that render as blank spaces in font.h and silently corrupt
-        // earlier output. The diagnostic is disabled by default and the
-        // commented-out snprintf is left in case it's useful for hand
-        // debugging; do NOT call console_print on uninitialized memory.
-        //
-        // NOTE: we deliberately do NOT free memory_base/stack here.
-        // This callback fires from inside Bochs's cpu_loop (via
-        // bochs_guest_exit), which can still touch the slab on its
-        // way out — TLB writebacks, async event handling, etc.
-        // Freeing here would be a use-after-free. The actual teardown
-        // (free memory, unregister the slot's Bochs mapping, reset
-        // cpu_initialized) happens in tick_elf_processes once
-        // x86_tick has fully unwound.
-        (void)code;
+        // DIAGNOSTIC: report the exit code (now the real fault vector
+        // number, per the per-vector stub change in inject_slab_tables).
+        // The buffer is zero-initialized this time, unlike the old
+        // disabled version this comment used to warn about.
+        char buf[64] = {0};
+        snprintf(buf, sizeof(buf), "\n[guest exit, code=%d]\n", code);
+        console_print(buf);
+
         elf_processes[slot].completed = true;
         elf_processes[slot].active    = false;
     }
