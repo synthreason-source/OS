@@ -1322,12 +1322,13 @@ extern "C" void bochs_guest_putc(char c) {
     SlotState& s = g_slots[g_active_slot];
     if (s.write_cb) s.write_cb(g_active_slot, c);
 
-    // Ask cpu_loop to yield so the kernel main loop can drain output,
-    // poll input, repaint. Both flags must be set: kill_bochs_request
-    // alone is only checked inside handleAsyncEvent, which is only
-    // entered when async_event != 0.
-    BX_CPU(0)->kill_bochs_request = 1;
-    BX_CPU(0)->async_event = 1;
+    // Do NOT set kill_bochs_request here. The old code yielded after
+    // every character, but bochs_cpu_tick only calls cpu_loop() once,
+    // so cpu_loop() returned after the first putc and the guest never
+    // advanced to output the second character (e.g. "HELLO WORLD"
+    // showed only 'H'). The instruction budget in bochs_cpu_tick
+    // provides time-slicing; bochs_guest_exit (port 0xE8) still sets
+    // kill_bochs_request to signal process termination.
 }
 
 extern "C" void bochs_guest_exit(int code) {
