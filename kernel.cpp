@@ -9083,6 +9083,17 @@ static bool x86_tick(int slot, int steps) {
     bochs_cpu_tick(steps);
     x86_breadcrumb(7, 't');
 
+    // Guest polled port 0xE7 (bochs_guest_getc, see bochs_glue.cpp) and
+    // found no keystroke queued. Flag this slot as waiting-for-input so
+    // the keyboard router in the main loop ("Route keypresses to any
+    // active ELF guest process") delivers the very next keypress here
+    // instead of letting the guest spend its whole instruction budget
+    // busy-polling an empty queue. Gated on in_empty() too: if a key
+    // arrived between the guest's poll and now, don't pause the slot.
+    if (bochs_process_wants_input(slot) && in_empty(slot)) {
+        proc.waiting_for_input = true;
+    }
+
     // Diagnostic restart detector. If EIP was WELL PAST the entry point
     // before this tick (i.e. we were mid-execution) and is now back AT
     // the entry point or within a few bytes of it, something rewound

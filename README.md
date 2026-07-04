@@ -9,7 +9,7 @@ SATA port selection with 'disk_select'
 
 TODO: elf's print/memory/tick algorithm glitch free
 
-TODO: bochs keyboard input working and test elf functionality via bochs CPU emulator
+DONE: bochs keyboard input — guests can now read stdin via `inb(0xE7)`, see "Guest kernel ABI" below.
 
 TODO: add ethernet, Lynx_(web_browser)
 
@@ -115,6 +115,12 @@ static inline void outb(unsigned short port, unsigned char v) {
     __asm__ volatile("outb %0,%1" :: "a"(v), "Nd"(port));
 }
 
+static inline unsigned char inb(unsigned short port) {
+    unsigned char v;
+    __asm__ volatile("inb %1,%0" : "=a"(v) : "Nd"(port));
+    return v;
+}
+
 void _start(void) {
     const char *s = "Hello from TCC!\n";
     while (*s) outb(0xE9, *s++);   // print to terminal
@@ -122,3 +128,27 @@ void _start(void) {
     for (;;) {}
 }
 ```
+
+### Keyboard input
+
+`inb(0xE7)` returns the next queued keystroke from the terminal, or `0`
+if none is waiting yet. It's non-blocking, so poll it in a loop:
+
+```c
+static inline unsigned char inb(unsigned short port) {
+    unsigned char v;
+    __asm__ volatile("inb %1,%0" : "=a"(v) : "Nd"(port));
+    return v;
+}
+
+char getch(void) {
+    unsigned char c;
+    while ((c = inb(0xE7)) == 0) { /* spin until a key arrives */ }
+    return c;
+}
+```
+
+While a guest is polling an empty queue, the kernel notices (via
+`bochs_process_wants_input`) and pauses that slot until the next
+keypress arrives instead of burning its whole instruction budget —
+see `bochs_guest_getc()` in `bochs_glue.cpp`.

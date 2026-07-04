@@ -185,7 +185,17 @@ bx_devices_c::~bx_devices_c() {}
 extern "C" void bochs_guest_putc(char c);
 // bochs_guest_exit already forward-declared at top.
 
-Bit32u bx_devices_c::inp(Bit16u, unsigned) { return 0xFFFF; }
+// Port 0xE7 — guest keyboard-input sentinel (see bochs_glue.cpp). The
+// guest does `in al, 0xE7` and gets back the next queued keystroke, or
+// 0 if none is waiting yet. Routes to the active slot's read_cb
+// (elf_io_read -> pop_input), the same ring buffer regular
+// (non-Bochs) ELF processes already use for stdin.
+extern "C" int bochs_guest_getc();
+
+Bit32u bx_devices_c::inp(Bit16u port, unsigned) {
+    if (port == 0xE7) return (Bit32u)(unsigned char)bochs_guest_getc();
+    return 0xFFFF;
+}
 void   bx_devices_c::outp(Bit16u port, Bit32u val, unsigned) {
     // Port 0xE9 — Bochs "debug console" port. We route to the active
     // slot's write callback (-> kernel terminal).

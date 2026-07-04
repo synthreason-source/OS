@@ -1389,6 +1389,38 @@ extern "C" bool bochs_process_wants_input(int slot) {
 }
 
 // =====================================================================
+// Guest keyboard input (port 0xE7 = getc, non-blocking)
+// =====================================================================
+//
+// Mirrors the 0xE8/0xE9 sentinel-port convention: the guest does
+// `in al, 0xE7` and gets back either the next queued keystroke or 0 if
+// none is waiting yet (0 doubles as "empty", the same way pop_input()
+// already treats it on the kernel side - see kernel.cpp's pop_input).
+//
+// bx_devices_c::inp() (bochs_infra.cpp) routes port 0xE7 here. We defer
+// to the active slot's read_cb (elf_io_read -> pop_input) instead of
+// touching the ring buffer directly, so a Bochs-emulated guest and a
+// natively-executed guest share the exact same per-slot stdin queue.
+//
+// When the queue is empty we set wants_input so the kernel's tick loop
+// (x86_tick in kernel.cpp) can flip the slot's waiting_for_input flag
+// and have the keyboard-routing code hand it the very next keystroke,
+// instead of leaving the guest to busy-poll an empty queue for an
+// entire instruction budget.
+extern "C" int bochs_guest_getc() {
+    if (g_active_slot < 0 || g_active_slot >= MAX_BOCHS_SLOTS) return 0;
+    SlotState& s = g_slots[g_active_slot];
+    if (!s.read_cb) return 0;
+
+    int c = s.read_cb(g_active_slot);
+    if (c == 0) {
+        // Nothing queued yet - remember that this slot asked.
+        s.wants_input = true;
+    }
+    return c;
+}
+
+// =====================================================================
 // Tick — run the active slot for a bounded number of cpu_loop entries
 // =====================================================================
 //
