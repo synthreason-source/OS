@@ -281,12 +281,25 @@ static void mapping_unregister(SlotState& s) {
 static void inject_slab_tables(SlotState& s) {
     if (!s.mem_base || s.mem_size < 0x1000) return;
 
-    static const Bit8u stub[7] = {
-        0xB0, 0x00,         // mov  $0, %al
-        0xE6, 0xE8,         // out  %al, $0xE8
-        0xF4,               // hlt
-        0xEB, 0xFE,         // jmp  .  (safety: spin if hlt resumes)
-    };
+// Reserve room for 256 tiny per-vector stubs + one shared tail.
+// Each entry stub: B0 <vec>  (mov al, vec)    -- 2 bytes
+//                  EB <rel>  (jmp tail)        -- 2 bytes
+// Shared tail:      E6 E8    (out al, 0xE8)
+//                   F4       (hlt)
+//                   EB FE    (jmp .)
+Bit32u entries_off = 0x300;                 // well clear of GDT (0x80) and old stub (0xE0)
+Bit32u tail_off    = entries_off + 256 * 4; // right after the 256 entries
+
+static const Bit8u tail[5] = { 0xE6, 0xE8, 0xF4, 0xEB, 0xFE };
+__builtin_memcpy(s.mem_base + tail_off, tail, sizeof(tail));
+
+for (int v = 0; v < 256; ++v) {
+    Bit8u* e = s.mem_base + entries_off + v * 4;
+    e[0] = 0xB0;                 // mov al, imm8
+    e[1] = (Bit8u)v;             //   <- vector number becomes the exit code
+    e[2] = 0xEB;                 // jmp rel8
+    e[3] = (Bit8u)(tail_off - (entries_off + v * 4 + 4));
+}
 
     // Place the stub at a FIXED offset inside the GDT/IDT injection
     // band (0x80..0xFF). This band is reserved for kernel-injected
@@ -310,7 +323,7 @@ static void inject_slab_tables(SlotState& s) {
     // entirely: the IDT always points somewhere valid, and a fault
     // always exits the slot cleanly via port 0xE8.
     Bit32u stub_off = 0xE0;
-    __builtin_memcpy(s.mem_base + stub_off, stub, sizeof(stub));
+    __builtin_memcpy(s.mem_base + stub_off, tail, sizeof(tail));
 
     // ── GDT at slab offset 0x80 ────────────────────────────────────
     // Three descriptors:
