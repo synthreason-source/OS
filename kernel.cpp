@@ -9080,52 +9080,32 @@ static bool x86_tick(int slot, int steps) {
     // isn't polluted.)
     uint32_t eip_before = bochs_cpu_get_eip();
 
-    bochs_cpu_tick(steps);
-    x86_breadcrumb(7, 't');
+bochs_cpu_tick(steps);
+x86_breadcrumb(7, 't');
 
-    // Guest polled port 0xE7 (bochs_guest_getc, see bochs_glue.cpp) and
-    // found no keystroke queued. Flag this slot as waiting-for-input so
-    // the keyboard router in the main loop ("Route keypresses to any
-    // active ELF guest process") delivers the very next keypress here
-    // instead of letting the guest spend its whole instruction budget
-    // busy-polling an empty queue. Gated on in_empty() too: if a key
-    // arrived between the guest's poll and now, don't pause the slot.
-    if (bochs_process_wants_input(slot) && in_empty(slot)) {
-        proc.waiting_for_input = true;
-    }
+bool just_started_waiting =
+    bochs_process_wants_input(slot) && in_empty(slot);
 
-    // Diagnostic restart detector. If EIP was WELL PAST the entry point
-    // before this tick (i.e. we were mid-execution) and is now back AT
-    // the entry point or within a few bytes of it, something rewound
-    // the CPU. Emit '?' into the output buffer so it's visible in the
-    // terminal at the exact point the restart occurred. This pins down
-    // whether the "8 chars then restart" symptom is the CPU genuinely
-    // re-entering _start or something else (e.g. icache returning a
-    // stale decoded trace that points at the entry).
-    uint32_t eip_after = bochs_cpu_get_eip();
-    if (eip_before > proc.entry_point + 16 &&
-        eip_after  < proc.entry_point + 16 &&
-        eip_after >= proc.entry_point) {
-        push_output(slot, '?');
-    }
+if (just_started_waiting) {
+    proc.waiting_for_input = true;
+    // The guest yielded mid-`IN` on port 0xE7. EIP isn't reliably
+    // retired across that abort, so don't trust it this tick —
+    // skip the exit/EIP-range checks below entirely and pick back
+    // up cleanly next tick once real input has been pushed.
+    return true;
+}
 
+// ─── FIX: detect clean guest-exit signal ──────────────────────────────
+if (!proc.active || proc.completed) return false;
 
-    // ─── FIX: detect clean guest-exit signal ──────────────────────────────
-    // bochs_guest_exit() (triggered by an `out %al, $0xE8` from the IDT
-    // stub on any guest fault or trap) calls our exit_cb (elf_io_exit),
-    // which flips proc.active to false. Re-check it here so the surrounding
-    // tick_elf_processes sees `running == false` and clears the terminal's
-    // captured_elf_slot, returning the user to the shell prompt instead of
-    // leaving a dead emulator window taking input.
-    if (!proc.active || proc.completed) return false;
+unsigned int eip = bochs_cpu_get_eip();
+if (eip == 0 || eip < proc.vaddr_base || eip >= proc.vaddr_base + proc.memory_size) {
+    proc.completed = true;
+    proc.active    = false;
+    return false;
+}
 
-    unsigned int eip = bochs_cpu_get_eip();
-    if (eip == 0 || eip < proc.vaddr_base ||
-        eip >= proc.vaddr_base + proc.memory_size) {
-        proc.completed = true;
-        proc.active    = false;
-        return false;
-    }
+return true;
 
     return true;
 }
