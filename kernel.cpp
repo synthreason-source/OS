@@ -7069,6 +7069,7 @@ void handle_command() {
 			console_print("=== Bochs i386 CPU emulator ===\n");
 			console_print("Just type an ELF filename to run it -- init happens automatically.\n");
 		} else {
+			console_print("\n");
 			int s = load_and_execute_elf(bochs_fname, bochs_args, this);
 			if (s >= 0) captured_elf_slot = s;
 		}
@@ -7292,18 +7293,7 @@ void handle_command() {
                 console_print("        make cc SRC="); console_print(src_arg);
                 if (out_arg) { console_print(" OUT="); console_print(out_arg); }
                 console_print("\n");
-                if (_elf_exists) {
-                    console_print("ELF '"); console_print(out_name);
-                    console_print("' already on disk. Running now...\n");
-                    is_emulator_window = true;
-                    title = "Bochs Emulator";
-                    int s = load_and_execute_elf(out_name, nullptr, this);
-                    if (s >= 0) {
-                        captured_elf_slot = s;
-                    } else {
-                        console_print("cc: launch failed (see error above)\n");
-                    }
-                }
+                
             }
         }
     }
@@ -7702,6 +7692,7 @@ void handle_command() {
 
         // Run the ELF in-place; output flows to this window's
         // console_print via the elf_io_write callback chain.
+	console_print("\n");
         int s = load_and_execute_elf(command, args, this);
         if (s >= 0) captured_elf_slot = s;
     }
