@@ -919,6 +919,5 @@ extern "C" void tcc_kernel_cmd_cc(void* terminal_opaque,
 
     console_print("cc: written '"); console_print(out_name); console_print("'\n");
 
-    // Auto-launch
-    tcc_bridge_exec_elf(terminal_opaque, out_name, nullptr);
+
 }
