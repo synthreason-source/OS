@@ -1414,30 +1414,11 @@ extern "C" int bochs_guest_getc() {
 
     int c = s.read_cb(g_active_slot);
     if (c == 0) {
-        // Nothing queued yet - remember that this slot asked.
         s.wants_input = true;
-
-        // Force cpu_loop() to return RIGHT NOW instead of burning the
-        // rest of this tick's instruction budget spinning inside the
-        // guest's `while (inb(0xE7) == 0) {}` poll loop. bochs_cpu_tick
-        // makes exactly one cpu_loop() call per frame with a huge fixed
-        // budget (n * 256, up to ~2^31); without this, a getch()-style
-        // guest never advances past its first empty poll, cpu_loop()
-        // never returns, and the single-threaded kernel main loop -
-        // which is what would otherwise deliver the next keystroke and
-        // repaint the screen - blocks forever. Net effect from the
-        // user's side: the ENTIRE kernel freezes, not just the guest
-        // window, the moment a program tries to read a key that isn't
-        // queued yet.
-        //
-        // Mirrors bochs_guest_exit()'s use of these same two fields.
-        // Unlike bochs_guest_putc() (which deliberately does NOT yield
-        // per character, so a multi-character string prints in one
-        // tick) we DO want to yield on every empty poll: the guest
-        // will simply re-issue `in al,0xE7` on the next tick, once per
-        // frame, until a key shows up.
-        BX_CPU(0)->kill_bochs_request = 1;
-        BX_CPU(0)->async_event         = 1;
+        // removed: forced kill_bochs_request / async_event here.
+        // Let cpu_loop() finish this IN instruction normally and
+        // keep spinning within its existing budget instead of
+        // yielding mid-instruction.
     }
     return c;
 }
