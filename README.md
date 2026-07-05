@@ -6,12 +6,9 @@ CTRL-Q saves and exits text editor...
 
 SATA port selection with 'disk_select'
 
+guest programs require bochs_drivers.h to interface with the OS.
 
-TODO: elf's print/memory/tick algorithm glitch free
-
-DONE: bochs keyboard input — guests can now read stdin via `inb(0xE7)`, see "Guest kernel ABI" below.
-
-TODO: add ethernet, Lynx_(web_browser)
+TODO: add ethernet, Lynx_(web_browser) & busybox
 
 # Build Instructions
 
