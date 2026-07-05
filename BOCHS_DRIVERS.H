@@ -1,4 +1,4 @@
-/* BOCHS_DRIVERS.h — guest ABI for in-kernel TCC programs */
+/* BOCHS_DRIVERS.H — guest ABI for in-kernel TCC programs */
  
 /* port I/O helpers */
 static inline void outb(unsigned short port, unsigned char val)
