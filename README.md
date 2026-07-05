@@ -131,8 +131,7 @@ void _start(void) {
 
 ### Keyboard input
 
-`inb(0xE7)` returns the next queued keystroke from the terminal, or `0`
-if none is waiting yet. It's non-blocking, so poll it in a loop:
+`inb(0xE7)` returns the next queued keystroke from the terminal:
 
 ```c
 /* keyboard_tcc.c — example guest program showing keyboard input.
