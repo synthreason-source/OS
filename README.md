@@ -152,9 +152,7 @@ if none is waiting yet. It's non-blocking, so poll it in a loop:
  * point (set by tcc_guest.ld). Code lands at 0x08002000 so it is safe
  * from the Bochs slot's GDT/IDT/stub injection zone (0x08001000..0x08001FFF).
  */
-/* tcc.h â€” guest ABI for in-kernel TCC programs */
-#ifndef TCC_H
-#define TCC_H
+
 /* port I/O helpers
 static inline void outb(unsigned short port, unsigned char val)
 {
