@@ -152,36 +152,8 @@ if none is waiting yet. It's non-blocking, so poll it in a loop:
  * point (set by tcc_guest.ld). Code lands at 0x08002000 so it is safe
  * from the Bochs slot's GDT/IDT/stub injection zone (0x08001000..0x08001FFF).
  */
+#include "tcc.h"
 
-/* port I/O helpers
-static inline void outb(unsigned short port, unsigned char val)
-{
-    __asm__ volatile("outb %0, %1" : : "a"(val), "Nd"(port));
-}
-
-static inline unsigned char inb(unsigned short port)
-{
-    unsigned char v;
-    __asm__ volatile("inb %1, %0" : "=a"(v) : "Nd"(port));
-    return v;
-}
-
-static void kputc(char c)   { outb(0xE9, (unsigned char)c); }
-static void kexit(int code) { outb(0xE8, (unsigned char)code); }
-
-static void kputs(const char *s)
-{
-    while (*s) kputc(*s++);
-}
-
-/* Non-blocking read of the guest's stdin queue. Returns 0 if nothing
- * is waiting yet â€” spin on it to make a blocking getch(). */
-static char getch(void)
-{
-    unsigned char c;
-    while ((c = inb(0xE7)) == 0) { /* wait for a keystroke */ }
-    return c;
-}
 void _start(void)
 {
     kputs("==================================\n");
