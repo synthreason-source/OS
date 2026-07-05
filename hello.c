@@ -17,7 +17,7 @@
  * point (set by tcc_guest.ld). Code lands at 0x08002000 so it is safe
  * from the Bochs slot's GDT/IDT/stub injection zone (0x08001000..0x08001FFF).
  */
-#include "tcc.h"
+#include "drivers.h"
 
 void _start(void)
 {
