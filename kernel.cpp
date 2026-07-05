@@ -1723,6 +1723,16 @@ void load_desktop_items() {
         return nullptr;
     }
 
+    // Which ELF slot (if any) does the currently FOCUSED window own?
+    // -1 if no window is focused, or the focused window isn't a
+    // terminal capturing an ELF process. Used to route keystrokes to
+    // whichever process the user actually clicked into, instead of
+    // just the first process that happens to be waiting for input.
+    int get_focused_elf_slot() const {
+        if (focused_idx < 0 || focused_idx >= num_windows) return -1;
+        return windows[focused_idx]->get_elf_slot();
+    }
+
     void cleanup_closed_windows() {
         if (num_windows == 0) return;
         int current_idx = 0;
@@ -9807,16 +9817,34 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
         }
 
         // Route keypresses to any active ELF guest process
+        //
+        // FIX (focus ignored on click): this used to scan every slot
+        // and hand the keystroke to the FIRST one that was active &&
+        // waiting_for_input, regardless of which terminal window was
+        // actually focused/clicked. With two terminals each running
+        // a program that reads stdin, typing while Terminal B was
+        // focused would silently feed Terminal A instead (whichever
+        // slot happened to be waiting), and last_key_press got
+        // zeroed here before wm.handle_input ever saw it — so B's
+        // own captured_elf_slot path (kernel.cpp's BUSYBOX CAPTURE
+        // block) never even ran.
+        //
+        // Fix: only steal the keystroke for the ELF slot owned by
+        // the currently FOCUSED window. If that slot isn't waiting
+        // for input (or no window is focused, or the focused window
+        // isn't capturing a slot), fall through and let the normal
+        // g_evt_input / wm.handle_input path below handle the key —
+        // which is what already correctly threads input to whichever
+        // terminal's captured_elf_slot the user clicked into.
         if (last_key_press != 0) {
-			for (int s = 0; s < MAX_ELF_PROCESSES; s++) {
-				if (elf_processes[s].active && elf_processes[s].waiting_for_input) {
-					push_input(s, last_key_press);
-					elf_processes[s].waiting_for_input = false;
-					last_key_press = 0;
-					break;
-				}
-			}
-		}
+            int fs = wm.get_focused_elf_slot();
+            if (fs >= 0 && fs < MAX_ELF_PROCESSES &&
+                elf_processes[fs].active && elf_processes[fs].waiting_for_input) {
+                push_input(fs, last_key_press);
+                elf_processes[fs].waiting_for_input = false;
+                last_key_press = 0;
+            }
+        }
 
         // Software timer (no PIT — IRQ0 would fire into an unhandled vector)
         if (++poll_counter >= 500) {
