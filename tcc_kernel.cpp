@@ -528,9 +528,43 @@ static void kfd_reset_all() {
 int open(const char* path, int flags, ...) {
     bool writing=(flags&O_WRONLY)||(flags&O_RDWR)||(flags&O_CREAT);
     { char _db[128]; snprintf(_db,sizeof(_db),"[tcc] open(%s, flags=0x%x, writing=%d)\n", path?path:"null", flags, (int)writing); console_print(_db); }
+
     if (!writing) {
-        g_errno_val=2; console_print("[tcc] open: ENOENT\n"); return -1;
+        // FIX (#include "x.h" never found): this used to unconditionally
+        // return ENOENT for every read-mode open(). That was harmless for
+        // the main translation unit — tcc_kernel_cmd_cc() feeds that in
+        // directly via fat32_read_file_as_string() + tcc_compile_string(),
+        // never through open() — but libtcc's PREPROCESSOR resolves every
+        // #include by calling this same open()/read()/close() path itself.
+        // With read-mode open() always failing, #include "x.h" (and any
+        // other local header) could never be found, no matter what was
+        // actually on disk.
+        //
+        // Fix: load the requested file from FAT32 the same way the main
+        // source file is loaded, and hand back a read-only fake fd over
+        // its bytes so the existing read()/lseek()/close() shims below
+        // (which already handle the read side generically) just work.
+        char* data = fat32_read_file_as_string(path);
+        if (!data) {
+            g_errno_val=2;
+            { char _db[160]; snprintf(_db,sizeof(_db),"[tcc] open(%s): ENOENT (not on disk)\n", path?path:"null"); console_print(_db); }
+            return -1;
+        }
+        int fd=kfd_alloc();
+        if (fd<0) {
+            free(data);
+            g_errno_val=12; console_print("[tcc] open: no fd slots!\n"); return -1;
+        }
+        KFd* f=kfd_get(fd);
+        f->is_write=false;
+        f->buf=(unsigned char*)data;              // owned by kfd now; freed on kfd_release/reset
+        f->size=(unsigned long)strlen(data);
+        f->cap=f->size;
+        f->pos=0;
+        { char _db[96]; snprintf(_db,sizeof(_db),"[tcc] open(%s): read fd=%d size=%lu\n", path?path:"null", fd, f->size); console_print(_db); }
+        return fd;
     }
+
     int fd=kfd_alloc();
     if (fd<0) { g_errno_val=12; console_print("[tcc] open: no fd slots!\n"); return -1; }
     KFd* f=kfd_get(fd);
