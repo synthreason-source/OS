@@ -1445,10 +1445,32 @@ extern "C" int bochs_guest_getc() {
     int c = s.read_cb(g_active_slot);
     if (c == 0) {
         s.wants_input = true;
-        // removed: forced kill_bochs_request / async_event here.
-        // Let cpu_loop() finish this IN instruction normally and
-        // keep spinning within its existing budget instead of
-        // yielding mid-instruction.
+
+        // FIX (kernel freeze in getch()): a guest blocking-getch() is
+        // `while (inb(0xE7) == 0) {}` — a bare IN/TEST/JZ spin with no
+        // exit or putc in it, so it never touches port 0xE8/0xE9 and
+        // never trips the async-event path any other way. The old
+        // "let cpu_loop() keep spinning within its existing budget"
+        // approach assumed max_instr_count would eventually force
+        // cpu_loop() to return on its own, but a tight port-IO-only
+        // loop doesn't reliably retire against that countdown here,
+        // so cpu_loop() simply never comes back. tick_elf_processes()
+        // then never runs again, and the whole kernel main loop
+        // (repaint, mouse, keyboard polling) stalls with it — a full
+        // freeze, not just a stuck guest.
+        //
+        // Force the same clean yield-back-to-kernel that a guest exit
+        // or putc gets, immediately after this IN retires. cpu_loop()
+        // sees kill_bochs_request/async_event set and returns to
+        // bochs_cpu_tick() right away instead of looping further.
+        // x86_tick() already handles this correctly on the kernel
+        // side (bochs_process_wants_input() + in_empty() check right
+        // after the tick sets proc.waiting_for_input and skips the
+        // exit/EIP checks for that frame), so no kernel.cpp change is
+        // needed — this just makes sure control actually gets back
+        // there every tick instead of only when we get lucky.
+        BX_CPU(0)->kill_bochs_request = 1;
+        BX_CPU(0)->async_event        = 1;
     }
     return c;
 }
