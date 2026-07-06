@@ -13,8 +13,9 @@
 //     contained version that does NOT depend on SIM-> calls. (The
 //     stock version's chain of SIM->get_param_*() during init is the
 //     source of half the freestanding-port pain.)
-//   * Route guest I/O on ports 0xE9 (putc) and 0xE8 (exit) into the
-//     glue layer.
+//   * Route guest I/O on ports 0xE9 (putc), 0xE8 (exit), 0xE7 (getc),
+//     and 0xE0-0xE4 (file-level FAT32 disk wrapper) into the glue
+//     layer.
 //
 // This file deliberately contains NO panic recovery. If Bochs's panic
 // path is reached, the active slot is told to exit and cpu_loop is
@@ -192,6 +193,16 @@ extern "C" void bochs_guest_putc(char c);
 // (non-Bochs) ELF processes already use for stdin.
 extern "C" int bochs_guest_getc();
 
+// Ports 0xE0-0xE4 — guest disk wrapper (file-level FAT32 access; see
+// bochs_drivers.h's disk_mailbox_t / kfread / kfwrite / kfremove /
+// kfstat, and bochs_glue.cpp's bochs_guest_disk_cmd). The guest writes
+// the little-endian bytes of a guest-physical mailbox address to
+// 0xE0-0xE3, then a command byte to 0xE4, which triggers the whole
+// file operation synchronously (result is written back into the same
+// mailbox struct in guest memory before the triggering OUT returns).
+extern "C" void bochs_guest_disk_cmd(unsigned int mbox_addr, int cmd);
+static Bit32u s_disk_addr_bytes[4] = {0, 0, 0, 0};
+
 Bit32u bx_devices_c::inp(Bit16u port, unsigned) {
     if (port == 0xE7) return (Bit32u)(unsigned char)bochs_guest_getc();
     return 0xFFFF;
@@ -203,6 +214,19 @@ void   bx_devices_c::outp(Bit16u port, Bit32u val, unsigned) {
     // Port 0xE8 — process exit sentinel. The IDT trap stub injected
     // by bochs_glue.cpp does `out al, 0xE8` on every guest fault.
     else if (port == 0xE8) bochs_guest_exit((int)(val & 0xFF));
+    // Ports 0xE0-0xE3 — latch one byte each of a 32-bit guest-physical
+    // mailbox address (little-endian). Consumed when 0xE4 is written.
+    else if (port >= 0xE0 && port <= 0xE3) {
+        s_disk_addr_bytes[port - 0xE0] = (Bit32u)(val & 0xFF);
+    }
+    // Port 0xE4 — disk command trigger.
+    else if (port == 0xE4) {
+        Bit32u addr = s_disk_addr_bytes[0]
+                    | (s_disk_addr_bytes[1] << 8)
+                    | (s_disk_addr_bytes[2] << 16)
+                    | (s_disk_addr_bytes[3] << 24);
+        bochs_guest_disk_cmd(addr, (int)(val & 0xFF));
+    }
     // All other ports are silently dropped.
 }
 void bx_devices_c::reset(unsigned) {}

@@ -134,6 +134,7 @@ void fat32_list_files();
 typedef struct { char name[11]; uint8_t attr; uint8_t ntres; uint8_t crt_time_tenth; uint16_t crt_time, crt_date, lst_acc_date, fst_clus_hi; uint16_t wrt_time, wrt_date, fst_clus_lo; uint32_t file_size; } __attribute__((packed)) fat_dir_entry_t;
 int fat32_list_directory(const char* path, fat_dir_entry_t* buffer, int max_entries);
 int fat32_find_entry(const char* filename, fat_dir_entry_t* entry_out, uint32_t* sector_out, uint32_t* offset_out);
+int fat32_stat_file(const char* filename, uint32_t* size_out);
 bool fat32_init();
 
 
@@ -534,6 +535,7 @@ char* fat32_read_file_as_string(const char* filename);
 void fat32_list_files();
 bool fat32_init();
 void fat32_get_fne_from_entry(fat_dir_entry_t* entry, char* out); // New helper
+int fat32_stat_file(const char* filename, uint32_t* size_out); // Guest disk wrapper helper (bochs_glue.cpp)
 // --- Minimal Standard Library ---
 size_t strlen(const char* str) { size_t len = 0; while (str[len]) len++; return len; }
 int memcmp(const void* ptr1, const void* ptr2, size_t n) { const uint8_t* p1 = (const uint8_t*)ptr1; const uint8_t* p2 = (const uint8_t*)ptr2; for(size_t i=0; i<n; ++i) if(p1[i] != p2[i]) return p1[i] - p2[i]; return 0; }
@@ -3526,6 +3528,19 @@ int fat32_find_entry(const char* filename, fat_dir_entry_t* entry_out, uint32_t*
     delete[] dir_buf;
     return -1;
 }
+// Guest-disk-wrapper helper (see bochs_glue.cpp's bochs_guest_disk_cmd):
+// get a file's size without reading its contents. Used both for the
+// guest's STAT command and internally by READ, so a too-small buffer
+// fails fast (with the real size reported back) instead of paying for
+// a full fat32_read_file_as_string() alloc+copy first.
+int fat32_stat_file(const char* filename, uint32_t* size_out) {
+    fat_dir_entry_t entry;
+    uint32_t sector, offset;
+    if (fat32_find_entry(filename, &entry, &sector, &offset) != 0) return -1;
+    if (size_out) *size_out = entry.file_size;
+    return 0;
+}
+
 int fat32_list_directory(const char* path, fat_dir_entry_t* buffer, int max_entries) {
     // This implementation ignores 'path' and lists the current directory for simplicity.
     if (!ahci_base || !current_directory_cluster || !buffer) {

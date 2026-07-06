@@ -1476,6 +1476,143 @@ extern "C" int bochs_guest_getc() {
 }
 
 // =====================================================================
+// Guest disk wrapper (ports 0xE0-0xE4 = file-level FAT32 access)
+// =====================================================================
+//
+// Protocol (see bochs_drivers.h's disk_mailbox_t / kfread / kfwrite /
+// kfremove / kfstat for the guest side): the guest writes the little-
+// endian bytes of a guest-physical mailbox address to ports
+// 0xE0-0xE3, then a command byte to 0xE4. bx_devices_c::outp
+// (bochs_infra.cpp) reassembles the address and calls
+// bochs_guest_disk_cmd() below, which runs the WHOLE file operation to
+// completion before returning — same blocking-call shape as a real
+// read_write_sectors() DMA transaction, so the guest never has to
+// poll.
+//
+// Every command goes straight through the SAME fat32_* functions and
+// disk.img that the host kernel's own shell/file-explorer commands
+// use — there is no separate cache, shadow copy, or write-back buffer
+// introduced here. A file a guest program writes is immediately
+// visible to (and consistent with) the rest of the kernel the moment
+// the triggering OUT returns, and vice versa.
+
+// Mirrors bochs_drivers.h's disk_mailbox_t byte-for-byte. Kept as a
+// separate definition (rather than #including the guest header)
+// because bochs_drivers.h assumes a freestanding, no-system-headers
+// guest build, while this file is compiled WITH system headers (see
+// the file banner at the top of bochs_infra.cpp). Both structs are
+// plain old data with 4-byte-aligned fields and no padding gaps, so
+// the two 32-bit-x86 compiles agree on layout.
+struct GuestDiskMailbox {
+    char         name[64];
+    unsigned int buf_addr;
+    unsigned int buf_len;
+    int          status;
+};
+
+enum {
+    DISK_CMD_READ   = 1,
+    DISK_CMD_WRITE  = 2,
+    DISK_CMD_DELETE = 3,
+    DISK_CMD_STAT   = 4,
+};
+
+enum {
+    DISK_OK           = 0,
+    DISK_ERR_NOTFOUND = -1,
+    DISK_ERR_IO       = -2,
+    DISK_ERR_TOOBIG   = -3,
+    DISK_ERR_BADCMD   = -4,
+    DISK_ERR_BADNAME  = -5,
+};
+
+// fat32_* is kernel.cpp's real, single, global filesystem driver — the
+// same one AHCI-backed shell commands (ls/cat/cp/edit/...) use.
+extern int   fat32_write_file(const char* filename, const void* data, unsigned int size);
+extern int   fat32_remove_file(const char* filename);
+extern char* fat32_read_file_as_string(const char* filename);
+extern int   fat32_stat_file(const char* filename, unsigned int* size_out);
+
+// Translates a guest-physical address (and the length of the access)
+// inside the CURRENTLY ACTIVE slot's memory window to a host pointer —
+// the same address math mapping_register()/bx_mem.vector use for CPU
+// memory accesses. Returns nullptr if there is no active slot, or the
+// [addr, addr+len) range falls even partly outside that slot's
+// window, so a misbehaving guest gets a clean failure here instead of
+// touching unrelated host/kernel memory.
+static void* disk_guest_ptr(Bit32u addr, Bit32u len) {
+    if (g_active_slot < 0 || g_active_slot >= MAX_BOCHS_SLOTS) return nullptr;
+    SlotState& s = g_slots[g_active_slot];
+    if (!s.mem_base || !s.mem_size) return nullptr;
+    if (addr < s.vaddr_base) return nullptr;
+    Bit32u off = addr - s.vaddr_base;
+    if ((Bit64u)off + (Bit64u)len > (Bit64u)s.mem_size) return nullptr;
+    return s.mem_base + off;
+}
+
+extern "C" void bochs_guest_disk_cmd(unsigned int mbox_addr, int cmd) {
+    GuestDiskMailbox* mbox =
+        (GuestDiskMailbox*)disk_guest_ptr(mbox_addr, sizeof(GuestDiskMailbox));
+    // Mailbox itself is unreachable (bad address / no active slot) —
+    // there is nowhere safe to report a status back to, so just drop
+    // the command, same as an out-of-range PIO write on real hardware.
+    if (!mbox) return;
+
+    // Force NUL-termination regardless of what the guest sent, so a
+    // runaway/adversarial guest can never make fat32_* walk past the
+    // end of this fixed-size field.
+    mbox->name[sizeof(mbox->name) - 1] = '\0';
+
+    switch (cmd) {
+        case DISK_CMD_READ: {
+            unsigned int size = 0;
+            if (fat32_stat_file(mbox->name, &size) != 0) {
+                mbox->status = DISK_ERR_NOTFOUND;
+                break;
+            }
+            if (size > mbox->buf_len) {
+                // Report the real size so the guest can retry with a
+                // big-enough buffer; don't touch its (too-small) one.
+                mbox->buf_len = size;
+                mbox->status  = DISK_ERR_TOOBIG;
+                break;
+            }
+            char* data = fat32_read_file_as_string(mbox->name);
+            if (!data) { mbox->status = DISK_ERR_IO; break; }
+            void* dst = disk_guest_ptr(mbox->buf_addr, size);
+            if (!dst) { delete[] data; mbox->status = DISK_ERR_BADNAME; break; }
+            if (size) __builtin_memcpy(dst, data, size);
+            delete[] data;
+            mbox->buf_len = size;
+            mbox->status  = DISK_OK;
+            break;
+        }
+        case DISK_CMD_WRITE: {
+            void* src = disk_guest_ptr(mbox->buf_addr, mbox->buf_len);
+            if (!src) { mbox->status = DISK_ERR_BADNAME; break; }
+            int rc = fat32_write_file(mbox->name, src, mbox->buf_len);
+            mbox->status = (rc == 0) ? DISK_OK : DISK_ERR_IO;
+            break;
+        }
+        case DISK_CMD_DELETE: {
+            int rc = fat32_remove_file(mbox->name);
+            mbox->status = (rc == 0) ? DISK_OK : DISK_ERR_NOTFOUND;
+            break;
+        }
+        case DISK_CMD_STAT: {
+            unsigned int size = 0;
+            int rc = fat32_stat_file(mbox->name, &size);
+            if (rc == 0) { mbox->buf_len = size; mbox->status = DISK_OK; }
+            else         { mbox->status = DISK_ERR_NOTFOUND; }
+            break;
+        }
+        default:
+            mbox->status = DISK_ERR_BADCMD;
+            break;
+    }
+}
+
+// =====================================================================
 // Tick — run the active slot for a bounded number of cpu_loop entries
 // =====================================================================
 //
