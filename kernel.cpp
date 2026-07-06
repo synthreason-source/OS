@@ -721,6 +721,16 @@ public:
             prev->next = block_to_free->next;
         }
     }
+
+    // Sum of all free blocks currently on the free list. Used by callers
+    // (e.g. chkdsk) that are about to request a large allocation and want
+    // to fail gracefully instead of triggering oom_halt(), which freezes
+    // the whole kernel rather than just the requesting operation.
+    size_t total_free() const {
+        size_t sum = 0;
+        for (FreeBlock* cur = freeListHead; cur; cur = cur->next) sum += cur->size;
+        return sum;
+    }
 };
 
 static FreeListAllocator g_allocator;
@@ -3233,69 +3243,85 @@ void fat32_list_files() {
         wm.print_to_focused("Filesystem not ready.\n");
         return;
     }
-    uint8_t* buffer = new uint8_t[bpb.sec_per_clus * SECTOR_SIZE];
-    if (read_write_sectors(g_ahci_port, cluster_to_lba(current_directory_cluster), bpb.sec_per_clus, false, buffer) != 0) {
-        wm.print_to_focused("Read error\n");
-        delete[] buffer;
-        return;
-    }
+    uint32_t cluster_bytes = bpb.sec_per_clus * SECTOR_SIZE;
+    uint8_t* buffer = new uint8_t[cluster_bytes];
 
     wm.print_to_focused("Name                           Size\n");
     char lfn_buf[256] = {0};
 
-    for (uint32_t i = 0; i < (bpb.sec_per_clus * SECTOR_SIZE); i += sizeof(fat_dir_entry_t)) {
-        fat_dir_entry_t* entry = (fat_dir_entry_t*)(buffer + i);
-
-        if (entry->name[0] == 0x00) break;
-        if ((uint8_t)entry->name[0] == DELETED_ENTRY) {
-            lfn_buf[0] = '\0';
-            continue;
+    // FAT32 directories are ordinary cluster chains, not single clusters.
+    // Once enough entries exist to fill one cluster (trivially easy: a
+    // 512-byte cluster only holds 16 entries), the directory spills into
+    // a second, third, ... cluster via the FAT chain. The old code only
+    // ever read the FIRST cluster, so any files sitting in later clusters
+    // — very common right after copying a batch of files in from another
+    // OS — silently vanished from `ls`. We now walk the whole chain and
+    // only stop when we hit a genuine end-of-directory marker (name[0] ==
+    // 0x00), exactly like real FAT32 implementations do.
+    uint32_t cluster = current_directory_cluster;
+    bool end_of_dir = false;
+    while (!end_of_dir && cluster >= 2 && cluster < FAT_END_OF_CHAIN) {
+        if (read_write_sectors(g_ahci_port, cluster_to_lba(cluster), bpb.sec_per_clus, false, buffer) != 0) {
+            wm.print_to_focused("Read error\n");
+            break;
         }
-        if (entry->name[0] == '.') continue;
 
-        if (entry->attr == ATTR_LONG_NAME) {
-            fat_lfn_entry_t* lfn = (fat_lfn_entry_t*)entry;
-            if (lfn->order & 0x40) lfn_buf[0] = '\0';
+        for (uint32_t i = 0; i < cluster_bytes; i += sizeof(fat_dir_entry_t)) {
+            fat_dir_entry_t* entry = (fat_dir_entry_t*)(buffer + i);
 
-            char name_part[14] = {0};
-            int k = 0;
-            auto extract = [&](uint16_t val) {
-                if (k < 13 && val != 0x0000 && val != 0xFFFF) name_part[k++] = (char)val;
-            };
-            for(int j=0; j<5; j++) extract(lfn->name1[j]);
-            for(int j=0; j<6; j++) extract(lfn->name2[j]);
-            for(int j=0; j<2; j++) extract(lfn->name3[j]);
-
-            memmove(lfn_buf + k, lfn_buf, strlen(lfn_buf) + 1);
-            memcpy(lfn_buf, name_part, k);
-
-        } else if (!(entry->attr & ATTR_VOLUME_ID)) {
-            char line[120];
-            char fname_83[13];
-            const char* name_to_print;
-
-            if (lfn_buf[0] != '\0') {
-                name_to_print = lfn_buf;
-            } else {
-                from_83_format(entry->name, fname_83);
-                name_to_print = fname_83;
+            if (entry->name[0] == 0x00) { end_of_dir = true; break; }
+            if ((uint8_t)entry->name[0] == DELETED_ENTRY) {
+                lfn_buf[0] = '\0';
+                continue;
             }
+            if (entry->name[0] == '.') continue;
 
-            // Manually copy and pad the filename to 30 characters
-            int name_len = strlen(name_to_print);
-            int copy_len = (name_len > 30) ? 30 : name_len;
-            memcpy(line, name_to_print, copy_len);
-            for (int k = copy_len; k < 30; ++k) {
-                line[k] = ' ';
+            if (entry->attr == ATTR_LONG_NAME) {
+                fat_lfn_entry_t* lfn = (fat_lfn_entry_t*)entry;
+                if (lfn->order & 0x40) lfn_buf[0] = '\0';
+
+                char name_part[14] = {0};
+                int k = 0;
+                auto extract = [&](uint16_t val) {
+                    if (k < 13 && val != 0x0000 && val != 0xFFFF) name_part[k++] = (char)val;
+                };
+                for(int j=0; j<5; j++) extract(lfn->name1[j]);
+                for(int j=0; j<6; j++) extract(lfn->name2[j]);
+                for(int j=0; j<2; j++) extract(lfn->name3[j]);
+
+                memmove(lfn_buf + k, lfn_buf, strlen(lfn_buf) + 1);
+                memcpy(lfn_buf, name_part, k);
+
+            } else if (!(entry->attr & ATTR_VOLUME_ID)) {
+                char line[120];
+                char fname_83[13];
+                const char* name_to_print;
+
+                if (lfn_buf[0] != '\0') {
+                    name_to_print = lfn_buf;
+                } else {
+                    from_83_format(entry->name, fname_83);
+                    name_to_print = fname_83;
+                }
+
+                // Manually copy and pad the filename to 30 characters
+                int name_len = strlen(name_to_print);
+                int copy_len = (name_len > 30) ? 30 : name_len;
+                memcpy(line, name_to_print, copy_len);
+                for (int k = copy_len; k < 30; ++k) {
+                    line[k] = ' ';
+                }
+                line[30] = '\0'; // Terminate after the padded name
+
+                // Use a simple snprintf for just the size
+                snprintf(line + 30, 90, " %d\n", entry->file_size);
+
+                wm.print_to_focused(line);
+                lfn_buf[0] = '\0'; // Reset for next entry
             }
-            line[30] = '\0'; // Terminate after the padded name
-
-            // Use a simple snprintf for just the size
-            snprintf(line + 30, 90, " %d\n", entry->file_size);
-            
-            wm.print_to_focused(line);
-            lfn_buf[0] = '\0'; // Reset for next entry
         }
+
+        if (!end_of_dir) cluster = read_fat_entry(cluster);
     }
     delete[] buffer;
 }
@@ -3320,58 +3346,112 @@ int fat32_write_file(const char* filename, const void* data, uint32_t size) {
     }
 
     uint8_t* dir_buf = new uint8_t[SECTOR_SIZE];
-    for (uint8_t s = 0; s < bpb.sec_per_clus; s++) {
-        uint64_t sector_lba = cluster_to_lba(current_directory_cluster) + s;
-        if (read_write_sectors(g_ahci_port, sector_lba, 1, false, dir_buf) != 0) continue;
 
-        for (uint16_t e = 0; e < SECTOR_SIZE / sizeof(fat_dir_entry_t); e++) {
-            fat_dir_entry_t* entry = (fat_dir_entry_t*)(dir_buf + e * sizeof(fat_dir_entry_t));
-            if (entry->name[0] == 0x00 || (uint8_t)entry->name[0] == DELETED_ENTRY) {
-                // Found a free slot, create the entry.
-                memset(entry, 0, sizeof(fat_dir_entry_t));
-                memcpy(entry->name, target_83, 11);
-                entry->attr = ATTR_ARCHIVE;
-                entry->file_size = size;
-                entry->fst_clus_lo = first_cluster & 0xFFFF;
-                entry->fst_clus_hi = (first_cluster >> 16) & 0xFFFF;
-                
-                if (read_write_sectors(g_ahci_port, sector_lba, 1, true, dir_buf) == 0) {
-                    delete[] dir_buf;
-                    return 0; // Success
-                } else {
-                    delete[] dir_buf;
-                    if(first_cluster > 0) free_cluster_chain(first_cluster);
-                    return -1; // Directory write error
+    // Walk the directory's ENTIRE cluster chain looking for a free slot,
+    // instead of only ever looking at the first cluster. A directory is
+    // just a cluster chain like any file; a 512-byte cluster only holds
+    // 16 entries, so it's trivial to fill the first cluster and spill
+    // into a second one — something any real OS handles transparently.
+    // Before this fix, once cluster #1 was full this function returned
+    // "Directory is full" even with the whole rest of the disk empty,
+    // and any files that DID make it into a later cluster (e.g. written
+    // by another OS) were invisible to fat32_find_entry/list_files too.
+    uint32_t cluster = current_directory_cluster;
+    uint32_t last_cluster = cluster;
+    while (cluster >= 2 && cluster < FAT_END_OF_CHAIN) {
+        last_cluster = cluster;
+        for (uint8_t s = 0; s < bpb.sec_per_clus; s++) {
+            uint64_t sector_lba = cluster_to_lba(cluster) + s;
+            if (read_write_sectors(g_ahci_port, sector_lba, 1, false, dir_buf) != 0) continue;
+
+            for (uint16_t e = 0; e < SECTOR_SIZE / sizeof(fat_dir_entry_t); e++) {
+                fat_dir_entry_t* entry = (fat_dir_entry_t*)(dir_buf + e * sizeof(fat_dir_entry_t));
+                if (entry->name[0] == 0x00 || (uint8_t)entry->name[0] == DELETED_ENTRY) {
+                    // Found a free slot, create the entry.
+                    memset(entry, 0, sizeof(fat_dir_entry_t));
+                    memcpy(entry->name, target_83, 11);
+                    entry->attr = ATTR_ARCHIVE;
+                    entry->file_size = size;
+                    entry->fst_clus_lo = first_cluster & 0xFFFF;
+                    entry->fst_clus_hi = (first_cluster >> 16) & 0xFFFF;
+
+                    if (read_write_sectors(g_ahci_port, sector_lba, 1, true, dir_buf) == 0) {
+                        delete[] dir_buf;
+                        return 0; // Success
+                    } else {
+                        delete[] dir_buf;
+                        if(first_cluster > 0) free_cluster_chain(first_cluster);
+                        return -1; // Directory write error
+                    }
                 }
             }
         }
+        cluster = read_fat_entry(cluster);
     }
 
+    // Every existing directory cluster is completely full (no 0x00 and no
+    // deleted-entry slot anywhere in the chain): grow the directory by
+    // appending a fresh cluster, exactly like a real FAT32 driver would.
+    uint32_t new_dir_cluster = allocate_cluster();
+    if (new_dir_cluster == 0) {
+        delete[] dir_buf;
+        if (first_cluster > 0) free_cluster_chain(first_cluster);
+        return -1; // Disk is genuinely full, can't grow the directory
+    }
+
+    uint32_t cluster_bytes = bpb.sec_per_clus * SECTOR_SIZE;
+    uint8_t* new_clus_buf = new uint8_t[cluster_bytes];
+    memset(new_clus_buf, 0, cluster_bytes); // zeroed => first unused entry marks end-of-directory
+
+    fat_dir_entry_t* new_entry = (fat_dir_entry_t*)new_clus_buf;
+    memcpy(new_entry->name, target_83, 11);
+    new_entry->attr = ATTR_ARCHIVE;
+    new_entry->file_size = size;
+    new_entry->fst_clus_lo = first_cluster & 0xFFFF;
+    new_entry->fst_clus_hi = (first_cluster >> 16) & 0xFFFF;
+
+    bool wrote_ok = (read_write_sectors(g_ahci_port, cluster_to_lba(new_dir_cluster), bpb.sec_per_clus, true, new_clus_buf) == 0);
+    delete[] new_clus_buf;
     delete[] dir_buf;
-    if (first_cluster > 0) free_cluster_chain(first_cluster);
-    return -1; // Directory is full
+
+    if (!wrote_ok) {
+        free_cluster_chain(new_dir_cluster);
+        if (first_cluster > 0) free_cluster_chain(first_cluster);
+        return -1;
+    }
+
+    // Link the new cluster onto the end of the directory's FAT chain.
+    write_fat_entry(last_cluster, new_dir_cluster);
+    write_fat_entry(new_dir_cluster, FAT_END_OF_CHAIN);
+    return 0;
 }
 
 char* fat32_read_file_as_string(const char* filename) {
     char target[11]; to_83_format(filename, target);
     uint8_t* dir_buf = new uint8_t[SECTOR_SIZE];
-    for (uint8_t s = 0; s < bpb.sec_per_clus; s++) {
-        if (read_write_sectors(g_ahci_port, cluster_to_lba(current_directory_cluster) + s, 1, false, dir_buf) != 0) { delete[] dir_buf; return nullptr; }
-        for (uint16_t e = 0; e < SECTOR_SIZE / sizeof(fat_dir_entry_t); e++) {
-            fat_dir_entry_t* entry = (fat_dir_entry_t*)(dir_buf + e * sizeof(fat_dir_entry_t));
-            if (entry->name[0] == 0x00) { delete[] dir_buf; return nullptr; }
-            if (memcmp(entry->name, target, 11) == 0) {
-                uint32_t size = entry->file_size;
-                if(size == 0) { delete[] dir_buf; char* empty = new char[1]; empty[0] = '\0'; return empty; }
-                char* data = new char[size + 1];
-                if (read_data_from_clusters((entry->fst_clus_hi << 16) | entry->fst_clus_lo, data, size)) {
-                    data[size] = '\0';
-                    delete[] dir_buf;
-                    return data;
+    // Walk the full directory cluster chain (see fat32_list_files() for
+    // why this matters) instead of stopping after the first cluster.
+    uint32_t cluster = current_directory_cluster;
+    while (cluster >= 2 && cluster < FAT_END_OF_CHAIN) {
+        for (uint8_t s = 0; s < bpb.sec_per_clus; s++) {
+            if (read_write_sectors(g_ahci_port, cluster_to_lba(cluster) + s, 1, false, dir_buf) != 0) { delete[] dir_buf; return nullptr; }
+            for (uint16_t e = 0; e < SECTOR_SIZE / sizeof(fat_dir_entry_t); e++) {
+                fat_dir_entry_t* entry = (fat_dir_entry_t*)(dir_buf + e * sizeof(fat_dir_entry_t));
+                if (entry->name[0] == 0x00) { delete[] dir_buf; return nullptr; }
+                if (memcmp(entry->name, target, 11) == 0) {
+                    uint32_t size = entry->file_size;
+                    if(size == 0) { delete[] dir_buf; char* empty = new char[1]; empty[0] = '\0'; return empty; }
+                    char* data = new char[size + 1];
+                    if (read_data_from_clusters((entry->fst_clus_hi << 16) | entry->fst_clus_lo, data, size)) {
+                        data[size] = '\0';
+                        delete[] dir_buf;
+                        return data;
+                    }
+                    delete[] data; delete[] dir_buf; return nullptr;
                 }
-                delete[] data; delete[] dir_buf; return nullptr;
             }
         }
+        cluster = read_fat_entry(cluster);
     }
     delete[] dir_buf; return nullptr;
 }
@@ -3379,60 +3459,69 @@ char* fat32_read_file_as_string(const char* filename) {
 int fat32_find_entry(const char* filename, fat_dir_entry_t* entry_out, uint32_t* sector_out, uint32_t* offset_out) {
     char lfn_buf[256] = {0};
     uint8_t current_checksum = 0;
-    
+
+    // Walk the directory's FULL cluster chain, not just its first cluster.
+    // See the comment in fat32_list_files() for why this matters: any
+    // entry copied in from another OS that landed past cluster #1 used to
+    // be completely invisible to this lookup, which made "cp"/"cat"/open
+    // silently fail on files that clearly existed on disk.
     uint8_t* dir_buf = new uint8_t[SECTOR_SIZE];
-    for(uint8_t s=0; s<bpb.sec_per_clus; ++s) {
-        uint32_t current_sector = cluster_to_lba(current_directory_cluster) + s;
-        if(read_write_sectors(g_ahci_port, current_sector, 1, false, dir_buf) != 0) { 
-            delete[] dir_buf; 
-            return -1; 
-        }
-        
-        for(uint16_t e=0; e < SECTOR_SIZE / sizeof(fat_dir_entry_t); ++e) {
-            fat_dir_entry_t* entry = (fat_dir_entry_t*)(dir_buf + e*sizeof(fat_dir_entry_t));
-            if(entry->name[0] == 0x00) { delete[] dir_buf; return -1; }
-            if((uint8_t)entry->name[0] == DELETED_ENTRY) { lfn_buf[0] = '\0'; continue; }
+    uint32_t cluster = current_directory_cluster;
+    while (cluster >= 2 && cluster < FAT_END_OF_CHAIN) {
+        for(uint8_t s=0; s<bpb.sec_per_clus; ++s) {
+            uint32_t current_sector = cluster_to_lba(cluster) + s;
+            if(read_write_sectors(g_ahci_port, current_sector, 1, false, dir_buf) != 0) {
+                delete[] dir_buf;
+                return -1;
+            }
 
-            if(entry->attr == ATTR_LONG_NAME) {
-                fat_lfn_entry_t* lfn = (fat_lfn_entry_t*)entry;
-                if (lfn->order & 0x40) { 
-                    lfn_buf[0] = '\0'; 
-                    current_checksum = lfn->checksum; 
-                }
-                
-                char name_part[14] = {0};
-                int k = 0;
-                auto extract = [&](uint16_t val) {
-                    if (k < 13 && val != 0x0000 && val != 0xFFFF) name_part[k++] = (char)val;
-                };
-                for(int j=0; j<5; j++) extract(lfn->name1[j]);
-                for(int j=0; j<6; j++) extract(lfn->name2[j]);
-                for(int j=0; j<2; j++) extract(lfn->name3[j]);
+            for(uint16_t e=0; e < SECTOR_SIZE / sizeof(fat_dir_entry_t); ++e) {
+                fat_dir_entry_t* entry = (fat_dir_entry_t*)(dir_buf + e*sizeof(fat_dir_entry_t));
+                if(entry->name[0] == 0x00) { delete[] dir_buf; return -1; }
+                if((uint8_t)entry->name[0] == DELETED_ENTRY) { lfn_buf[0] = '\0'; continue; }
 
-                memmove(lfn_buf + k, lfn_buf, strlen(lfn_buf) + 1);
-                memcpy(lfn_buf, name_part, k);
+                if(entry->attr == ATTR_LONG_NAME) {
+                    fat_lfn_entry_t* lfn = (fat_lfn_entry_t*)entry;
+                    if (lfn->order & 0x40) {
+                        lfn_buf[0] = '\0';
+                        current_checksum = lfn->checksum;
+                    }
 
-            } else if (!(entry->attr & ATTR_VOLUME_ID)) {
-                bool match = false;
-                if(lfn_buf[0] != '\0' && lfn_checksum((unsigned char*)entry->name) == current_checksum) {
-                    if(strcmp(lfn_buf, filename) == 0) match = true;
-                } else {
-                    char sfn_name[13]; 
-                    from_83_format(entry->name, sfn_name);
-                    if(strcmp(sfn_name, filename) == 0) match = true;
-                }
+                    char name_part[14] = {0};
+                    int k = 0;
+                    auto extract = [&](uint16_t val) {
+                        if (k < 13 && val != 0x0000 && val != 0xFFFF) name_part[k++] = (char)val;
+                    };
+                    for(int j=0; j<5; j++) extract(lfn->name1[j]);
+                    for(int j=0; j<6; j++) extract(lfn->name2[j]);
+                    for(int j=0; j<2; j++) extract(lfn->name3[j]);
 
-                lfn_buf[0] = '\0';
+                    memmove(lfn_buf + k, lfn_buf, strlen(lfn_buf) + 1);
+                    memcpy(lfn_buf, name_part, k);
 
-                if(match) {
-                    memcpy(entry_out, entry, sizeof(fat_dir_entry_t));
-                    *sector_out = current_sector;
-                    *offset_out = e * sizeof(fat_dir_entry_t);
-                    delete[] dir_buf;
-                    return 0;
+                } else if (!(entry->attr & ATTR_VOLUME_ID)) {
+                    bool match = false;
+                    if(lfn_buf[0] != '\0' && lfn_checksum((unsigned char*)entry->name) == current_checksum) {
+                        if(strcmp(lfn_buf, filename) == 0) match = true;
+                    } else {
+                        char sfn_name[13];
+                        from_83_format(entry->name, sfn_name);
+                        if(strcmp(sfn_name, filename) == 0) match = true;
+                    }
+
+                    lfn_buf[0] = '\0';
+
+                    if(match) {
+                        memcpy(entry_out, entry, sizeof(fat_dir_entry_t));
+                        *sector_out = current_sector;
+                        *offset_out = e * sizeof(fat_dir_entry_t);
+                        delete[] dir_buf;
+                        return 0;
+                    }
                 }
             }
         }
+        cluster = read_fat_entry(cluster);
     }
     delete[] dir_buf;
     return -1;
@@ -3443,25 +3532,36 @@ int fat32_list_directory(const char* path, fat_dir_entry_t* buffer, int max_entr
         return 0;
     }
 
-    uint8_t* dir_sector_buf = new uint8_t[bpb.sec_per_clus * SECTOR_SIZE];
-    if (read_write_sectors(g_ahci_port, cluster_to_lba(current_directory_cluster), bpb.sec_per_clus, false, dir_sector_buf) != 0) {
-        delete[] dir_sector_buf;
-        return 0; // Read error
-    }
+    uint32_t cluster_bytes = bpb.sec_per_clus * SECTOR_SIZE;
+    uint8_t* dir_sector_buf = new uint8_t[cluster_bytes];
 
     int count = 0;
-    for (uint32_t i = 0; i < (bpb.sec_per_clus * SECTOR_SIZE); i += sizeof(fat_dir_entry_t)) {
-        if (count >= max_entries) break;
+    // Walk the full directory cluster chain (see fat32_list_files() for
+    // why: entries past the first cluster used to be invisible here too,
+    // which is why file explorer / desktop icon lists silently dropped
+    // files copied in from another OS).
+    uint32_t cluster = current_directory_cluster;
+    bool end_of_dir = false;
+    while (!end_of_dir && count < max_entries && cluster >= 2 && cluster < FAT_END_OF_CHAIN) {
+        if (read_write_sectors(g_ahci_port, cluster_to_lba(cluster), bpb.sec_per_clus, false, dir_sector_buf) != 0) {
+            break; // Read error
+        }
 
-        fat_dir_entry_t* entry = (fat_dir_entry_t*)(dir_sector_buf + i);
+        for (uint32_t i = 0; i < cluster_bytes; i += sizeof(fat_dir_entry_t)) {
+            if (count >= max_entries) break;
 
-        if (entry->name[0] == 0x00) break; // End of directory
-        if ((uint8_t)entry->name[0] == DELETED_ENTRY) continue; // Skip deleted entries
-        if (entry->attr == ATTR_LONG_NAME || (entry->attr & ATTR_VOLUME_ID)) continue; // Skip LFN and Volume ID
-        
-        // This is a valid file or directory, so copy it to the output buffer
-        memcpy(&buffer[count], entry, sizeof(fat_dir_entry_t));
-        count++;
+            fat_dir_entry_t* entry = (fat_dir_entry_t*)(dir_sector_buf + i);
+
+            if (entry->name[0] == 0x00) { end_of_dir = true; break; } // End of directory
+            if ((uint8_t)entry->name[0] == DELETED_ENTRY) continue; // Skip deleted entries
+            if (entry->attr == ATTR_LONG_NAME || (entry->attr & ATTR_VOLUME_ID)) continue; // Skip LFN and Volume ID
+
+            // This is a valid file or directory, so copy it to the output buffer
+            memcpy(&buffer[count], entry, sizeof(fat_dir_entry_t));
+            count++;
+        }
+
+        if (!end_of_dir) cluster = read_fat_entry(cluster);
     }
 
     delete[] dir_sector_buf;
@@ -4092,79 +4192,99 @@ bool check_directory_entry(fat_dir_entry_t* entry, ChkdskStats& stats, bool fix)
     return !has_error;
 }
 
-bool scan_directory(uint32_t cluster, ChkdskStats& stats, bool fix, int depth = 0) {
+bool scan_directory(uint32_t start_cluster, ChkdskStats& stats, bool fix, int depth = 0) {
     if (depth > 20) {
         wm.print_to_focused("ERROR: Directory nesting too deep!");
         return false;
     }
     
     stats.directories_checked++;
-    
-    uint8_t* buffer = new uint8_t[bpb.sec_per_clus * SECTOR_SIZE];
-    if (read_write_sectors(g_ahci_port, cluster_to_lba(cluster), bpb.sec_per_clus, false, buffer) != 0) {
-        wm.print_to_focused("ERROR: Cannot read directory cluster");
-        delete[] buffer;
-        return false;
-    }
-    
+
+    uint32_t cluster_bytes = bpb.sec_per_clus * SECTOR_SIZE;
+    uint8_t* buffer = new uint8_t[cluster_bytes];
+
     // Create a working copy for modifications
     uint8_t* working_buffer = nullptr;
     if (fix) {
-        working_buffer = new uint8_t[bpb.sec_per_clus * SECTOR_SIZE];
-        memcpy(working_buffer, buffer, bpb.sec_per_clus * SECTOR_SIZE);
+        working_buffer = new uint8_t[cluster_bytes];
     }
-    
-    bool modified = false;
-    
-    for (uint32_t i = 0; i < (bpb.sec_per_clus * SECTOR_SIZE); i += sizeof(fat_dir_entry_t)) {
-        // Use working buffer if fixing, otherwise use read-only buffer
-        fat_dir_entry_t* entry = (fat_dir_entry_t*)((fix ? working_buffer : buffer) + i);
-        
-        if (entry->name[0] == 0x00) break;
-        if ((uint8_t)entry->name[0] == DELETED_ENTRY) continue;
-        if (entry->name[0] == '.') continue;
-        
-        if (entry->attr == ATTR_LONG_NAME) continue;
-        if (entry->attr & ATTR_VOLUME_ID) continue;
-        
-        stats.files_checked++;
-        
-        char fname[13];
-        from_83_format(entry->name, fname);
-        
-        char msg[100];
-        snprintf(msg, 100, "Checking: %s", fname);
-        wm.print_to_focused(msg);
-        
-        // Only mark as modified if we're in fix mode and something changed
-        if (!check_directory_entry(entry, stats, fix)) {
-            if (fix) {
-                modified = true;
-            }
+
+    bool ok = true;
+
+    // A directory is an ordinary cluster chain, exactly like a file. The
+    // previous version of this function only ever looked at the FIRST
+    // cluster of the chain, so any entries that spilled into a second or
+    // later cluster (trivial to hit: a 512-byte cluster holds only 16
+    // entries) were never scanned, never marked "in use" in the cluster
+    // bitmap, and their files never appeared as checked by chkdsk. This
+    // is the same root cause behind files copied in from another OS
+    // going missing from `ls` — we now walk the whole chain, stopping
+    // only at a genuine end-of-directory marker (name[0] == 0x00).
+    uint32_t cluster = start_cluster;
+    bool end_of_dir = false;
+    while (!end_of_dir && cluster >= 2 && cluster < FAT_END_OF_CHAIN) {
+        mark_cluster_used(cluster);
+
+        if (read_write_sectors(g_ahci_port, cluster_to_lba(cluster), bpb.sec_per_clus, false, buffer) != 0) {
+            wm.print_to_focused("ERROR: Cannot read directory cluster");
+            ok = false;
+            break;
         }
-        
-        if (entry->attr & 0x10) {
-            uint32_t subcluster = (entry->fst_clus_hi << 16) | entry->fst_clus_lo;
-            if (subcluster >= 2 && subcluster < FAT_END_OF_CHAIN) {
-                if (!is_cluster_marked(subcluster)) {
-                    mark_cluster_used(subcluster);
-                    scan_directory(subcluster, stats, fix, depth + 1);
+
+        if (fix) memcpy(working_buffer, buffer, cluster_bytes);
+        bool modified = false;
+
+        for (uint32_t i = 0; i < cluster_bytes; i += sizeof(fat_dir_entry_t)) {
+            // Use working buffer if fixing, otherwise use read-only buffer
+            fat_dir_entry_t* entry = (fat_dir_entry_t*)((fix ? working_buffer : buffer) + i);
+
+            if (entry->name[0] == 0x00) { end_of_dir = true; break; }
+            if ((uint8_t)entry->name[0] == DELETED_ENTRY) continue;
+            if (entry->name[0] == '.') continue;
+
+            if (entry->attr == ATTR_LONG_NAME) continue;
+            if (entry->attr & ATTR_VOLUME_ID) continue;
+
+            stats.files_checked++;
+
+            char fname[13];
+            from_83_format(entry->name, fname);
+
+            char msg[100];
+            snprintf(msg, 100, "Checking: %s", fname);
+            wm.print_to_focused(msg);
+
+            // Only mark as modified if we're in fix mode and something changed
+            if (!check_directory_entry(entry, stats, fix)) {
+                if (fix) {
+                    modified = true;
+                }
+            }
+
+            if (entry->attr & 0x10) {
+                uint32_t subcluster = (entry->fst_clus_hi << 16) | entry->fst_clus_lo;
+                if (subcluster >= 2 && subcluster < FAT_END_OF_CHAIN) {
+                    if (!is_cluster_marked(subcluster)) {
+                        scan_directory(subcluster, stats, fix, depth + 1);
+                    }
                 }
             }
         }
+
+        // ONLY write back if in fix mode AND something was modified
+        if (fix && modified) {
+            read_write_sectors(g_ahci_port, cluster_to_lba(cluster), bpb.sec_per_clus, true, working_buffer);
+        }
+
+        if (!end_of_dir) cluster = read_fat_entry(cluster);
     }
-    
-    // ONLY write back if in fix mode AND something was modified
-    if (fix && modified && working_buffer) {
-        read_write_sectors(g_ahci_port, cluster_to_lba(cluster), bpb.sec_per_clus, true, working_buffer);
-    }
-    
+
     delete[] buffer;
     if (working_buffer) {
         delete[] working_buffer;
     }
-    
-    return true;
+
+    return ok;
 }
 
 
