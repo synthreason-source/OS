@@ -7886,6 +7886,33 @@ void handle_command() {
 
     if(!in_editor) print_prompt();
 }
+static void elfdbg_hex(char* out, uint32_t v) {
+    const char* hexd = "0123456789ABCDEF";
+    out[0]='0'; out[1]='x';
+    for (int i = 0; i < 8; ++i) out[2 + i] = hexd[(v >> ((7 - i) * 4)) & 0xF];
+    out[10] = '\0';
+}
+static void elfdbg_dump_phdrs(TerminalWindow* terminal, Elf32_Phdr* phdr,
+                               int phnum, uint32_t minvaddr, uint32_t maxvaddr) {
+    if (!terminal) return;
+    char line[160];
+    char hv[11], hm[11], hf[11], ht[11];
+    terminal->console_print("[elf] phdr dump:\n");
+    for (int i = 0; i < phnum; ++i) {
+        elfdbg_hex(hv, phdr[i].p_vaddr);
+        elfdbg_hex(hm, phdr[i].p_memsz);
+        elfdbg_hex(hf, phdr[i].p_filesz);
+        elfdbg_hex(ht, phdr[i].p_type);
+        snprintf(line, sizeof(line),
+                 "  [%d] type=%s vaddr=%s memsz=%s filesz=%s\n",
+                 i, ht, hv, hm, hf);
+        terminal->console_print(line);
+    }
+    elfdbg_hex(hv, minvaddr);
+    elfdbg_hex(hm, maxvaddr);
+    snprintf(line, sizeof(line), "[elf] minvaddr=%s maxvaddr=%s\n", hv, hm);
+    terminal->console_print(line);
+}
 int load_and_execute_elf(const char* filename, const char* args, TerminalWindow* terminal) {
     char* elfdata = fat32_read_file_as_string(filename);
     if (!elfdata) {
@@ -7965,6 +7992,17 @@ int load_and_execute_elf(const char* filename, const char* args, TerminalWindow*
 
         for (int i = 0; i < ehdr.e_phnum; i++) {
             if (phdr[i].p_type != PT_LOAD) continue;
+            // Skip zero-memsz PT_LOAD entries. Some linkers (incl. TCC's own
+            // linker) emit placeholder/alignment PT_LOAD headers with
+            // p_vaddr == 0 and p_memsz == 0. Letting these count toward
+            // minvaddr silently drags minvaddr down to 0 even though the
+            // *real* code/data segments load at a sane address (e.g.
+            // 0x08002000). That in turn makes `minvaddr - ELF_SLOT_RESERVE`
+            // underflow to 0xFFFFF000, which is exactly the bogus
+            // vaddr_base disk_guest_ptr() then rejects every mailbox
+            // address against. Mirrors the same skip already done in
+            // load_elf_image_to_slab().
+            if (phdr[i].p_memsz == 0) continue;
             found_load = true;
             if (phdr[i].p_memsz < phdr[i].p_filesz) { phdr_bad = true; break; }
             if (phdr[i].p_offset + phdr[i].p_filesz > filesize) { phdr_bad = true; break; }
@@ -7983,6 +8021,7 @@ int load_and_execute_elf(const char* filename, const char* args, TerminalWindow*
         }
         if (maxvaddr <= minvaddr) {
             if (terminal) terminal->console_print("ELF: empty or inverted load range\n");
+            elfdbg_dump_phdrs(terminal, phdr, ehdr.e_phnum, minvaddr, maxvaddr);
             break;
         }
 
@@ -8016,6 +8055,19 @@ int load_and_execute_elf(const char* filename, const char* args, TerminalWindow*
             break;
         }
 
+
+        // minvaddr - ELF_SLOT_RESERVE underflows (wraps to ~0xFFFFF000) if
+        // the lowest real PT_LOAD segment sits below the 4 KiB reserve —
+        // that bogus vaddr_base then makes every legitimate guest address
+        // (e.g. mailbox/buffer pointers, which are small numbers relative
+        // to the program's actual load address) look "out of range" to
+        // disk_guest_ptr(), silently dropping every disk command. Catch it
+        // here instead of wrapping into a huge, wrong base.
+        if (minvaddr < ELF_SLOT_RESERVE) {
+            if (terminal) terminal->console_print("ELF: lowest PT_LOAD vaddr is too low to reserve a slab header (linker script/-Ttext issue?)\n");
+            elfdbg_dump_phdrs(terminal, phdr, ehdr.e_phnum, minvaddr, maxvaddr);
+            break;
+        }
 
         mem = elf_alloc_bytes(memsize);
         if (!mem) {
