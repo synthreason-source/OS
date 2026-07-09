@@ -8462,9 +8462,10 @@ public:
                     memset(wrapped_text, 0, TERM_WIDTH);
                     strcpy(wrapped_text, &current_line_ptr[wrap_pos]);
                     
-                    // Trim leading space from wrapped text
+                    // Trim leading space(s) from wrapped text
                     char* trimmed = wrapped_text;
                     while (*trimmed == ' ') trimmed++;
+                    int trimmed_count = (int)(trimmed - wrapped_text);
                     
                     // Truncate current line at wrap point
                     current_line_ptr[wrap_pos] = '\0';
@@ -8475,11 +8476,16 @@ public:
                     // Move cursor to next line if it was past wrap point
                     if (edit_cursor_col > wrap_pos) {
                         edit_current_line++;
-                        edit_cursor_col = edit_cursor_col - wrap_pos;
-                        // Account for trimmed spaces
-                        while (edit_cursor_col > 0 && wrapped_text[0] == ' ') {
-                            edit_cursor_col--;
-                        }
+                        // New column = old column, minus the chars that
+                        // stayed on line 1 (wrap_pos), minus the leading
+                        // space(s) trimmed off line 2. Previously this was
+                        // a loop re-testing the same fixed byte
+                        // (wrapped_text[0], which the loop never updated),
+                        // so it ran all the way down to column 0 any time
+                        // the wrap point landed on a space — i.e. on every
+                        // normal word wrap — yanking the cursor to the
+                        // start of the new line while still mid-word.
+                        edit_cursor_col = edit_cursor_col - wrap_pos - trimmed_count;
                         if (edit_cursor_col < 0) edit_cursor_col = 0;
                     }
                 }
