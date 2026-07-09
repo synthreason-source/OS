@@ -8008,7 +8008,30 @@ int load_and_execute_elf(const char* filename, const char* args, TerminalWindow*
         // therefore every address the compiler/linker baked into the
         // program) is completely unchanged -- only the underlying
         // buffer layout moves.
-        const uint32_t ELF_SLOT_RESERVE = 0x1000;
+        const uint32_t ELF_SLOT_RESERVE = 0x0000;
+
+        // Guard against unsigned underflow: `minvaddr - ELF_SLOT_RESERVE`
+        // below silently wraps to a value near 0xFFFFFFFF whenever an ELF's
+        // lowest PT_LOAD vaddr is less than ELF_SLOT_RESERVE (0x1000) —
+        // e.g. a stale build predating tcc_guest.ld/guest.ld's leading-page
+        // reservation, or any toolchain invocation that didn't apply one of
+        // this project's slab-aware linker scripts. Left unchecked, the
+        // wrapped vaddr_base (e.g. 0xFFFFF000) is then handed straight to
+        // bochs_set_process_memory/disk_guest_ptr as this process's guest-
+        // physical window base, so EVERY address the guest legitimately
+        // owns (which is small, since the program itself links near 0)
+        // reads as "before vaddr_base" and gets rejected — the guest keeps
+        // running (its own code/data addressing never depended on
+        // vaddr_base), but host-side helpers like the disk mailbox can no
+        // longer resolve any pointer the guest hands them. Catch it here
+        // instead of producing that hard-to-diagnose failure mode deep
+        // into execution.
+        if (minvaddr < ELF_SLOT_RESERVE) {
+            if (terminal) terminal->console_print(
+                "ELF: load address too low (must be >= 0x1000) -- "
+                "rebuild with the project's guest linker script\n");
+            break;
+        }
 
         uint32_t memsize = imgsize + ELFHEAPSIZE + ELF_SLOT_RESERVE;
         if (memsize > 6 * 1024 * 1024) {

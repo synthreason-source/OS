@@ -1518,12 +1518,19 @@ enum {
 };
 
 enum {
-    DISK_OK           = 0,
-    DISK_ERR_NOTFOUND = -1,
-    DISK_ERR_IO       = -2,
-    DISK_ERR_TOOBIG   = -3,
-    DISK_ERR_BADCMD   = -4,
-    DISK_ERR_BADNAME  = -5,
+    DISK_OK              = 0,
+    DISK_ERR_NOTFOUND    = -1,
+    DISK_ERR_IO          = -2,
+    DISK_ERR_TOOBIG      = -3,
+    DISK_ERR_BADCMD      = -4,
+    DISK_ERR_BADNAME     = -5,
+    // Mirrors drivers.h's DISK_ERR_UNREACHABLE. The kernel side never
+    // writes this value itself (if it could write anything into the
+    // mailbox at all, the mailbox was reachable) -- it's the guest-side
+    // preset that a dropped command is left showing. Kept in this mirror
+    // purely so the two copies of the protocol's constant set don't
+    // silently diverge.
+    DISK_ERR_UNREACHABLE = -6,
 };
 
 // fat32_* is kernel.cpp's real, single, global filesystem driver — the
@@ -1550,13 +1557,54 @@ static void* disk_guest_ptr(Bit32u addr, Bit32u len) {
     return s.mem_base + off;
 }
 
+// Emit a short diagnostic directly into the active slot's own terminal,
+// through the SAME write_cb bochs_guest_putc() (port 0xE9) already uses —
+// this is just that mechanism invoked from the host side instead of in
+// response to a guest OUT. Used below so a dropped disk command is
+// visible in-band, in the running program's own output, instead of a
+// totally silent no-op that only a rebuild-with-printf-patches debug
+// session could ever see.
+static void disk_report(const char* msg) {
+    if (g_active_slot < 0 || g_active_slot >= MAX_BOCHS_SLOTS) return;
+    SlotState& s = g_slots[g_active_slot];
+    if (!s.write_cb) return;
+    for (const char* p = msg; *p; ++p) s.write_cb(g_active_slot, *p);
+}
+
+static void disk_report_hex32(Bit32u v) {
+    char buf[11] = "0x00000000";
+    static const char hexd[] = "0123456789ABCDEF";
+    for (int i = 0; i < 8; ++i) {
+        buf[9 - i] = hexd[v & 0xF];
+        v >>= 4;
+    }
+    disk_report(buf);
+}
+
 extern "C" void bochs_guest_disk_cmd(unsigned int mbox_addr, int cmd) {
     GuestDiskMailbox* mbox =
         (GuestDiskMailbox*)disk_guest_ptr(mbox_addr, sizeof(GuestDiskMailbox));
     // Mailbox itself is unreachable (bad address / no active slot) —
-    // there is nowhere safe to report a status back to, so just drop
-    // the command, same as an out-of-range PIO write on real hardware.
-    if (!mbox) return;
+    // there is nowhere IN THE MAILBOX to report a status back to (we
+    // can't write through a pointer we just determined is invalid), so
+    // the command is dropped, same as an out-of-range PIO write on real
+    // hardware. That used to be entirely silent, which let a dropped
+    // WRITE/READ/DELETE look identical to success on the guest side
+    // (disk_mailbox_t.status is DISK_OK==0, the same value it has right
+    // out of .bss). The guest side now presets status to
+    // DISK_ERR_UNREACHABLE before every submit (see drivers.h) so it can
+    // no longer misreport success — this print is the host-side half:
+    // surface *why* in the guest's own terminal so a genuinely
+    // unreachable mailbox (e.g. a stale/misbuilt ELF whose link address
+    // doesn't match this slot's vaddr_base) is diagnosable without a
+    // custom debug build.
+    if (!mbox) {
+        disk_report("\n[disk] mailbox unreachable at guest addr ");
+        disk_report_hex32(mbox_addr);
+        disk_report(" -- command dropped (bad address, or program linked "
+                    "outside its own memory window)\n");
+        return;
+    }
 
     // Force NUL-termination regardless of what the guest sent, so a
     // runaway/adversarial guest can never make fat32_* walk past the

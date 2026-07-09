@@ -77,6 +77,10 @@ typedef struct {
 #define DISK_ERR_TOOBIG   (-3)   /* file is bigger than the buffer      */
 #define DISK_ERR_BADCMD   (-4)   /* unknown command byte                */
 #define DISK_ERR_BADNAME  (-5)   /* data buffer address out of range    */
+#define DISK_ERR_UNREACHABLE (-6) /* kernel couldn't even resolve the   */
+                                  /* mailbox itself (bad guest_ptr /     */
+                                  /* wrong vaddr_base) -- command was    */
+                                  /* dropped, not attempted              */
 
 static inline void __disk_submit(disk_mailbox_t *mbox, int cmd)
 {
@@ -105,6 +109,14 @@ static inline int kfread(const char *filename, void *buf, unsigned int buflen)
     __disk_set_name(&mbox, filename);
     mbox.buf_addr = (unsigned int)(unsigned long)buf;
     mbox.buf_len  = buflen;
+    /* The kernel only writes mbox.status if it can resolve this very
+     * mailbox's own guest address (see bochs_guest_disk_cmd's disk_guest_ptr
+     * check in bochs_glue.cpp) -- if that resolution fails, the command is
+     * dropped and status is left exactly as we set it here. Since DISK_OK
+     * is 0, leaving status at its .bss zero-init would make a silently
+     * dropped command indistinguishable from success; preset it to a real
+     * error first so a dropped command is always reported as one. */
+    mbox.status = DISK_ERR_UNREACHABLE;
     __disk_submit(&mbox, DISK_CMD_READ);
     if (mbox.status != DISK_OK) return mbox.status;
     return (int)mbox.buf_len;
@@ -118,6 +130,7 @@ static inline int kfwrite(const char *filename, const void *buf, unsigned int le
     __disk_set_name(&mbox, filename);
     mbox.buf_addr = (unsigned int)(unsigned long)buf;
     mbox.buf_len  = len;
+    mbox.status   = DISK_ERR_UNREACHABLE;  /* see kfread's comment */
     __disk_submit(&mbox, DISK_CMD_WRITE);
     return mbox.status;
 }
@@ -127,6 +140,7 @@ static inline int kfremove(const char *filename)
 {
     static disk_mailbox_t mbox;
     __disk_set_name(&mbox, filename);
+    mbox.status = DISK_ERR_UNREACHABLE;  /* see kfread's comment */
     __disk_submit(&mbox, DISK_CMD_DELETE);
     return mbox.status;
 }
@@ -137,6 +151,7 @@ static inline int kfstat(const char *filename, unsigned int *size_out)
 {
     static disk_mailbox_t mbox;
     __disk_set_name(&mbox, filename);
+    mbox.status = DISK_ERR_UNREACHABLE;  /* see kfread's comment */
     __disk_submit(&mbox, DISK_CMD_STAT);
     if (mbox.status == DISK_OK && size_out) *size_out = mbox.buf_len;
     return mbox.status;
