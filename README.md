@@ -8,6 +8,8 @@ SATA port selection with 'disk_select'
 
 guest programs require bochs_drivers.h to interface with the OS.
 
+TODO: add OS config file
+
 TODO: add ethernet, Lynx_(web_browser) & busybox
 
 # Build Instructions
