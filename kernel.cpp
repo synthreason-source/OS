@@ -1875,9 +1875,21 @@ void load_desktop_items() {
         // ── Taskbar clock (bottom-right, HH:MM read from CMOS RTC) ──────────
         {
             RTC_Time t = read_rtc();
-            char clock_buf[16];
-            snprintf(clock_buf, sizeof(clock_buf), "%02u:%02u",
-                     (unsigned)t.hour, (unsigned)t.minute);
+            // This kernel's snprintf() only understands %d/%s/%c — no %u
+            // and no zero-padding width specifiers — so "%02u:%02u" was
+            // being emitted almost verbatim (each digit of the format
+            // spec printed as a literal character) instead of substituting
+            // the actual time, which is why a stray 'u' showed up after
+            // every number. Build the zero-padded "HH:MM" string by hand.
+            uint8_t hh = t.hour % 24;
+            uint8_t mm = t.minute % 60;
+            char clock_buf[6];
+            clock_buf[0] = '0' + (hh / 10);
+            clock_buf[1] = '0' + (hh % 10);
+            clock_buf[2] = ':';
+            clock_buf[3] = '0' + (mm / 10);
+            clock_buf[4] = '0' + (mm % 10);
+            clock_buf[5] = '\0';
             int clock_text_w = (int)strlen(clock_buf) * 8; // 8px-wide glyphs, see draw_char()
             int pad = 10;
             int clock_box_w = clock_text_w + pad * 2;
