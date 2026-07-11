@@ -1610,9 +1610,16 @@ public:
     const char* title;
     bool has_focus;
     bool is_closed;
+    // When true, the window is hidden (not drawn, not hit-tested) but
+    // stays alive in the WindowManager's window list — i.e. it's still
+    // "running", just tucked away. A taskbar button remains for it so a
+    // single click there can bring it straight back (see
+    // is_in_minimize_button() / WindowManager's taskbar click handling).
+    bool is_minimized;
 
     Window(int x, int y, int w, int h, const char* title)
-        : x(x), y(y), w(w), h(h), title(title), has_focus(false), is_closed(false) {}
+        : x(x), y(y), w(w), h(h), title(title), has_focus(false), is_closed(false),
+          is_minimized(false) {}
     virtual ~Window() {}
     virtual void put_char(char c) {} // ADD THIS
 
@@ -1624,9 +1631,14 @@ public:
     virtual void update() = 0;
     virtual void console_print(const char* s) {}
     virtual int  get_elf_slot() const { return -1; }  // overridden by TerminalWindow
+    // Stable per-window ID used for taskbar buttons (overridden by
+    // TerminalWindow). -1 means "doesn't get a taskbar button".
+    virtual int  get_taskbar_id() const { return -1; }
 
     bool is_in_titlebar(int mx, int my) { return mx > x && mx < x + w && my > y && my < y + 25; }
     bool is_in_close_button(int mx, int my) { int btn_x = x + w - 22, btn_y = y + 4; return mx >= btn_x && mx < btn_x + 18 && my >= btn_y && my < btn_y + 18; }
+    // Minimize ("_") button sits directly to the left of the close button.
+    bool is_in_minimize_button(int mx, int my) { int btn_x = x + w - 44, btn_y = y + 4; return mx >= btn_x && mx < btn_x + 18 && my >= btn_y && my < btn_y + 18; }
     virtual void close() { is_closed = true; }
 };
 
@@ -1806,34 +1818,81 @@ void load_desktop_items() {
         draw_taskbar_button(btn_x, btn_y, btn_w, btn_h, "Terminal", false);
         btn_x += btn_w + 4;
 
-        // ── Per-slot ELF process buttons ─────────────────────────────────────
-        // Each active ELF slot gets its own button. Clicking it raises and
-        // focuses the terminal window that owns the slot. The active (focused)
-        // slot button is drawn highlighted in blue.
-        for (int s = 0; s < MAX_ELF_PROCESSES; ++s) {
-            if (!elf_processes[s].active) continue;  // skip idle and completed slots
-            // Build a label: "Slot N: <first few chars of cmdline>"
-            char label[20];
-            label[0] = 'S'; label[1] = '0' + (char)s; label[2] = ':'; label[3] = ' ';
-            // Append the first few chars of cmdline (or "elf" if empty)
-            const char* cmd = elf_processes[s].cmdline;
-            int ci = 4;
-            if (cmd[0]) {
-                for (int k = 0; cmd[k] && ci < 15; k++, ci++) label[ci] = cmd[k];
-            } else {
-                label[ci++] = 'e'; label[ci++] = 'l'; label[ci++] = 'f';
-            }
-            label[ci] = 0;
+        // ── Per-terminal-window taskbar buttons ──────────────────────────────
+        // Every open TerminalWindow gets a button here — not just ones
+        // currently running an ELF — so a minimized terminal always has
+        // somewhere to be restored from with a single click. Windows are
+        // reordered in windows[] every time focus changes (see
+        // set_focus()), so walk them in stable get_taskbar_id() order
+        // rather than array order, or a window's button would jump
+        // around the taskbar every time it was clicked.
+        {
+            bool shown[16] = { false };
+            for (int shown_count = 0; shown_count < num_windows; ++shown_count) {
+                // Find the not-yet-shown terminal window with the lowest id.
+                int best_i = -1, best_id = 0x7fffffff;
+                for (int i = 0; i < num_windows; ++i) {
+                    if (shown[i]) continue;
+                    int tid = windows[i]->get_taskbar_id();
+                    if (tid < 0) { shown[i] = true; continue; } // not a terminal window
+                    if (tid < best_id) { best_id = tid; best_i = i; }
+                }
+                if (best_i < 0) break; // nothing left to show
+                shown[best_i] = true;
 
-            // Is this slot's terminal the focused window?
-            bool is_focused = false;
-            if (focused_idx >= 0 && focused_idx < num_windows) {
-                if (windows[focused_idx]->get_elf_slot() == s) is_focused = true;
-            }
+                Window* tw = windows[best_i];
+                bool has_elf = tw->get_elf_slot() >= 0 &&
+                                elf_processes[tw->get_elf_slot()].active;
 
-            draw_taskbar_button(btn_x, btn_y, btn_w, btn_h, label, is_focused);
-            btn_x += btn_w + 4;
-            if (btn_x + btn_w >= (int)fb_info.width - 100) break; // guard overflow
+                char label[20];
+                int ci = 0;
+                label[ci++]='T'; label[ci++]='e'; label[ci++]='r'; label[ci++]='m';
+                label[ci++]=' ';
+                if (best_id < 10) {
+                    label[ci++] = '0' + (char)best_id;
+                } else {
+                    label[ci++] = '0' + (char)(best_id / 10);
+                    label[ci++] = '0' + (char)(best_id % 10);
+                }
+                if (has_elf) {
+                    const char* cmd = elf_processes[tw->get_elf_slot()].cmdline;
+                    label[ci++] = ':'; label[ci++] = ' ';
+                    for (int k = 0; cmd[k] && ci < 15; k++, ci++) label[ci] = cmd[k];
+                } else if (tw->is_minimized) {
+                    label[ci++] = ' '; label[ci++] = '['; label[ci++] = '-'; label[ci++] = ']';
+                }
+                label[ci] = 0;
+
+                bool is_focused = (!tw->is_minimized && focused_idx >= 0 &&
+                                    focused_idx < num_windows && windows[focused_idx] == tw);
+
+                draw_taskbar_button(btn_x, btn_y, btn_w, btn_h, label, is_focused);
+                btn_x += btn_w + 4;
+                if (btn_x + btn_w >= (int)fb_info.width - 100) break; // guard overflow
+            }
+        }
+
+        // ── Taskbar clock (bottom-right, HH:MM read from CMOS RTC) ──────────
+        {
+            RTC_Time t = read_rtc();
+            char clock_buf[16];
+            snprintf(clock_buf, sizeof(clock_buf), "%02u:%02u",
+                     (unsigned)t.hour, (unsigned)t.minute);
+            int clock_text_w = (int)strlen(clock_buf) * 8; // 8px-wide glyphs, see draw_char()
+            int pad = 10;
+            int clock_box_w = clock_text_w + pad * 2;
+            int clock_box_x = (int)fb_info.width - clock_box_w - 4;
+            int clock_box_y = (int)fb_info.height - 36;
+            int clock_box_h = 28;
+
+            // Sunken 3D field, matching the taskbar button styling.
+            draw_rect_filled(clock_box_x, clock_box_y, clock_box_w, clock_box_h, TASKBAR_DARK);
+            draw_rect_filled(clock_box_x, clock_box_y, clock_box_w, 1, ColorPalette::BUTTON_SHADOW);
+            draw_rect_filled(clock_box_x, clock_box_y, 1, clock_box_h, ColorPalette::BUTTON_SHADOW);
+            draw_rect_filled(clock_box_x, clock_box_y + clock_box_h - 1, clock_box_w, 1, ColorPalette::BUTTON_HIGHLIGHT);
+            draw_rect_filled(clock_box_x + clock_box_w - 1, clock_box_y, 1, clock_box_h, ColorPalette::BUTTON_HIGHLIGHT);
+
+            draw_string(clock_buf, clock_box_x + pad, clock_box_y + (clock_box_h - 8) / 2, ColorPalette::TEXT_WHITE);
         }
 
         // Draw desktop icons
@@ -6462,6 +6521,11 @@ private:
 static constexpr int EDIT_ROWS = 35;       // rows visible in the editor area
 static constexpr int EDIT_COL_PIX = 8;     // font width
 static constexpr int EDIT_LINE_PIX = 10;   // line height
+// Column width at which the editor wraps a line, both while typing and
+// when a file is first loaded into the editor (see the "edit" command
+// handler). Keeping this a single shared constant guarantees a loaded
+// file wraps identically to how it would look if it had been typed.
+static constexpr int EDITOR_WRAP_WIDTH = 75;
 public:  // put_char overrides Window::put_char
 void put_char(char c) override {
         if (in_editor) return; // Don't mess with editor
@@ -7551,36 +7615,72 @@ void handle_command() {
             edit_cursor_col = 0;
             edit_scroll_offset = 0;
             char* content = fat32_read_file_as_string(filename);
+
+            // Seed with a single empty line; editor_insert_line_at() grows
+            // the array as wrapped segments are appended below.
+            //
+            // The old loader just strncpy()'d each raw line (split only on
+            // '\n') straight into a fixed 119-char slot. That silently
+            // truncated anything past 119 chars, and — the real bug —
+            // never wrapped lines that were under 119 chars but still
+            // wider than the editor's visible column width, so on open
+            // they were drawn straight off the right edge of the window
+            // instead of wrapping the way they would if you'd typed them.
+            // Word-wrap on load exactly like the live typing path does,
+            // using the same EDITOR_WRAP_WIDTH, so a loaded file looks
+            // identical to one typed in by hand.
+            edit_lines = new char*[1];
+            edit_lines[0] = new char[120];
+            memset(edit_lines[0], 0, 120);
+            edit_line_count = 1;
+
             if (content) {
-                int line_count_temp = 1;
-                for (char* p = content; *p; p++) if (*p == '\n') line_count_temp++;
-                
-                edit_lines = new char*[line_count_temp];
-                edit_line_count = 0;
-                
+                bool first_segment_used = false;
                 char* line_start = content;
-                for (char* p = content; *p; p++) {
-                    if (*p == '\n') {
+                char* p = content;
+                for (;;) {
+                    bool at_end = (*p == '\0');
+                    if (*p == '\n' || at_end) {
+                        char saved = *p;
                         *p = '\0';
-                        edit_lines[edit_line_count] = new char[120];
-                        memset(edit_lines[edit_line_count], 0, 120);
-                        strncpy(edit_lines[edit_line_count], line_start, 119);
-                        edit_line_count++;
+
+                        // Word-wrap this raw (newline-delimited) line into
+                        // one or more editor lines at EDITOR_WRAP_WIDTH
+                        // columns. Runs at least once even for a blank
+                        // line, so blank lines in the file are preserved.
+                        char* seg = line_start;
+                        do {
+                            int seg_len = (int)strlen(seg);
+                            int take = seg_len;
+                            if (seg_len > EDITOR_WRAP_WIDTH) {
+                                take = find_wrap_pos(seg, EDITOR_WRAP_WIDTH);
+                                if (take <= 0) take = EDITOR_WRAP_WIDTH;
+                            }
+
+                            char saved_c = seg[take];
+                            seg[take] = '\0';
+
+                            if (!first_segment_used) {
+                                strncpy(edit_lines[0], seg, 119);
+                                first_segment_used = true;
+                            } else {
+                                editor_insert_line_at(edit_line_count, seg);
+                            }
+
+                            seg[take] = saved_c;
+                            seg += take;
+                            while (*seg == ' ' || *seg == '\t') seg++;
+                        } while (*seg);
+
+                        *p = saved;
+                        if (at_end) break;
                         line_start = p + 1;
+                        p = line_start;
+                    } else {
+                        p++;
                     }
                 }
-                if (*line_start) {
-                    edit_lines[edit_line_count] = new char[120];
-                    memset(edit_lines[edit_line_count], 0, 120);
-                    strncpy(edit_lines[edit_line_count], line_start, 119);
-                    edit_line_count++;
-                }
                 delete[] content;
-            } else {
-                edit_lines = new char*[1];
-                edit_lines[0] = new char[120];
-                memset(edit_lines[0], 0, 120);
-                edit_line_count = 1;
             }
         } else {
             console_print("Usage: edit \"<filename>\"\n");
@@ -8157,6 +8257,14 @@ public:
             private_startup_cmd[255] = '\0';
         }
 
+        // Stable ID for this window's taskbar button. Unlike its index in
+        // WindowManager::windows[] (which gets reshuffled every time a
+        // window is focused — see set_focus()), this never changes, so
+        // the terminal's taskbar button stays in the same place for its
+        // whole lifetime instead of jumping around as windows are clicked.
+        static int s_next_term_id = 1;
+        term_id = s_next_term_id++;
+
         // Print a banner in the emulator window so it's obvious to the
         // user that this is the Bochs CPU emulator booting their ELF, not
         // a normal shell. The banner is queued onto the terminal buffer
@@ -8171,7 +8279,9 @@ public:
     bool is_emulator_window = false;
     bool bochs_reset_done   = false;  // reset runs once per window
     int captured_elf_slot = -1;
+    int term_id = -1;
     int get_elf_slot() const override { return captured_elf_slot; }
+    int get_taskbar_id() const override { return term_id; }
 
     void close() override {
         // If this window owned the Bochs self-test overlay, relinquish it
@@ -8256,6 +8366,7 @@ public:
 
     void draw() override {
         if (!has_focus && is_closed) return;
+        if (is_minimized) return; // hidden but still "running" — see taskbar button
 
         using namespace ColorPalette;
         
@@ -8274,6 +8385,10 @@ public:
         } else {
             draw_string(title, x + 5, y + 8, TEXT_WHITE);
         }
+
+        // Minimize button ("_"), sits just left of the close button.
+        draw_rect_filled(x + w - 44, y + 4, 18, 18, BUTTON_FACE);
+        draw_string("_", x + w - 39, y + 12, TEXT_BLACK);
 
         draw_rect_filled(x + w - 22, y + 4, 18, 18, BUTTON_CLOSE);
         draw_string("X", x + w - 17, y + 8, TEXT_WHITE);
@@ -8427,7 +8542,7 @@ public:
         } 
         else if (c >= 32 && c < 127) { // Printable characters
             // **WORD WRAP IMPLEMENTATION**
-            const int MAX_LINE_WIDTH = 75; // Characters before wrap
+            const int MAX_LINE_WIDTH = EDITOR_WRAP_WIDTH; // Characters before wrap
             
             if (current_len < TERM_WIDTH - 2) {
                 // Insert character
@@ -8780,12 +8895,19 @@ void WindowManager::handle_input(char key, int mx, int my, bool left_down, bool 
     if (left_clicked) {
         // Check window interactions first (top to bottom)
         for (int i = num_windows - 1; i >= 0; i--) {
+            if (windows[i]->is_minimized) continue; // hidden — no on-screen hit area
             if (mx >= windows[i]->x && mx < windows[i]->x + windows[i]->w &&
                 my >= windows[i]->y && my < windows[i]->y + windows[i]->h) {
                 
                 set_focus(i);
                 if (windows[i]->is_in_close_button(mx, my)) {
                     windows[i]->close();
+                } else if (windows[i]->get_taskbar_id() >= 0 && windows[i]->is_in_minimize_button(mx, my)) {
+                    // Minimize button is only drawn for terminal windows
+                    // (get_taskbar_id() >= 0); other window types don't
+                    // render one, so don't treat that screen area as a
+                    // hidden hotspot for them.
+                    windows[i]->is_minimized = true;
                 } else if (windows[i]->is_in_titlebar(mx, my)) {
                     dragging_idx = focused_idx;
                     drag_offset_x = mx - windows[dragging_idx]->x;
@@ -8842,28 +8964,28 @@ void WindowManager::handle_input(char key, int mx, int my, bool left_down, bool 
                 return;
             }
             bx += btn_w + 4;
-            // Per-slot ELF buttons
-            for (int s = 0; s < MAX_ELF_PROCESSES; ++s) {
-                if (!elf_processes[s].active) continue;  // skip idle and completed slots
+
+            // Per-terminal-window buttons, walked in the same stable
+            // get_taskbar_id() order draw_desktop() uses (windows[] itself
+            // gets reshuffled by set_focus(), so array order isn't stable).
+            // A single click here both raises/focuses the window AND — if
+            // it was minimized — restores ("maximises") it back onto the
+            // desktop in that same click.
+            bool shown[16] = { false };
+            for (int shown_count = 0; shown_count < num_windows; ++shown_count) {
+                int best_i = -1, best_id = 0x7fffffff;
+                for (int i = 0; i < num_windows; ++i) {
+                    if (shown[i]) continue;
+                    int tid = windows[i]->get_taskbar_id();
+                    if (tid < 0) { shown[i] = true; continue; } // not a terminal window
+                    if (tid < best_id) { best_id = tid; best_i = i; }
+                }
+                if (best_i < 0) break; // nothing left to show
+                shown[best_i] = true;
+
                 if (mx >= bx && mx < bx + btn_w) {
-                    // Find the terminal window that owns this slot and bring it to front
-                    bool found = false;
-                    for (int wi = 0; wi < num_windows; ++wi) {
-                        if (windows[wi]->get_elf_slot() == s) {
-                            set_focus(wi);
-                            found = true;
-                            break;
-                        }
-                    }
-                    // Terminal was closed but ELF still active — open a new one attached to slot
-                    if (!found && elf_processes[s].active) {
-                        static int _tw_ctr = 0;
-                        int off = (_tw_ctr++ % 10) * 30;
-                        TerminalWindow* tw2 = new TerminalWindow(100 + off, 50 + off);
-                        tw2->captured_elf_slot = s;
-                        elf_processes[s].terminal = tw2;
-                        wm.add_window(tw2);
-                    }
+                    windows[best_i]->is_minimized = false;
+                    set_focus(best_i);
                     return;
                 }
                 bx += btn_w + 4;
@@ -9983,8 +10105,17 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
     vga_status("Init complete - entering main loop", 0x0A);
 
     // ── Main loop ─────────────────────────────────────────────────────────────
-    uint32_t last_paint_tick = 0;
     const uint32_t TICKS_PER_FRAME = 1;
+    // Seeded so that (g_timer_ticks - last_paint_tick) >= TICKS_PER_FRAME is
+    // already true on the very first loop iteration (0 - (uint32_t)-1
+    // wraps around to 1). With last_paint_tick starting at 0 (matching
+    // g_timer_ticks' own starting value of 0), that gating check read
+    // (0 - 0) >= 1, i.e. false — so despite the g_evt_timer/g_evt_dirty
+    // flags being forced below, the paint block a few lines down was
+    // still skipped on frame one and the desktop (icons, taskbar, clock)
+    // stayed blank until the software timer's poll_counter first reached
+    // 500, rather than appearing immediately as the comment intended.
+    uint32_t last_paint_tick = (uint32_t)0 - TICKS_PER_FRAME;
     int prev_mouse_x = mouse_x;
     int prev_mouse_y = mouse_y;
 
