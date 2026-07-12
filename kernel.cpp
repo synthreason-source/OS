@@ -1595,6 +1595,29 @@ void draw_icon_folder(int x, int y) {
     draw_rect_filled(x, y + 31, 32, 1, ColorPalette::ICON_FILE_OUTLINE);
 }
 
+// Small (14x14) icon variants used by the File Explorer list view. The
+// desktop icons above are 32x32, far taller than a compact list row —
+// drawing them in a list caused each icon to spill into the rows above
+// and below it (the "icon clipping" bug). These small variants are sized
+// to fit exactly inside FileExplorerWindow::ROW_H so rows never overlap.
+void draw_icon_file_small(int x, int y, bool is_shortcut) {
+    draw_rect_filled(x, y, 14, 14, ColorPalette::ICON_FILE_FILL);
+    draw_rect_filled(x, y, 14, 1, ColorPalette::ICON_FILE_OUTLINE);
+    draw_rect_filled(x + 13, y, 1, 14, ColorPalette::ICON_FILE_OUTLINE);
+    draw_rect_filled(x, y + 13, 14, 1, ColorPalette::ICON_FILE_OUTLINE);
+    draw_rect_filled(x, y, 1, 14, ColorPalette::ICON_FILE_OUTLINE);
+    if (is_shortcut) {
+        draw_rect_filled(x + 2, y + 9, 5, 3, ColorPalette::ICON_SHORTCUT_ARROW);
+        put_pixel_back(x + 4, y + 8, ColorPalette::ICON_SHORTCUT_ARROW);
+    }
+}
+
+void draw_icon_folder_small(int x, int y) {
+    draw_rect_filled(x, y + 3, 14, 11, ColorPalette::ICON_FOLDER_FILL);
+    draw_rect_filled(x, y, 7, 3, ColorPalette::ICON_FOLDER_FILL);
+    draw_rect_filled(x, y + 13, 14, 1, ColorPalette::ICON_FILE_OUTLINE);
+}
+
 // New: Desktop items structure
 enum IconType { ICON_FILE, ICON_DIR, ICON_SHORTCUT, ICON_APP };
 struct DesktopItem {
@@ -1627,6 +1650,7 @@ public:
     virtual void on_key_press(char c) = 0;
     virtual void on_mouse_click(int mx, int my) {} // New
 	virtual void on_mouse_right_click(int mx, int my) {} // ADD THIS LINE
+	virtual void refresh_contents() {} // Lets WindowManager tell a window (e.g. FileExplorerWindow) to reload its data after a filesystem-mutating context-menu action.
 
     virtual void update() = 0;
     virtual void console_print(const char* s) {}
@@ -4039,6 +4063,118 @@ private:
     int scroll_offset;
     int selected_index;
 
+    // --- List / scrollbar geometry constants ---
+    // ROW_H must be >= the small icon size (14px) plus a little padding so
+    // rows never overlap/clip into each other.
+    static constexpr int TITLEBAR_H   = 25;
+    static constexpr int LIST_TOP_PAD = 5;   // gap below titlebar before first row
+    static constexpr int ROW_H        = 18;
+    static constexpr int SCROLLBAR_W  = 16;  // width of the scroll sidebar
+    static constexpr int ARROW_H      = 16;  // height of each up/down arrow button
+
+    int list_area_x() const { return x; }
+    int list_area_y() const { return y + TITLEBAR_H; }
+    int list_area_w() const { return w - SCROLLBAR_W; }
+    int list_area_h() const { return h - TITLEBAR_H; }
+
+    int max_visible_items() const {
+        int n = (list_area_h() - LIST_TOP_PAD) / ROW_H;
+        return n < 1 ? 1 : n;
+    }
+
+    int max_scroll_offset() const {
+        int m = num_files - max_visible_items();
+        return m < 0 ? 0 : m;
+    }
+
+    void clamp_scroll() {
+        int max_off = max_scroll_offset();
+        if (scroll_offset > max_off) scroll_offset = max_off;
+        if (scroll_offset < 0) scroll_offset = 0;
+    }
+
+    int scrollbar_x() const { return x + w - SCROLLBAR_W; }
+    int scrollbar_top() const { return y + TITLEBAR_H; }
+    int scrollbar_track_top() const { return scrollbar_top() + ARROW_H; }
+    int scrollbar_track_h() const { return list_area_h() - 2 * ARROW_H; }
+
+    // Returns true and consumes the click if it landed on the scrollbar.
+    bool handle_scrollbar_click(int mx, int my) {
+        if (mx < scrollbar_x() || mx >= scrollbar_x() + SCROLLBAR_W) return false;
+        if (my < scrollbar_top() || my >= scrollbar_top() + list_area_h()) return false;
+
+        int sb_top = scrollbar_top();
+        int track_top = scrollbar_track_top();
+        int track_h = scrollbar_track_h();
+
+        if (my < sb_top + ARROW_H) {
+            // Up arrow
+            scroll_offset--;
+        } else if (my >= sb_top + list_area_h() - ARROW_H) {
+            // Down arrow
+            scroll_offset++;
+        } else if (track_h > 0) {
+            // Track click: page up/down relative to the thumb position
+            int visible = max_visible_items();
+            int max_off = max_scroll_offset();
+            int thumb_h = max_off > 0 ? (track_h * visible) / num_files : track_h;
+            if (thumb_h < 8) thumb_h = 8;
+            if (thumb_h > track_h) thumb_h = track_h;
+            int thumb_y = track_top;
+            if (max_off > 0) {
+                thumb_y = track_top + ((track_h - thumb_h) * scroll_offset) / max_off;
+            }
+            if (my < thumb_y) {
+                scroll_offset -= visible; // page up
+            } else if (my >= thumb_y + thumb_h) {
+                scroll_offset += visible; // page down
+            }
+        }
+        clamp_scroll();
+        return true;
+    }
+
+    void draw_scrollbar() {
+        using namespace ColorPalette;
+        int sb_x = scrollbar_x();
+        int sb_top = scrollbar_top();
+        int sb_h = list_area_h();
+
+        // Track background
+        draw_rect_filled(sb_x, sb_top, SCROLLBAR_W, sb_h, BUTTON_FACE);
+        draw_rect_filled(sb_x, sb_top, 1, sb_h, BUTTON_SHADOW);
+
+        // Up arrow button
+        draw_rect_filled(sb_x + 1, sb_top + 1, SCROLLBAR_W - 2, ARROW_H - 2, BUTTON_FACE);
+        draw_rect_filled(sb_x + 1, sb_top + 1, SCROLLBAR_W - 2, 1, BUTTON_HIGHLIGHT);
+        draw_rect_filled(sb_x + 1, sb_top + ARROW_H - 2, SCROLLBAR_W - 2, 1, BUTTON_SHADOW);
+        draw_char('^', sb_x + 4, sb_top + 4, TEXT_BLACK);
+
+        // Down arrow button
+        int down_y = sb_top + sb_h - ARROW_H;
+        draw_rect_filled(sb_x + 1, down_y + 1, SCROLLBAR_W - 2, ARROW_H - 2, BUTTON_FACE);
+        draw_rect_filled(sb_x + 1, down_y + 1, SCROLLBAR_W - 2, 1, BUTTON_HIGHLIGHT);
+        draw_rect_filled(sb_x + 1, down_y + ARROW_H - 2, SCROLLBAR_W - 2, 1, BUTTON_SHADOW);
+        draw_char('v', sb_x + 4, down_y + 4, TEXT_BLACK);
+
+        // Thumb
+        int track_top = scrollbar_track_top();
+        int track_h = scrollbar_track_h();
+        if (track_h > 0) {
+            int visible = max_visible_items();
+            int max_off = max_scroll_offset();
+            int thumb_h = max_off > 0 ? (track_h * visible) / (num_files > 0 ? num_files : 1) : track_h;
+            if (thumb_h < 8) thumb_h = 8;
+            if (thumb_h > track_h) thumb_h = track_h;
+            int thumb_y = track_top;
+            if (max_off > 0) {
+                thumb_y = track_top + ((track_h - thumb_h) * scroll_offset) / max_off;
+            }
+            draw_rect_filled(sb_x + 2, thumb_y, SCROLLBAR_W - 4, thumb_h, BUTTON_SHADOW);
+            draw_rect_filled(sb_x + 2, thumb_y, SCROLLBAR_W - 4, 1, BUTTON_HIGHLIGHT);
+        }
+    }
+
 public:
     FileExplorerWindow(int x, int y, const char* path) 
         : Window(x, y, 400, 300, "File Explorer"), num_files(0), scroll_offset(0), selected_index(-1) {
@@ -4047,8 +4183,10 @@ public:
         refresh_contents();
     }
 
-    void refresh_contents() {
+    void refresh_contents() override {
         num_files = fat32_list_directory(current_path, file_list, 128);
+        if (selected_index >= num_files) selected_index = -1;
+        clamp_scroll();
     }
 
     void draw() override {
@@ -4072,38 +4210,56 @@ public:
         for (int i = 0; i < h; i++) put_pixel_back(x, y + i, WINDOW_BORDER);
         for (int i = 0; i < h; i++) put_pixel_back(x + w - 1, y + i, WINDOW_BORDER);
 
-        // Draw file list
-        int max_visible_items = (h - 35) / 10;
-        for (int i = 0; i < max_visible_items; ++i) {
+        clamp_scroll();
+
+        // Draw file list — rows are ROW_H tall and icons are the small
+        // (14x14) variant, so each row's icon fits entirely within its own
+        // row and never bleeds into neighboring rows.
+        int visible = max_visible_items();
+        int la_x = list_area_x();
+        int la_y = list_area_y();
+        int la_w = list_area_w();
+
+        for (int i = 0; i < visible; ++i) {
             int file_idx = scroll_offset + i;
             if (file_idx >= num_files) break;
-            
-            int item_y = y + 30 + i * 10;
+
+            int item_y = la_y + LIST_TOP_PAD + i * ROW_H;
             char filename[13];
             fat32_get_fne_from_entry(&file_list[file_idx], filename);
 
             if (file_idx == selected_index) {
-                draw_rect_filled(x + 2, item_y, w - 4, 10, TITLEBAR_ACTIVE);
+                draw_rect_filled(la_x + 2, item_y, la_w - 4, ROW_H - 2, TITLEBAR_ACTIVE);
             }
 
             if (file_list[file_idx].attr & FAT_ATTR_DIRECTORY) {
-                draw_icon_folder(x + 5, item_y - 2);
+                draw_icon_folder_small(la_x + 4, item_y + 2);
             } else {
                 bool is_shortcut = strstr(filename, ".LNK") != nullptr;
-                draw_icon_file(x + 5, item_y - 2, is_shortcut);
+                draw_icon_file_small(la_x + 4, item_y + 2, is_shortcut);
             }
 
-            draw_string(filename, x + 40, item_y, TEXT_BLACK);
+            uint32_t name_color = (file_idx == selected_index) ? TEXT_WHITE : TEXT_BLACK;
+            draw_string(filename, la_x + 24, item_y + 5, name_color);
         }
+
+        // Scroll sidebar — always drawn so the list column width is
+        // consistent, and it visually communicates whether there's more
+        // content (short/tall thumb) even when nothing is scrollable yet.
+        draw_scrollbar();
     }
 
     void on_key_press(char c) override {
         // Handle keyboard navigation later
     }
-void on_mouse_right_click(int mx, int my) {
-        int content_y = my - (y + 30);
+
+    void on_mouse_right_click(int mx, int my) override {
+        // Right-clicks on the scrollbar shouldn't open a file context menu.
+        if (mx >= scrollbar_x() && mx < scrollbar_x() + SCROLLBAR_W) return;
+
+        int content_y = my - (list_area_y() + LIST_TOP_PAD);
         if (content_y < 0) return;
-        int clicked_idx = scroll_offset + (content_y / 10);
+        int clicked_idx = scroll_offset + (content_y / ROW_H);
 
         if (clicked_idx < num_files) {
             selected_index = clicked_idx;
@@ -4114,10 +4270,15 @@ void on_mouse_right_click(int mx, int my) {
             wm.show_file_context_menu(mx, my, filename);
         }
     }
+
     void on_mouse_click(int mx, int my) override {
-        int content_y = my - (y + 30);
+        // Scrollbar clicks (arrows / track) are handled here and don't
+        // affect file selection.
+        if (handle_scrollbar_click(mx, my)) return;
+
+        int content_y = my - (list_area_y() + LIST_TOP_PAD);
         if (content_y < 0) return;
-        int clicked_idx = scroll_offset + (content_y / 10);
+        int clicked_idx = scroll_offset + (content_y / ROW_H);
         
         if(clicked_idx < num_files) {
             selected_index = clicked_idx;
@@ -8780,6 +8941,7 @@ void WindowManager::execute_context_menu_action(int item_index) {
     }
     else if (current_context == CTX_EXPLORER_ITEM) {
         const char* filename = context_file_path;
+        bool needs_explorer_refresh = false;
 
         if (strcmp(action, "Run") == 0) {
             char command_buffer[128];
@@ -8802,7 +8964,27 @@ void WindowManager::execute_context_menu_action(int item_index) {
 
             fat32_write_file(shortcut_name, shortcut_content, strlen(shortcut_content));
             load_desktop_items();
-        } 
+            needs_explorer_refresh = true;
+        } else if (strcmp(action, "Copy") == 0) {
+            // Previously unimplemented: "Copy" appeared in the menu but did
+            // nothing when clicked. Store the file path in the shared
+            // clipboard buffer, same as desktop-icon Copy does.
+            strncpy(g_clipboard_buffer, filename, 1023);
+            g_clipboard_buffer[1023] = '\0';
+        } else if (strcmp(action, "Delete") == 0) {
+            // Previously unimplemented: "Delete" appeared in the menu but
+            // did nothing when clicked.
+            fat32_remove_file(filename);
+            load_desktop_items();
+            needs_explorer_refresh = true;
+        }
+
+        // The explorer window was necessarily focused for its context menu
+        // to have opened (see handle_input's right-click routing), so
+        // refresh whatever window is currently focused.
+        if (needs_explorer_refresh && focused_idx >= 0 && focused_idx < num_windows) {
+            windows[focused_idx]->refresh_contents();
+        }
     }
 
     context_menu_active = false;
@@ -10222,7 +10404,7 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
             // swap_buffers. Otherwise a hang inside tick_elf_processes
             // would leave the last painted frame without the breadcrumbs
             // pointing at where the hang happened.
-            tick_elf_processes(100);
+            tick_elf_processes(1);
 
             if (g_evt_dirty || g_input_state.hasNewInput) {
                 last_paint_tick           = g_timer_ticks;
