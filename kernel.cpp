@@ -1693,7 +1693,7 @@ public:
     WindowManager() : num_windows(0), focused_idx(-1), dragging_idx(-1), 
                       num_desktop_items(0), dragging_icon_idx(-1), 
                       context_menu_active(false) {}
-    void show_file_context_menu(int mx, int my, const char* filename) {
+    void show_file_context_menu(int mx, int my, const char* filename, bool is_executable) {
 		context_menu_active = true;
 		context_menu_x = mx;
 		context_menu_y = my;
@@ -1701,7 +1701,7 @@ public:
 		strncpy(context_file_path, filename, 127); // Store the filename for the action
 		num_context_menu_items = 0;
 		
-		if (strstr(filename, ".obj") != nullptr || strstr(filename, ".OBJ") != nullptr) {
+		if (is_executable) {
 			context_menu_items[num_context_menu_items++] = "Run";
 		}
 		context_menu_items[num_context_menu_items++] = "Edit"; // ADDED THIS LINE
@@ -4098,6 +4098,51 @@ private:
     int scrollbar_track_top() const { return scrollbar_top() + ARROW_H; }
     int scrollbar_track_h() const { return list_area_h() - 2 * ARROW_H; }
 
+    // Peeks at a file's first 4 bytes and checks them against the ELF
+    // magic number (0x7F 'E' 'L' 'F'), the same check validate_elf_header()
+    // does on the full header. We deliberately don't depend on the
+    // Elf32_Ehdr type here (it's defined much later in this translation
+    // unit, after FileExplorerWindow) — a raw byte comparison is all
+    // "is this actually an ELF" requires.
+    bool is_elf_file(int idx) {
+        if (idx < 0 || idx >= num_files) return false;
+        if (file_list[idx].attr & FAT_ATTR_DIRECTORY) return false;
+        if (file_list[idx].file_size < 4) return false;
+
+        char filename[13];
+        fat32_get_fne_from_entry(&file_list[idx], filename);
+        char* data = fat32_read_file_as_string(filename);
+        if (!data) return false;
+
+        bool is_elf = (unsigned char)data[0] == 0x7F &&
+                       data[1] == 'E' && data[2] == 'L' && data[3] == 'F';
+        delete[] data;
+        return is_elf;
+    }
+
+    // Double-click / right-click "Run" behavior: inspect the actual file
+    // contents (not just its extension) and either launch it through the
+    // Bochs CPU emulator (ELF binaries) or open it in the text editor
+    // (anything else). "bochs <file>" is used rather than "run <file>" —
+    // "run" is not a recognized shell command in handle_command(), so
+    // building a "run %s" command string (as this code used to) silently
+    // failed; "bochs" is the actual working ELF-execution entry point.
+    void open_or_run(int idx) {
+        if (idx < 0 || idx >= num_files) return;
+        if (file_list[idx].attr & FAT_ATTR_DIRECTORY) return; // directory navigation not implemented yet
+
+        char filename[13];
+        fat32_get_fne_from_entry(&file_list[idx], filename);
+
+        char command_buffer[128];
+        if (is_elf_file(idx)) {
+            snprintf(command_buffer, sizeof(command_buffer), "bochs %s", filename);
+        } else {
+            snprintf(command_buffer, sizeof(command_buffer), "edit \"%s\"", filename);
+        }
+        launch_terminal_with_command(command_buffer);
+    }
+
     // Returns true and consumes the click if it landed on the scrollbar.
     bool handle_scrollbar_click(int mx, int my) {
         if (mx < scrollbar_x() || mx >= scrollbar_x() + SCROLLBAR_W) return false;
@@ -4266,8 +4311,11 @@ public:
             char filename[13];
             fat32_get_fne_from_entry(&file_list[clicked_idx], filename);
 
-            // Tell the window manager to show the context menu for this file
-            wm.show_file_context_menu(mx, my, filename);
+            // Tell the window manager to show the context menu for this
+            // file. "Run" is offered whenever the file's contents are
+            // actually an ELF binary, not just when its name ends in
+            // .obj/.OBJ.
+            wm.show_file_context_menu(mx, my, filename, is_elf_file(clicked_idx));
         }
     }
 
@@ -4286,20 +4334,9 @@ public:
             static int last_click_idx = -1;
             static uint32_t last_click_tick = 0;
             if(clicked_idx == last_click_idx && (g_timer_ticks - last_click_tick) < 20) {
-                // Double click!
-                char filename[13];
-                fat32_get_fne_from_entry(&file_list[clicked_idx], filename);
-
-                // --- ADD THIS LOGIC ---
-                // Check if it's an executable object file
-                if (strstr(filename, ".obj") != nullptr || strstr(filename, ".OBJ") != nullptr) {
-                    char command_buffer[128];
-                    snprintf(command_buffer, 128, "run %s", filename);
-                    launch_terminal_with_command(command_buffer);
-                }
-                // --- END ADDITION ---
-
-                // Handle opening file/dir (can be expanded for directories later)
+                // Double click! Open in the editor, or run it in the
+                // emulator, depending on whether it's actually an ELF.
+                open_or_run(clicked_idx);
             }
             last_click_idx = clicked_idx;
             last_click_tick = g_timer_ticks;
@@ -8925,8 +8962,10 @@ void WindowManager::execute_context_menu_action(int item_index) {
         DesktopItem& item = desktop_items[context_icon_idx];
         
         if (strcmp(action, "Run") == 0) {
+            // Same fix as the explorer's Run action: "run <file>" isn't a
+            // recognized shell command, "bochs <file>" is.
             char command_buffer[128];
-            snprintf(command_buffer, 128, "run %s", item.name);
+            snprintf(command_buffer, 128, "bochs %s", item.name);
             launch_terminal_with_command(command_buffer);
         } else if (strcmp(action, "Edit") == 0) {
             char command_buffer[128];
@@ -8944,8 +8983,12 @@ void WindowManager::execute_context_menu_action(int item_index) {
         bool needs_explorer_refresh = false;
 
         if (strcmp(action, "Run") == 0) {
+            // "run <file>" is not a recognized shell command (see
+            // handle_command()'s dispatch table) -- "bochs <file>" is the
+            // actual ELF-execution entry point. Using "run" here silently
+            // did nothing.
             char command_buffer[128];
-            snprintf(command_buffer, 128, "run %s", filename);
+            snprintf(command_buffer, 128, "bochs %s", filename);
             launch_terminal_with_command(command_buffer);
         } else if (strcmp(action, "Edit") == 0) {
             char command_buffer[128];
@@ -9037,13 +9080,29 @@ void WindowManager::handle_input(char key, int mx, int my, bool left_down, bool 
     
     // --- 3. Handle Right Clicks (Opening Context Menu) ---
     if (right_clicked) {
-		if (focused_idx != -1) {
-            Window* win = windows[focused_idx];
-            if (mx >= win->x && mx < win->x + win->w && my >= win->y && my < win->y + win->h) {
-                win->on_mouse_right_click(mx, my);
-                return; // The window handled the click
-            }
-        }
+		// Check window interactions first (top to bottom), same as left
+		// click below. Previously this only ever checked the window that
+		// was ALREADY focused — right-clicking a background window (one
+		// not already in focus) fell straight through to the desktop-icon
+		// checks below and either did nothing or opened the desktop's
+		// context menu instead of that window's. Now a right-click on any
+		// window focuses it and dispatches the click to it, matching how
+		// left-click already behaves.
+		for (int i = num_windows - 1; i >= 0; i--) {
+			if (windows[i]->is_minimized) continue; // hidden — no on-screen hit area
+			if (mx >= windows[i]->x && mx < windows[i]->x + windows[i]->w &&
+				my >= windows[i]->y && my < windows[i]->y + windows[i]->h) {
+				// Capture the target BEFORE set_focus(), which reshuffles
+				// windows[] (moves the focused window to the end and
+				// shifts everything after idx down by one) — using
+				// windows[i] afterward would operate on whatever window
+				// slid into slot i, not the one actually clicked.
+				Window* target = windows[i];
+				set_focus(i);
+				target->on_mouse_right_click(mx, my);
+				return; // The window handled the click
+			}
+		}
         // First, check if a click happened on a desktop icon
         int clicked_icon_index = -1;
         for (int i = num_desktop_items - 1; i >= 0; --i) {
@@ -9093,21 +9152,29 @@ void WindowManager::handle_input(char key, int mx, int my, bool left_down, bool 
             if (mx >= windows[i]->x && mx < windows[i]->x + windows[i]->w &&
                 my >= windows[i]->y && my < windows[i]->y + windows[i]->h) {
                 
+                // Capture the target BEFORE set_focus(), which reshuffles
+                // windows[] (moves the focused window to the end and
+                // shifts everything after idx down by one) — using
+                // windows[i] afterward would operate on whatever window
+                // slid into slot i, not the one actually clicked (e.g.
+                // clicking a background window's close button could close
+                // a completely different window).
+                Window* target = windows[i];
                 set_focus(i);
-                if (windows[i]->is_in_close_button(mx, my)) {
-                    windows[i]->close();
-                } else if (windows[i]->get_taskbar_id() >= 0 && windows[i]->is_in_minimize_button(mx, my)) {
+                if (target->is_in_close_button(mx, my)) {
+                    target->close();
+                } else if (target->get_taskbar_id() >= 0 && target->is_in_minimize_button(mx, my)) {
                     // Minimize button is only drawn for terminal windows
                     // (get_taskbar_id() >= 0); other window types don't
                     // render one, so don't treat that screen area as a
                     // hidden hotspot for them.
-                    windows[i]->is_minimized = true;
-                } else if (windows[i]->is_in_titlebar(mx, my)) {
+                    target->is_minimized = true;
+                } else if (target->is_in_titlebar(mx, my)) {
                     dragging_idx = focused_idx;
-                    drag_offset_x = mx - windows[dragging_idx]->x;
-                    drag_offset_y = my - windows[dragging_idx]->y;
+                    drag_offset_x = mx - target->x;
+                    drag_offset_y = my - target->y;
                 } else {
-                    windows[i]->on_mouse_click(mx, my);
+                    target->on_mouse_click(mx, my);
                 }
                 return;
             }
@@ -9128,8 +9195,10 @@ void WindowManager::handle_input(char key, int mx, int my, bool left_down, bool 
 					} 
 					// This part handles executing .obj files
 					else if (strstr(item.name, ".obj") != nullptr || strstr(item.name, ".OBJ") != nullptr) {
+						// Same fix as the explorer's Run action: "run <file>"
+						// isn't a recognized shell command.
 						char command_buffer[128];
-						snprintf(command_buffer, 128, "run %s", item.name);
+						snprintf(command_buffer, 128, "bochs %s", item.name);
 						launch_terminal_with_command(command_buffer);
 					}
                     
