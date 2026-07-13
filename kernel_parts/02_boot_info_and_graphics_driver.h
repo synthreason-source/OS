@@ -57,6 +57,118 @@ static uint32_t* backbuffer = backbuffer_storage;
 FramebufferInfo fb_info;
 
 // =============================================================================
+// FRAMEBUFFER WRITE-COMBINING (MTRR) -- fixes "mouse is slow on real
+// hardware, fine in VMware"
+// =============================================================================
+// swap_buffers() (see 10_window_manager_impl.h) does one `rep movsl` from
+// the backbuffer to the live linear framebuffer every single frame, and
+// every mouse-move redraw goes through that same path. Under VMware the
+// virtual GPU's framebuffer is fast to write to no matter what x86 memory
+// type the CPU thinks it has, so this cost is invisible there. On real
+// hardware, unless something has told the CPU the framebuffer's physical
+// address range is Write-Combining, the default effective memory type for
+// a BIOS/GOP-provided linear framebuffer is often Uncacheable (UC) --
+// and bulk sequential writes to UC memory are dramatically slower (often
+// 20-100x) than to WC memory, because every store becomes its own
+// separate, unbuffered bus transaction instead of being coalesced into
+// full-cache-line burst writes. The whole render+input loop (see
+// poll_input_universal()'s call site in kernel_main) runs synchronously,
+// so a framebuffer blit that's 20-100x slower makes mouse tracking itself
+// feel exactly as laggy as the symptom describes.
+//
+// This kernel runs in 32-bit protected mode WITHOUT paging (no CR3/PDE/PTE
+// setup anywhere in this codebase), so there's no page-level PAT/PCD knob
+// available. MTRRs are the only remaining lever: paging-independent,
+// physical-address-range memory-type overrides configured through MSRs,
+// present on every P6-class (Pentium Pro, 1995) and later x86 CPU, i.e.
+// any real hardware this is plausibly running on.
+//
+// This only takes effect if the framebuffer's physical base/size happen
+// to be power-of-two aligned -- true for any PCI-BAR-backed framebuffer,
+// since PCI BARs are always power-of-two sized/aligned. If they aren't
+// (some unusual non-BAR memory map), this safely does nothing rather than
+// risk marking unrelated physical memory as write-combining.
+
+static inline void cpuid_regs(uint32_t leaf, uint32_t& eax, uint32_t& ebx, uint32_t& ecx, uint32_t& edx) {
+    asm volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(leaf));
+}
+
+static inline uint64_t rdmsr64(uint32_t msr) {
+    uint32_t lo, hi;
+    asm volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+static inline void wrmsr64(uint32_t msr, uint64_t value) {
+    uint32_t lo = (uint32_t)(value & 0xFFFFFFFFu);
+    uint32_t hi = (uint32_t)(value >> 32);
+    asm volatile("wrmsr" : : "c"(msr), "a"(lo), "d"(hi));
+}
+
+#define MTRR_TYPE_WC          0x01
+#define IA32_MTRRCAP          0xFE
+#define IA32_MTRR_DEF_TYPE    0x2FF
+#define IA32_MTRR_PHYSBASE0   0x200
+#define IA32_MTRR_PHYSMASK0   0x201
+
+// Call once, after fb_info.ptr/pitch/height are finalized and before the
+// first swap_buffers(). Safe no-op on any CPU/layout it can't handle
+// confidently (no MSR/MTRR support, no WC support, no free variable MTRR,
+// or a base/size that isn't naturally power-of-two aligned) -- worst case
+// the framebuffer is left exactly as slow as it already was, never worse.
+void setup_framebuffer_write_combining() {
+    if (!fb_info.ptr) return;
+
+    uint32_t eax, ebx, ecx, edx;
+    cpuid_regs(1, eax, ebx, ecx, edx);
+    bool has_msr  = (edx & (1u << 5))  != 0;
+    bool has_mtrr = (edx & (1u << 12)) != 0;
+    if (!has_msr || !has_mtrr) return;
+
+    uint64_t mtrrcap = rdmsr64(IA32_MTRRCAP);
+    uint32_t vcnt = (uint32_t)(mtrrcap & 0xFF);
+    bool wc_supported = (mtrrcap & (1ull << 10)) != 0;
+    if (!wc_supported || vcnt == 0) return;
+
+    uint64_t base = (uint64_t)(uintptr_t)fb_info.ptr;
+    uint64_t fb_bytes = (uint64_t)fb_info.pitch * (uint64_t)fb_info.height;
+    if (fb_bytes == 0) return;
+
+    // Smallest power-of-two size (>= fb_bytes, <= 256MB) that `base` is
+    // naturally aligned to. If nothing up to 256MB works, bail out.
+    uint64_t size = 4096; // MTRR minimum granularity
+    bool found = false;
+    for (; size <= (256ull * 1024 * 1024); size <<= 1) {
+        if (size >= fb_bytes && (base % size) == 0) { found = true; break; }
+    }
+    if (!found) return;
+
+    int slot = -1;
+    for (uint32_t i = 0; i < vcnt; i++) {
+        uint64_t mask = rdmsr64(IA32_MTRR_PHYSMASK0 + i * 2);
+        if (!(mask & (1ull << 11))) { slot = (int)i; break; } // valid bit clear = free
+    }
+    if (slot < 0) return; // all variable MTRRs already in use -- don't clobber the BIOS's
+
+    asm volatile("cli");
+
+    uint64_t def_type = rdmsr64(IA32_MTRR_DEF_TYPE);
+    wrmsr64(IA32_MTRR_DEF_TYPE, def_type & ~(1ull << 11)); // disable MTRRs while reprogramming
+    asm volatile("wbinvd");
+
+    uint64_t phys_base = base & ~(size - 1);
+    uint64_t phys_mask = (~(size - 1)) & 0xFFFFFFFFFull; // 36-bit phys addr width -- guaranteed minimum on any MTRR-capable CPU
+
+    wrmsr64(IA32_MTRR_PHYSBASE0 + slot * 2, phys_base | MTRR_TYPE_WC);
+    wrmsr64(IA32_MTRR_PHYSMASK0 + slot * 2, phys_mask | (1ull << 11)); // set valid bit
+
+    asm volatile("wbinvd");
+    wrmsr64(IA32_MTRR_DEF_TYPE, def_type | (1ull << 11)); // re-enable MTRRs
+
+    asm volatile("sti");
+}
+
+// =============================================================================
 // UNIFIED COLOR PALETTE - PREVENTS COLOR INCONSISTENCIES
 // =============================================================================
 namespace ColorPalette {

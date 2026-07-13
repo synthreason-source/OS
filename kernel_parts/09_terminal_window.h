@@ -390,7 +390,7 @@ private:
         }
     }
     void print_prompt() { 
-        snprintf(prompt_buffer, TERM_WIDTH, "> %s", current_line);
+        snprintf(prompt_buffer, TERM_WIDTH, "%s> %s", current_directory_path, current_line);
         if (line_count > 0) {
             strncpy(buffer[line_count-1], prompt_buffer, TERM_WIDTH - 1);
         } else {
@@ -828,6 +828,7 @@ void handle_command() {
 
 	if (strcmp(command, "help") == 0) {
 		console_print("\nCommands: help, clear, version, time, ps, ls, edit, run, exec,\n"
+					  "  cd <dir> | cd .. | cd /   -- change directory, pwd, mkdir <name>\n"
 					  "  compile, rm, cp, mv, formatfs, chkdsk (/r /f), select_disk,\n"
 					  "  setpass, removepass, unlock, busybox, pself, killelf,\n"
 					  "  killexec, killrun, aesenc, aesdec, test,\n"
@@ -1158,6 +1159,34 @@ void handle_command() {
 	}
     else if (strcmp(command, "clear") == 0) { line_count = 0; memset(buffer, 0, sizeof(buffer)); }
     else if (strcmp(command, "ls") == 0) { fat32_list_files(); }
+    else if (strcmp(command, "cd") == 0) {
+        char* target = get_arg(args, 0);
+        const char* dest = (target && *target) ? target : "/"; // bare 'cd' -> root
+        uint32_t new_cluster;
+        char new_path[256];
+        if (fat32_resolve_path(dest, current_directory_cluster, current_directory_path,
+                                &new_cluster, new_path, sizeof(new_path))) {
+            current_directory_cluster = new_cluster;
+            strncpy(current_directory_path, new_path, 255);
+            current_directory_path[255] = '\0';
+        } else {
+            console_print("cd: no such directory: "); console_print(dest); console_print("\n");
+        }
+    }
+    else if (strcmp(command, "pwd") == 0) {
+        console_print(current_directory_path);
+        console_print("\n");
+    }
+    else if (strcmp(command, "mkdir") == 0) {
+        char* name = get_arg(args, 0);
+        if (!name) {
+            console_print("Usage: mkdir <name>\n");
+        } else if (fat32_mkdir(name) == 0) {
+            console_print("Directory created.\n");
+        } else {
+            console_print("mkdir: failed (name already in use, or disk full)\n");
+        }
+    }
     else if (strcmp(command, "edit") == 0) {
         char* filename = get_arg(args, 0);
         if(filename) {

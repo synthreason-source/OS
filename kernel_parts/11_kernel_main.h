@@ -929,6 +929,15 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
     if (fb_info.height == 0 || fb_info.height > 1200) fb_info.height = 768;
     if (fb_info.pitch  < fb_info.width * 4) fb_info.pitch = fb_info.width * 4;
 
+    // Real-hardware-only perf fix: mark the linear framebuffer's physical
+    // range Write-Combining via MTRR if at all possible (see the big
+    // comment above setup_framebuffer_write_combining() in
+    // 02_boot_info_and_graphics_driver.h for why this matters -- in short,
+    // it's what makes every-frame swap_buffers() blits, and therefore
+    // mouse tracking, not feel sluggish on real silicon). No-op under
+    // VMware/emulation, where this was never the bottleneck.
+    setup_framebuffer_write_combining();
+
     // ── Step 3: commit and paint ──────────────────────────────────────────────
     backbuffer = backbuffer_storage;
     g_gfx.init(false);
@@ -1163,7 +1172,15 @@ static inline bool is_cc_safe_char(unsigned char c) {
 }
 
 char* tcc_bridge_fat32_read(const char* filename) {
-    char *data = fat32_read_file_as_string(filename);
+    // Path-aware: fat32_read_file_as_string() only ever looks in the
+    // current directory and treats any '/' as part of a garbage flat
+    // name. fat32_read_file_as_string_path() falls back to that exact
+    // behavior when there's no '/' in filename, and otherwise resolves
+    // the directory part first -- needed both for `cc sub/foo.c` and for
+    // #include "sub/foo.h" (this same function is what TCC's open()
+    // shim calls for every #include, via the fat32_read_file_as_string
+    // macro alias in tcc_kernel.cpp).
+    char *data = fat32_read_file_as_string_path(filename);
 
     if (!data) {
         return NULL;
@@ -1171,7 +1188,10 @@ char* tcc_bridge_fat32_read(const char* filename) {
 
     for (char *p = data; *p; ++p) {
         if (!is_cc_safe_char((unsigned char)*p)) {
-            
+            // FIX: this used to return NULL here without freeing `data`,
+            // leaking the whole file's buffer every time a source file
+            // or header contained a byte outside the "safe" set.
+            delete[] data;
             return NULL;
         }
     }

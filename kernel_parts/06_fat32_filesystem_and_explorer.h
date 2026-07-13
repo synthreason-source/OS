@@ -116,6 +116,10 @@ static char* g_ahci_fis_buffer = nullptr;
 static fat32_bpb_t bpb;
 static uint32_t fat_start_sector, data_start_sector;
 static uint32_t current_directory_cluster = 0;
+// Human-readable form of current_directory_cluster, kept in sync by cd/
+// fat32_resolve_path(). Purely cosmetic/navigational (pwd, shell prompt) --
+// the cluster number above is what actually drives every disk operation.
+static char current_directory_path[256] = "/";
 // Absolute disk LBA of the FAT32 partition's first sector (0 if the disk
 // is a raw FAT32 image with no partition table — e.g. mkfat32.py output).
 // Set by fat32_init when an MBR/GPT FAT32 partition is located; used by
@@ -1165,6 +1169,313 @@ int fat32_find_entry(const char* filename, fat_dir_entry_t* entry_out, uint32_t*
     delete[] dir_buf;
     return -1;
 }
+// =============================================================================
+// DIRECTORY TRAVERSAL (cd / mkdir / path resolution)
+// =============================================================================
+// Everything above this point (fat32_find_entry, fat32_list_files, ...)
+// only ever looks inside current_directory_cluster -- the filesystem was
+// originally "one flat directory" with no way to descend into anything
+// else. The functions below generalise entry lookup to an arbitrary
+// starting cluster so the shell's `cd`, `mkdir`, the File Explorer, and
+// the in-kernel TCC compiler's #include resolution can all navigate
+// real subdirectories instead of being stuck at the root.
+
+// Same scan as fat32_find_entry(), but against an explicitly given
+// directory cluster instead of always current_directory_cluster, and
+// without the sector/offset out-params those callers use to edit an
+// entry in place (cd/mkdir/path-resolution only ever need to know
+// *what* an entry is, never to overwrite it).
+int fat32_find_entry_in(uint32_t dir_cluster, const char* name, fat_dir_entry_t* entry_out) {
+    char lfn_buf[256] = {0};
+    uint8_t current_checksum = 0;
+    uint8_t* dir_buf = new uint8_t[SECTOR_SIZE];
+    uint32_t cluster = dir_cluster;
+    while (cluster >= 2 && cluster < FAT_END_OF_CHAIN) {
+        for (uint8_t s = 0; s < bpb.sec_per_clus; ++s) {
+            uint32_t sector = cluster_to_lba(cluster) + s;
+            if (read_write_sectors(g_ahci_port, sector, 1, false, dir_buf) != 0) {
+                delete[] dir_buf;
+                return -1;
+            }
+            for (uint16_t e = 0; e < SECTOR_SIZE / sizeof(fat_dir_entry_t); ++e) {
+                fat_dir_entry_t* entry = (fat_dir_entry_t*)(dir_buf + e * sizeof(fat_dir_entry_t));
+                if (entry->name[0] == 0x00) { delete[] dir_buf; return -1; }
+                if ((uint8_t)entry->name[0] == DELETED_ENTRY) { lfn_buf[0] = '\0'; continue; }
+                if (entry->name[0] == '.') continue; // hide "." / ".." -- same as fat32_find_entry/list_files
+
+                if (entry->attr == ATTR_LONG_NAME) {
+                    fat_lfn_entry_t* lfn = (fat_lfn_entry_t*)entry;
+                    if (lfn->order & 0x40) {
+                        lfn_buf[0] = '\0';
+                        current_checksum = lfn->checksum;
+                    }
+                    char name_part[14] = {0};
+                    int k = 0;
+                    auto extract = [&](uint16_t val) {
+                        if (k < 13 && val != 0x0000 && val != 0xFFFF) name_part[k++] = (char)val;
+                    };
+                    for (int j=0; j<5; j++) extract(lfn->name1[j]);
+                    for (int j=0; j<6; j++) extract(lfn->name2[j]);
+                    for (int j=0; j<2; j++) extract(lfn->name3[j]);
+                    memmove(lfn_buf + k, lfn_buf, strlen(lfn_buf) + 1);
+                    memcpy(lfn_buf, name_part, k);
+                } else if (!(entry->attr & ATTR_VOLUME_ID)) {
+                    bool match = false;
+                    if (lfn_buf[0] != '\0' && lfn_checksum((unsigned char*)entry->name) == current_checksum) {
+                        if (strcmp(lfn_buf, name) == 0) match = true;
+                    } else {
+                        char sfn[13];
+                        from_83_format(entry->name, sfn);
+                        if (strcmp(sfn, name) == 0) match = true;
+                    }
+                    lfn_buf[0] = '\0';
+                    if (match) {
+                        memcpy(entry_out, entry, sizeof(fat_dir_entry_t));
+                        delete[] dir_buf;
+                        return 0;
+                    }
+                }
+            }
+        }
+        cluster = read_fat_entry(cluster);
+    }
+    delete[] dir_buf;
+    return -1;
+}
+
+// Reads a directory's own ".." entry (always the 2nd entry -- see
+// fat32_mkdir(), the only thing that creates directories, which always
+// lays them out "." then ".." first) to find its parent cluster. This
+// lets 'cd ..' / path resolution walk upward without keeping a separate
+// directory tree in memory: the on-disk ".." entry already IS that tree.
+bool fat32_get_parent_cluster(uint32_t dir_cluster, uint32_t* parent_out) {
+    if (dir_cluster == bpb.root_clus) { *parent_out = bpb.root_clus; return true; } // root is its own parent
+
+    uint8_t buf[SECTOR_SIZE];
+    if (read_write_sectors(g_ahci_port, cluster_to_lba(dir_cluster), 1, false, buf) != 0) return false;
+
+    fat_dir_entry_t* dotdot = (fat_dir_entry_t*)(buf + sizeof(fat_dir_entry_t));
+    if (dotdot->name[0] != '.' || dotdot->name[1] != '.') return false; // not a dir we created -- no ".." to trust
+
+    uint32_t cl = ((uint32_t)dotdot->fst_clus_hi << 16) | dotdot->fst_clus_lo;
+    if (cl == 0) cl = bpb.root_clus; // FAT32 convention: ".." pointing at root is stored as cluster 0
+    *parent_out = cl;
+    return true;
+}
+
+// Pops the last "/name" component off an absolute path string in place:
+// "/a/b/c" -> "/a/b", "/a" -> "/". Root ("/") has nothing to pop.
+static void path_pop_component(char* path) {
+    size_t len = strlen(path);
+    if (len <= 1) return; // already root
+    char* slash = strrchr(path, '/');
+    if (!slash) return;
+    if (slash == path) path[1] = '\0'; // pop back to root
+    else *slash = '\0';
+}
+
+// Appends "/name" onto an absolute path string in place, handling the
+// at-root case ("/" + "sub" -> "/sub", not "//sub").
+static void path_push_component(char* path, size_t path_bufsize, const char* name) {
+    size_t len = strlen(path);
+    bool at_root = (len == 1 && path[0] == '/');
+    if (!at_root && len + 1 < path_bufsize) {
+        path[len] = '/';
+        path[len + 1] = '\0';
+    }
+    strncat(path, name, path_bufsize - strlen(path) - 1);
+}
+
+// Resolves a "/"-separated path (absolute if it starts with '/',
+// otherwise relative to base_cluster/base_path) one component at a time:
+// "." stays put, ".." goes to the parent via fat32_get_parent_cluster(),
+// anything else is looked up via fat32_find_entry_in() and must be a
+// directory. On success, *out_cluster and out_path (an absolute path,
+// buffer of at least out_path_size bytes) are updated; on failure
+// (any component not found, or not a directory), returns false and
+// leaves both outputs untouched.
+//
+// Shared by: the shell's `cd` (relative to current_directory_cluster),
+// the File Explorer (always resolves an absolute path built from its own
+// per-window current_path), and the in-kernel TCC compiler's #include
+// resolution (fat32_read_file_as_string_path(), below).
+bool fat32_resolve_path(const char* path, uint32_t base_cluster, const char* base_path,
+                         uint32_t* out_cluster, char* out_path, size_t out_path_size) {
+    if (!ahci_base || !bpb.root_clus) return false;
+    if (!path || !*path) {
+        *out_cluster = base_cluster;
+        strncpy(out_path, base_path, out_path_size - 1);
+        out_path[out_path_size - 1] = '\0';
+        return true;
+    }
+
+    uint32_t cluster;
+    char work_path[256];
+    const char* p = path;
+    if (*p == '/') {
+        cluster = bpb.root_clus;
+        strncpy(work_path, "/", sizeof(work_path));
+        while (*p == '/') p++;
+    } else {
+        cluster = base_cluster;
+        strncpy(work_path, base_path, sizeof(work_path) - 1);
+        work_path[sizeof(work_path) - 1] = '\0';
+    }
+
+    char path_copy[256];
+    strncpy(path_copy, p, sizeof(path_copy) - 1);
+    path_copy[sizeof(path_copy) - 1] = '\0';
+
+    // Hand-rolled tokenizer (no strtok in this freestanding libc): walk
+    // path_copy in place, splitting on '/' and skipping empty components
+    // (so "a//b" and "a/b/" behave like a normal shell would).
+    char* comp = path_copy;
+    while (*comp) {
+        while (*comp == '/') comp++;
+        if (!*comp) break;
+        char* end = comp;
+        while (*end && *end != '/') end++;
+        bool at_end = (*end == '\0');
+        *end = '\0';
+
+        if (strcmp(comp, ".") == 0) {
+            // stay
+        } else if (strcmp(comp, "..") == 0) {
+            uint32_t parent;
+            if (!fat32_get_parent_cluster(cluster, &parent)) return false;
+            cluster = parent;
+            path_pop_component(work_path);
+        } else {
+            fat_dir_entry_t entry;
+            if (fat32_find_entry_in(cluster, comp, &entry) != 0) return false;
+            if (!(entry.attr & FAT_ATTR_DIRECTORY)) return false;
+            uint32_t next = ((uint32_t)entry.fst_clus_hi << 16) | entry.fst_clus_lo;
+            if (next == 0) next = bpb.root_clus;
+            cluster = next;
+            path_push_component(work_path, sizeof(work_path), comp);
+        }
+
+        if (at_end) break;
+        comp = end + 1;
+    }
+
+    *out_cluster = cluster;
+    strncpy(out_path, work_path, out_path_size - 1);
+    out_path[out_path_size - 1] = '\0';
+    return true;
+}
+
+// Creates a subdirectory named `name` inside current_directory_cluster.
+// Lays out the new cluster with "." (self) and ".." (parent) entries
+// first, exactly like a real FAT32 driver, so fat32_get_parent_cluster()
+// / 'cd ..' work on it afterward. Reuses fat32_write_file()'s existing
+// free-slot-scan-and-grow logic to insert the directory entry itself
+// (as a zero-length "file") rather than duplicating that code, then
+// patches the freshly-written entry's attribute/cluster in place.
+int fat32_mkdir(const char* name) {
+    if (!ahci_base || !current_directory_cluster || !name || !*name) return -1;
+
+    fat_dir_entry_t existing;
+    if (fat32_find_entry_in(current_directory_cluster, name, &existing) == 0) return -1; // name in use
+
+    uint32_t new_cluster = allocate_cluster();
+    if (new_cluster == 0) return -1;
+
+    uint32_t cluster_bytes = bpb.sec_per_clus * SECTOR_SIZE;
+    uint8_t* buf = new uint8_t[cluster_bytes];
+    memset(buf, 0, cluster_bytes);
+
+    fat_dir_entry_t* dot = (fat_dir_entry_t*)buf;
+    memset(dot->name, ' ', 11);
+    dot->name[0] = '.';
+    dot->attr = FAT_ATTR_DIRECTORY;
+    dot->fst_clus_lo = new_cluster & 0xFFFF;
+    dot->fst_clus_hi = (new_cluster >> 16) & 0xFFFF;
+
+    fat_dir_entry_t* dotdot = (fat_dir_entry_t*)(buf + sizeof(fat_dir_entry_t));
+    memset(dotdot->name, ' ', 11);
+    dotdot->name[0] = '.'; dotdot->name[1] = '.';
+    dotdot->attr = FAT_ATTR_DIRECTORY;
+    // FAT32 convention: ".." in a directory whose parent IS the root
+    // stores cluster 0, not the root cluster number.
+    uint32_t parent_stored = (current_directory_cluster == bpb.root_clus) ? 0 : current_directory_cluster;
+    dotdot->fst_clus_lo = parent_stored & 0xFFFF;
+    dotdot->fst_clus_hi = (parent_stored >> 16) & 0xFFFF;
+
+    write_fat_entry(new_cluster, FAT_END_OF_CHAIN);
+    bool wrote_ok = (read_write_sectors(g_ahci_port, cluster_to_lba(new_cluster), bpb.sec_per_clus, true, buf) == 0);
+    delete[] buf;
+    if (!wrote_ok) { free_cluster_chain(new_cluster); return -1; }
+
+    if (fat32_write_file(name, nullptr, 0) != 0) {
+        free_cluster_chain(new_cluster);
+        return -1;
+    }
+
+    fat_dir_entry_t written;
+    uint32_t sector, offset;
+    if (fat32_find_entry(name, &written, &sector, &offset) != 0) {
+        free_cluster_chain(new_cluster);
+        return -1;
+    }
+    uint8_t* sec_buf = new uint8_t[SECTOR_SIZE];
+    if (read_write_sectors(g_ahci_port, sector, 1, false, sec_buf) == 0) {
+        fat_dir_entry_t* e = (fat_dir_entry_t*)(sec_buf + offset);
+        e->attr = FAT_ATTR_DIRECTORY;
+        e->file_size = 0;
+        e->fst_clus_lo = new_cluster & 0xFFFF;
+        e->fst_clus_hi = (new_cluster >> 16) & 0xFFFF;
+        read_write_sectors(g_ahci_port, sector, 1, true, sec_buf);
+    }
+    delete[] sec_buf;
+    return 0;
+}
+
+// Path-aware counterpart to fat32_read_file_as_string(): that function
+// (and fat32_find_entry(), which it's built on) only ever searches
+// current_directory_cluster and treats any '/' in its argument as
+// (garbage) part of a flat 8.3 name. This splits off a leading
+// directory path -- if any -- resolves it via fat32_resolve_path(), and
+// only then does the plain current-directory lookup for the final
+// component. Used by the in-kernel TCC compiler so both `cc <path>` and
+// `#include "sub/dir/foo.h"` can reach a header that lives in a
+// subdirectory rather than only ever the flat root.
+char* fat32_read_file_as_string_path(const char* path) {
+    if (!path || !*path) return nullptr;
+
+    const char* last_slash = strrchr(path, '/');
+    if (!last_slash) return fat32_read_file_as_string(path); // no directory component -- unchanged behaviour
+
+    const char* file_part = last_slash + 1;
+    if (!*file_part) return nullptr; // path ended in '/' -- not a file
+
+    size_t dir_len = (size_t)(last_slash - path);
+    char dir_part[256];
+    if (dir_len == 0) {
+        strncpy(dir_part, "/", sizeof(dir_part));
+    } else {
+        if (dir_len >= sizeof(dir_part)) dir_len = sizeof(dir_part) - 1;
+        memcpy(dir_part, path, dir_len);
+        dir_part[dir_len] = '\0';
+    }
+
+    uint32_t dir_cluster;
+    char resolved_path[256];
+    if (!fat32_resolve_path(dir_part, current_directory_cluster, current_directory_path,
+                             &dir_cluster, resolved_path, sizeof(resolved_path))) {
+        return nullptr;
+    }
+
+    // Borrow the global "current directory" for one lookup rather than
+    // duplicating fat32_read_file_as_string()'s cluster-chain-walking
+    // read logic here. Single-threaded kernel, no reentrancy concern.
+    uint32_t saved_cluster = current_directory_cluster;
+    current_directory_cluster = dir_cluster;
+    char* result = fat32_read_file_as_string(file_part);
+    current_directory_cluster = saved_cluster;
+    return result;
+}
+
 // Guest-disk-wrapper helper (see bochs_glue.cpp's bochs_guest_disk_cmd):
 // get a file's size without reading its contents. Used both for the
 // guest's STAT command and internally by READ, so a too-small buffer
@@ -1179,8 +1490,20 @@ int fat32_stat_file(const char* filename, uint32_t* size_out) {
 }
 
 int fat32_list_directory(const char* path, fat_dir_entry_t* buffer, int max_entries) {
-    // This implementation ignores 'path' and lists the current directory for simplicity.
-    if (!ahci_base || !current_directory_cluster || !buffer) {
+    if (!ahci_base || !bpb.root_clus || !buffer) {
+        return 0;
+    }
+
+    // 'path' is always treated as absolute (from root) here -- the File
+    // Explorer's current_path always starts "/" and is kept absolute by
+    // navigate_up()/navigate_into() -- so it resolves independently of
+    // whatever directory the shell's `cd` currently happens to be in.
+    // This used to ignore 'path' entirely and always list
+    // current_directory_cluster, which is why every FileExplorerWindow
+    // (even ones opened on a subfolder) silently showed the root.
+    uint32_t list_cluster;
+    char resolved[256];
+    if (!fat32_resolve_path(path, bpb.root_clus, "/", &list_cluster, resolved, sizeof(resolved))) {
         return 0;
     }
 
@@ -1192,7 +1515,7 @@ int fat32_list_directory(const char* path, fat_dir_entry_t* buffer, int max_entr
     // why: entries past the first cluster used to be invisible here too,
     // which is why file explorer / desktop icon lists silently dropped
     // files copied in from another OS).
-    uint32_t cluster = current_directory_cluster;
+    uint32_t cluster = list_cluster;
     bool end_of_dir = false;
     while (!end_of_dir && count < max_entries && cluster >= 2 && cluster < FAT_END_OF_CHAIN) {
         if (read_write_sectors(g_ahci_port, cluster_to_lba(cluster), bpb.sec_per_clus, false, dir_sector_buf) != 0) {
@@ -1604,6 +1927,11 @@ private:
     int num_files;
     int scroll_offset;
     int selected_index;
+    // True whenever current_path isn't root -- draws a synthetic ".."
+    // row at the top of the list (row 0) that navigates up on click.
+    // It's not a real directory entry (fat32_list_directory() hides
+    // "." / ".." the same way ls does), so it's tracked here instead.
+    bool has_parent_row;
 
     // --- List / scrollbar geometry constants ---
     // ROW_H must be >= the small icon size (14px) plus a little padding so
@@ -1624,8 +1952,12 @@ private:
         return n < 1 ? 1 : n;
     }
 
+    // Real file/directory entries plus the synthetic ".." row (if any) --
+    // everything that actually occupies a row in the list.
+    int total_rows() const { return num_files + (has_parent_row ? 1 : 0); }
+
     int max_scroll_offset() const {
-        int m = num_files - max_visible_items();
+        int m = total_rows() - max_visible_items();
         return m < 0 ? 0 : m;
     }
 
@@ -1662,19 +1994,66 @@ private:
         return is_elf;
     }
 
+    // Moves current_path up one level (via fat32_resolve_path's ".."
+    // handling, which reads the real on-disk ".." entry) and re-lists.
+    // No-op at root, since path_pop_component()/fat32_get_parent_cluster()
+    // both treat root as its own parent.
+    void navigate_up() {
+        char new_path[256];
+        strncpy(new_path, current_path, sizeof(new_path) - 1);
+        new_path[sizeof(new_path) - 1] = '\0';
+        path_pop_component(new_path);
+
+        uint32_t new_cluster;
+        char resolved[256];
+        if (!fat32_resolve_path(new_path, bpb.root_clus, "/", &new_cluster, resolved, sizeof(resolved))) return;
+        strncpy(current_path, resolved, 255);
+        current_path[255] = '\0';
+        selected_index = -1;
+        scroll_offset = 0;
+        refresh_contents();
+    }
+
+    // Descends into a named subdirectory of current_path and re-lists.
+    // Silently does nothing if `name` isn't actually a directory there
+    // (shouldn't happen -- this is only ever called with a name we just
+    // listed as ATTR_DIRECTORY -- but resolving fresh from disk rather
+    // than trusting the cached file_list entry keeps this in sync with
+    // whatever's actually on disk right now).
+    void navigate_into(const char* name) {
+        char new_path[256];
+        strncpy(new_path, current_path, sizeof(new_path) - 1);
+        new_path[sizeof(new_path) - 1] = '\0';
+        path_push_component(new_path, sizeof(new_path), name);
+
+        uint32_t new_cluster;
+        char resolved[256];
+        if (!fat32_resolve_path(new_path, bpb.root_clus, "/", &new_cluster, resolved, sizeof(resolved))) return;
+        strncpy(current_path, resolved, 255);
+        current_path[255] = '\0';
+        selected_index = -1;
+        scroll_offset = 0;
+        refresh_contents();
+    }
+
     // Double-click / right-click "Run" behavior: inspect the actual file
     // contents (not just its extension) and either launch it through the
     // Bochs CPU emulator (ELF binaries) or open it in the text editor
-    // (anything else). "bochs <file>" is used rather than "run <file>" —
-    // "run" is not a recognized shell command in handle_command(), so
-    // building a "run %s" command string (as this code used to) silently
-    // failed; "bochs" is the actual working ELF-execution entry point.
+    // (anything else). Directories descend into themselves instead.
+    // "bochs <file>" is used rather than "run <file>" — "run" is not a
+    // recognized shell command in handle_command(), so building a
+    // "run %s" command string (as this code used to) silently failed;
+    // "bochs" is the actual working ELF-execution entry point.
     void open_or_run(int idx) {
         if (idx < 0 || idx >= num_files) return;
-        if (file_list[idx].attr & FAT_ATTR_DIRECTORY) return; // directory navigation not implemented yet
 
         char filename[13];
         fat32_get_fne_from_entry(&file_list[idx], filename);
+
+        if (file_list[idx].attr & FAT_ATTR_DIRECTORY) {
+            navigate_into(filename);
+            return;
+        }
 
         char command_buffer[128];
         if (is_elf_file(idx)) {
@@ -1704,7 +2083,8 @@ private:
             // Track click: page up/down relative to the thumb position
             int visible = max_visible_items();
             int max_off = max_scroll_offset();
-            int thumb_h = max_off > 0 ? (track_h * visible) / num_files : track_h;
+            int rows = total_rows() > 0 ? total_rows() : 1;
+            int thumb_h = max_off > 0 ? (track_h * visible) / rows : track_h;
             if (thumb_h < 8) thumb_h = 8;
             if (thumb_h > track_h) thumb_h = track_h;
             int thumb_y = track_top;
@@ -1750,7 +2130,7 @@ private:
         if (track_h > 0) {
             int visible = max_visible_items();
             int max_off = max_scroll_offset();
-            int thumb_h = max_off > 0 ? (track_h * visible) / (num_files > 0 ? num_files : 1) : track_h;
+            int thumb_h = max_off > 0 ? (track_h * visible) / (total_rows() > 0 ? total_rows() : 1) : track_h;
             if (thumb_h < 8) thumb_h = 8;
             if (thumb_h > track_h) thumb_h = track_h;
             int thumb_y = track_top;
@@ -1764,7 +2144,7 @@ private:
 
 public:
     FileExplorerWindow(int x, int y, const char* path) 
-        : Window(x, y, 400, 300, "File Explorer"), num_files(0), scroll_offset(0), selected_index(-1) {
+        : Window(x, y, 400, 300, "File Explorer"), num_files(0), scroll_offset(0), selected_index(-1), has_parent_row(false) {
         strncpy(current_path, path, 255);
         current_path[255] = '\0';
         refresh_contents();
@@ -1772,6 +2152,7 @@ public:
 
     void refresh_contents() override {
         num_files = fat32_list_directory(current_path, file_list, 128);
+        has_parent_row = (strcmp(current_path, "/") != 0);
         if (selected_index >= num_files) selected_index = -1;
         clamp_scroll();
     }
@@ -1808,10 +2189,20 @@ public:
         int la_w = list_area_w();
 
         for (int i = 0; i < visible; ++i) {
-            int file_idx = scroll_offset + i;
-            if (file_idx >= num_files) break;
+            int row_idx = scroll_offset + i;
+            if (row_idx >= total_rows()) break;
 
             int item_y = la_y + LIST_TOP_PAD + i * ROW_H;
+
+            if (has_parent_row && row_idx == 0) {
+                // Synthetic "up one level" row -- not a real directory
+                // entry, so it's never selectable/highlighted like one.
+                draw_icon_folder_small(la_x + 4, item_y + 2);
+                draw_string("..", la_x + 24, item_y + 5, TEXT_BLACK);
+                continue;
+            }
+
+            int file_idx = row_idx - (has_parent_row ? 1 : 0);
             char filename[13];
             fat32_get_fne_from_entry(&file_list[file_idx], filename);
 
@@ -1846,19 +2237,20 @@ public:
 
         int content_y = my - (list_area_y() + LIST_TOP_PAD);
         if (content_y < 0) return;
-        int clicked_idx = scroll_offset + (content_y / ROW_H);
+        int row_idx = scroll_offset + (content_y / ROW_H);
+        if (row_idx >= total_rows()) return;
+        if (has_parent_row && row_idx == 0) return; // ".." has no context menu
 
-        if (clicked_idx < num_files) {
-            selected_index = clicked_idx;
-            char filename[13];
-            fat32_get_fne_from_entry(&file_list[clicked_idx], filename);
+        int clicked_idx = row_idx - (has_parent_row ? 1 : 0);
+        selected_index = clicked_idx;
+        char filename[13];
+        fat32_get_fne_from_entry(&file_list[clicked_idx], filename);
 
-            // Tell the window manager to show the context menu for this
-            // file. "Run" is offered whenever the file's contents are
-            // actually an ELF binary, not just when its name ends in
-            // .obj/.OBJ.
-            wm.show_file_context_menu(mx, my, filename, is_elf_file(clicked_idx));
-        }
+        // Tell the window manager to show the context menu for this
+        // file. "Run" is offered whenever the file's contents are
+        // actually an ELF binary, not just when its name ends in
+        // .obj/.OBJ.
+        wm.show_file_context_menu(mx, my, filename, is_elf_file(clicked_idx));
     }
 
     void on_mouse_click(int mx, int my) override {
@@ -1868,21 +2260,29 @@ public:
 
         int content_y = my - (list_area_y() + LIST_TOP_PAD);
         if (content_y < 0) return;
-        int clicked_idx = scroll_offset + (content_y / ROW_H);
-        
-        if(clicked_idx < num_files) {
-            selected_index = clicked_idx;
-            // Basic double-click simulation
-            static int last_click_idx = -1;
-            static uint32_t last_click_tick = 0;
-            if(clicked_idx == last_click_idx && (g_timer_ticks - last_click_tick) < 20) {
-                // Double click! Open in the editor, or run it in the
-                // emulator, depending on whether it's actually an ELF.
-                open_or_run(clicked_idx);
-            }
-            last_click_idx = clicked_idx;
-            last_click_tick = g_timer_ticks;
+        int row_idx = scroll_offset + (content_y / ROW_H);
+        if (row_idx >= total_rows()) return;
+
+        if (has_parent_row && row_idx == 0) {
+            // ".." navigates immediately on a single click -- it isn't a
+            // real file to select/double-click, so there's no reason to
+            // make it wait for a second click the way real entries do.
+            navigate_up();
+            return;
         }
+
+        int clicked_idx = row_idx - (has_parent_row ? 1 : 0);
+        selected_index = clicked_idx;
+        // Basic double-click simulation
+        static int last_click_idx = -1;
+        static uint32_t last_click_tick = 0;
+        if (clicked_idx == last_click_idx && (g_timer_ticks - last_click_tick) < 20) {
+            // Double click! Open in the editor, run it in the emulator,
+            // or descend into it, depending on what it actually is.
+            open_or_run(clicked_idx);
+        }
+        last_click_idx = clicked_idx;
+        last_click_tick = g_timer_ticks;
     }
 
     void update() override {}

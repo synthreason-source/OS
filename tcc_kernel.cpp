@@ -464,7 +464,10 @@ void __stack_chk_fail(void) {
 
 // ── RAM-backed fd/FILE shim ───────────────────────────────────────────────────
 #define FAKE_FD_BASE  500
-#define FAKE_FD_MAX   16   // TCC opens several internal fds during compilation
+#define FAKE_FD_MAX   32   // TCC opens several internal fds during compilation
+                           // -- bumped from 16 to give headroom for source
+                           // files that #include several headers (each one
+                           // briefly holds its own fake fd during preprocessing)
 
 // Hard ceiling on any single fake-fd output buffer. A 32-bit i386 ELF
 // produced by a single `cc` invocation has no legitimate reason to exceed
@@ -488,7 +491,19 @@ static KFd g_kfds[FAKE_FD_MAX];
 static int kfd_alloc() {
     for (int i=0;i<FAKE_FD_MAX;i++)
         if (!g_kfds[i].active) {
-            KFd* f = &g_kfds[i]; *f = {};
+            KFd* f = &g_kfds[i];
+            // FIX (multi-include leak): close() intentionally leaves a
+            // just-closed read fd's buffer alive (comment above it: "keep
+            // buf alive for harvest (write) or explicit free (read)"),
+            // relying on kfd_reset_all() at the top of the NEXT `cc` to
+            // free it. But kfd_alloc() reuses that same (now inactive)
+            // slot for the very next open() within THIS compile -- e.g.
+            // the second #include in a source file that has more than
+            // one -- and used to overwrite f->buf with `*f = {}` without
+            // ever freeing what it pointed to. One header leaked per
+            // additional #include, silently, for the whole compile.
+            if (f->buf) { free(f->buf); }
+            *f = {};
             f->active=true; return FAKE_FD_BASE+i;
         }
     return -1;
