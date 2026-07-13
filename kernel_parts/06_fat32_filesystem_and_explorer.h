@@ -956,8 +956,14 @@ void fat32_list_files() {
                 }
                 line[30] = '\0'; // Terminate after the padded name
 
-                // Use a simple snprintf for just the size
-                snprintf(line + 30, 90, " %d\n", entry->file_size);
+                // Directories show "<DIR>" instead of a size -- their
+                // file_size field is always 0, which used to make every
+                // folder look exactly like an empty file in the listing.
+                if (entry->attr & FAT_ATTR_DIRECTORY) {
+                    snprintf(line + 30, 90, " <DIR>\n");
+                } else {
+                    snprintf(line + 30, 90, " %d\n", entry->file_size);
+                }
 
                 wm.print_to_focused(line);
                 lfn_buf[0] = '\0'; // Reset for next entry
@@ -1623,6 +1629,191 @@ int fat32_rename_file(const char* old_name, const char* new_name) {
     delete[] dir_buf;
     return 0; // Success
 }
+
+// =============================================================================
+// DIRECTORY-AWARE cp / mv
+// =============================================================================
+// fat32_copy_file()/fat32_rename_file() above (and the old `cp`/`mv` shell
+// handlers) only ever read/wrote current_directory_cluster -- there was no
+// way to copy or move a file into, out of, or between subdirectories. The
+// functions below add that, and also implement the standard cp/mv
+// convention that copying/moving onto an *existing directory* name places
+// the file inside it under its own name, e.g. `cp disk_tcc test` ->
+// test/disk_tcc, rather than trying to create/overwrite a file literally
+// named "test".
+
+// POSIX dirname()+basename() in one pass, writing into caller buffers
+// instead of returning pointers into a mutable copy. No trailing slash
+// -> dir_out is empty (caller's cue to mean "current directory").
+static void path_split_last(const char* path, char* dir_out, size_t dir_out_size,
+                             char* name_out, size_t name_out_size) {
+    const char* last_slash = strrchr(path, '/');
+    if (!last_slash) {
+        dir_out[0] = '\0';
+        strncpy(name_out, path, name_out_size - 1);
+        name_out[name_out_size - 1] = '\0';
+        return;
+    }
+    size_t dir_len = (size_t)(last_slash - path);
+    if (dir_len == 0) {
+        strncpy(dir_out, "/", dir_out_size);
+    } else {
+        if (dir_len >= dir_out_size) dir_len = dir_out_size - 1;
+        memcpy(dir_out, path, dir_len);
+        dir_out[dir_len] = '\0';
+    }
+    strncpy(name_out, last_slash + 1, name_out_size - 1);
+    name_out[name_out_size - 1] = '\0';
+}
+
+// Resolves a cp/mv source argument to (directory cluster, final name).
+static bool fat32_resolve_src(const char* src_path, uint32_t* dir_cluster_out,
+                               char* name_out, size_t name_out_size) {
+    char dir_part[256], name_part[128];
+    path_split_last(src_path, dir_part, sizeof(dir_part), name_part, sizeof(name_part));
+    if (name_part[0] == '\0') return false; // path ended in '/' -- not a file
+
+    if (dir_part[0] == '\0') {
+        *dir_cluster_out = current_directory_cluster;
+    } else {
+        char resolved[256];
+        if (!fat32_resolve_path(dir_part, current_directory_cluster, current_directory_path,
+                                 dir_cluster_out, resolved, sizeof(resolved))) {
+            return false;
+        }
+    }
+    strncpy(name_out, name_part, name_out_size - 1);
+    name_out[name_out_size - 1] = '\0';
+    return true;
+}
+
+// Resolves a cp/mv destination argument to (directory cluster, final
+// name), applying the "lands inside an existing directory under its own
+// name" convention:
+//   cp foo.txt existing_dir        -> existing_dir/foo.txt
+//   cp foo.txt existing_dir/       -> existing_dir/foo.txt
+//   cp foo.txt existing_dir/bar.c  -> existing_dir/bar.c
+//   cp foo.txt bar.c               -> ./bar.c  (original plain behavior)
+// `fallback_name` is the source's own filename, used whenever dest turns
+// out to name a directory rather than a new filename.
+static bool fat32_resolve_dest(const char* dest_path, const char* fallback_name,
+                                uint32_t* dir_cluster_out, char* name_out, size_t name_out_size) {
+    char dir_part[256], name_part[128];
+    path_split_last(dest_path, dir_part, sizeof(dir_part), name_part, sizeof(name_part));
+
+    uint32_t dir_cluster;
+    if (dir_part[0] == '\0') {
+        dir_cluster = current_directory_cluster;
+    } else {
+        char resolved[256];
+        if (!fat32_resolve_path(dir_part, current_directory_cluster, current_directory_path,
+                                 &dir_cluster, resolved, sizeof(resolved))) {
+            return false;
+        }
+    }
+
+    if (name_part[0] == '\0') {
+        // Trailing slash ("existing_dir/") -- keep the source's name.
+        *dir_cluster_out = dir_cluster;
+        strncpy(name_out, fallback_name, name_out_size - 1);
+        name_out[name_out_size - 1] = '\0';
+        return true;
+    }
+
+    // Does name_part itself name an existing directory inside
+    // dir_cluster? If so, descend into it and keep the source's name --
+    // this is what makes `cp disk_tcc test` land at test/disk_tcc
+    // instead of creating/overwriting a file literally called "test".
+    fat_dir_entry_t maybe_dir;
+    if (fat32_find_entry_in(dir_cluster, name_part, &maybe_dir) == 0 &&
+        (maybe_dir.attr & FAT_ATTR_DIRECTORY)) {
+        uint32_t sub = ((uint32_t)maybe_dir.fst_clus_hi << 16) | maybe_dir.fst_clus_lo;
+        if (sub == 0) sub = bpb.root_clus;
+        *dir_cluster_out = sub;
+        strncpy(name_out, fallback_name, name_out_size - 1);
+        name_out[name_out_size - 1] = '\0';
+        return true;
+    }
+
+    *dir_cluster_out = dir_cluster;
+    strncpy(name_out, name_part, name_out_size - 1);
+    name_out[name_out_size - 1] = '\0';
+    return true;
+}
+
+// Directory-aware file copy: resolves directory components on both sides
+// (see fat32_resolve_src()/fat32_resolve_dest() above) instead of only
+// ever touching current_directory_cluster. Whole directories can't be
+// copied this way, only regular files.
+int fat32_copy_file_path(const char* src_path, const char* dest_path) {
+    if (!ahci_base || !bpb.root_clus) return -1;
+
+    char src_name[128];
+    uint32_t src_dir_cluster;
+    if (!fat32_resolve_src(src_path, &src_dir_cluster, src_name, sizeof(src_name))) return -1;
+
+    uint32_t saved_cluster = current_directory_cluster;
+    current_directory_cluster = src_dir_cluster;
+    fat_dir_entry_t entry;
+    uint32_t sector, offset;
+    int found = fat32_find_entry(src_name, &entry, &sector, &offset);
+    current_directory_cluster = saved_cluster;
+    if (found != 0) return -1;
+    if (entry.attr & FAT_ATTR_DIRECTORY) return -1; // copying whole directories isn't supported
+
+    char* content = nullptr;
+    bool ok = true;
+    if (entry.file_size > 0) {
+        content = new char[entry.file_size];
+        ok = read_data_from_clusters((entry.fst_clus_hi << 16) | entry.fst_clus_lo, content, entry.file_size);
+    }
+    if (!ok) { delete[] content; return -1; }
+
+    char dest_name[128];
+    uint32_t dest_dir_cluster;
+    if (!fat32_resolve_dest(dest_path, src_name, &dest_dir_cluster, dest_name, sizeof(dest_name))) {
+        delete[] content;
+        return -1;
+    }
+
+    saved_cluster = current_directory_cluster;
+    current_directory_cluster = dest_dir_cluster;
+    int wrote = fat32_write_file(dest_name, content, entry.file_size);
+    current_directory_cluster = saved_cluster;
+
+    delete[] content;
+    return wrote;
+}
+
+// Directory-aware move: a fast in-place rename (identical to the
+// original fat32_rename_file() behavior) whenever both sides are plain,
+// same-directory names and the destination doesn't itself already name a
+// directory to move INTO; otherwise falls back to copy-then-delete-the-
+// original, which naturally supports crossing directories in either
+// direction.
+int fat32_move_file_path(const char* src_path, const char* dest_path) {
+    if (!strchr(src_path, '/') && !strchr(dest_path, '/')) {
+        fat_dir_entry_t maybe_dir;
+        bool dest_is_dir = (fat32_find_entry_in(current_directory_cluster, dest_path, &maybe_dir) == 0)
+                            && (maybe_dir.attr & FAT_ATTR_DIRECTORY);
+        if (!dest_is_dir) {
+            return fat32_rename_file(src_path, dest_path);
+        }
+    }
+
+    if (fat32_copy_file_path(src_path, dest_path) != 0) return -1;
+
+    char src_name[128];
+    uint32_t src_dir_cluster;
+    if (!fat32_resolve_src(src_path, &src_dir_cluster, src_name, sizeof(src_name))) return -1;
+
+    uint32_t saved_cluster = current_directory_cluster;
+    current_directory_cluster = src_dir_cluster;
+    int removed = fat32_remove_file(src_name);
+    current_directory_cluster = saved_cluster;
+    return removed;
+}
+
 void fat32_format() {
     if(!ahci_base) {
         wm.print_to_focused("AHCI disk not found. Cannot format.\n");

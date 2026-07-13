@@ -1288,27 +1288,13 @@ void handle_command() {
         char args_for_dest[120];
         strncpy(args_for_dest, args, 119);
         char* dest = get_arg(args_for_dest, 1);
-        
-        if(!src || !dest) { 
-            console_print("Usage: cp \"<source>\" \"<dest>\"\n"); 
+
+        if (!src || !dest) {
+            console_print("Usage: cp \"<source>\" \"<dest>\"\n");
+        } else if (fat32_copy_file_path(src, dest) == 0) {
+            console_print("Copied.\n");
         } else {
-            fat_dir_entry_t entry;
-            uint32_t sector, offset;
-            if (fat32_find_entry(src, &entry, &sector, &offset) == 0) {
-                char* content = new char[entry.file_size];
-                if (content && read_data_from_clusters((entry.fst_clus_hi << 16) | entry.fst_clus_lo, content, entry.file_size)) {
-                    if(fat32_write_file(dest, content, entry.file_size) == 0) {
-                        console_print("Copied.\n");
-                    } else {
-                        console_print("Write failed.\n");
-                    }
-                } else {
-                    console_print("Read failed.\n");
-                }
-                if (content) delete[] content;
-            } else {
-                console_print("Source not found.\n");
-            }
+            console_print("Copy failed. (source not found, or it's a directory)\n");
         }
     }
     else if (strcmp(command, "mv") == 0) {
@@ -1323,7 +1309,7 @@ void handle_command() {
         if(!src || !dest) { 
             console_print("Usage: mv \"<source>\" \"<dest>\"\n"); 
         } else {
-            if(fat32_rename_file(src, dest) == 0) {
+            if(fat32_move_file_path(src, dest) == 0) {
                 console_print("Moved.\n");
             } else {
                 console_print("Failed. (Source not found or destination exists).\n");
