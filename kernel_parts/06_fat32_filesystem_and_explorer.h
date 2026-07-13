@@ -2117,12 +2117,28 @@ private:
     fat_dir_entry_t file_list[128];
     int num_files;
     int scroll_offset;
+    // Row index in "display row space" (0 = the ".." row if has_parent_row,
+    // otherwise row 0 is file_list[0]; see selected_file_index() below) --
+    // NOT a file_list[] index by itself. -1 = nothing selected. Row space
+    // is what lets a single field back both mouse selection and the
+    // keyboard cursor, and let the ".." row be selectable/highlighted
+    // like any other row.
     int selected_index;
     // True whenever current_path isn't root -- draws a synthetic ".."
     // row at the top of the list (row 0) that navigates up on click.
     // It's not a real directory entry (fat32_list_directory() hides
     // "." / ".." the same way ls does), so it's tracked here instead.
     bool has_parent_row;
+    // Double-click detection state. FIX: this used to be `static` local
+    // variables inside on_mouse_click() -- a function-local static is
+    // ONE variable shared by every FileExplorerWindow instance (and
+    // never reset), so clicking window A then window B could register
+    // as a double-click on window B, and clicking right after
+    // navigate_into()/navigate_up() reused stale state from the
+    // directory you just left. Making these real per-window members
+    // (and resetting them in refresh_contents()) fixes both.
+    int last_click_row;
+    uint32_t last_click_tick;
 
     // --- List / scrollbar geometry constants ---
     // ROW_H must be >= the small icon size (14px) plus a little padding so
@@ -2335,16 +2351,40 @@ private:
 
 public:
     FileExplorerWindow(int x, int y, const char* path) 
-        : Window(x, y, 400, 300, "File Explorer"), num_files(0), scroll_offset(0), selected_index(-1), has_parent_row(false) {
+        : Window(x, y, 400, 300, "File Explorer"), num_files(0), scroll_offset(0), selected_index(-1),
+          has_parent_row(false), last_click_row(-1), last_click_tick(0) {
         strncpy(current_path, path, 255);
         current_path[255] = '\0';
         refresh_contents();
     }
 
+    // Row-space index (see selected_index's declaration comment) for the
+    // currently selected/highlighted real file, or -1 if nothing valid
+    // is selected (including when the ".." row is what's selected).
+    int selected_file_index() const {
+        if (selected_index < 0) return -1;
+        int fi = selected_index - (has_parent_row ? 1 : 0);
+        return (fi >= 0 && fi < num_files) ? fi : -1;
+    }
+
+    // Scrolls just enough to bring row `row` into view.
+    void ensure_row_visible(int row) {
+        int visible = max_visible_items();
+        if (row < scroll_offset) scroll_offset = row;
+        else if (row >= scroll_offset + visible) scroll_offset = row - visible + 1;
+        clamp_scroll();
+    }
+
     void refresh_contents() override {
         num_files = fat32_list_directory(current_path, file_list, 128);
         has_parent_row = (strcmp(current_path, "/") != 0);
-        if (selected_index >= num_files) selected_index = -1;
+        if (selected_index >= num_files + (has_parent_row ? 1 : 0)) selected_index = -1;
+        // A directory change invalidates any in-flight double-click --
+        // otherwise a quick click on the new listing's first row could
+        // be paired with the click that navigated here and mistakenly
+        // fire a second "open" immediately.
+        last_click_row = -1;
+        last_click_tick = 0;
         clamp_scroll();
     }
 
@@ -2386,10 +2426,15 @@ public:
             int item_y = la_y + LIST_TOP_PAD + i * ROW_H;
 
             if (has_parent_row && row_idx == 0) {
-                // Synthetic "up one level" row -- not a real directory
-                // entry, so it's never selectable/highlighted like one.
+                // Synthetic "up one level" row -- selectable via keyboard
+                // like any other row (see on_key_press), so it highlights
+                // the same way real entries do.
+                if (row_idx == selected_index) {
+                    draw_rect_filled(la_x + 2, item_y, la_w - 4, ROW_H - 2, TITLEBAR_ACTIVE);
+                }
                 draw_icon_folder_small(la_x + 4, item_y + 2);
-                draw_string("..", la_x + 24, item_y + 5, TEXT_BLACK);
+                draw_string("..", la_x + 24, item_y + 5,
+                             (row_idx == selected_index) ? TEXT_WHITE : TEXT_BLACK);
                 continue;
             }
 
@@ -2397,7 +2442,8 @@ public:
             char filename[13];
             fat32_get_fne_from_entry(&file_list[file_idx], filename);
 
-            if (file_idx == selected_index) {
+            bool is_selected = (row_idx == selected_index);
+            if (is_selected) {
                 draw_rect_filled(la_x + 2, item_y, la_w - 4, ROW_H - 2, TITLEBAR_ACTIVE);
             }
 
@@ -2408,7 +2454,7 @@ public:
                 draw_icon_file_small(la_x + 4, item_y + 2, is_shortcut);
             }
 
-            uint32_t name_color = (file_idx == selected_index) ? TEXT_WHITE : TEXT_BLACK;
+            uint32_t name_color = is_selected ? TEXT_WHITE : TEXT_BLACK;
             draw_string(filename, la_x + 24, item_y + 5, name_color);
         }
 
@@ -2419,7 +2465,26 @@ public:
     }
 
     void on_key_press(char c) override {
-        // Handle keyboard navigation later
+        int rows = total_rows();
+        if (rows == 0) return;
+
+        if (c == KEY_UP) {
+            selected_index = (selected_index < 0) ? rows - 1
+                            : (selected_index > 0 ? selected_index - 1 : 0);
+            ensure_row_visible(selected_index);
+        } else if (c == KEY_DOWN) {
+            selected_index = (selected_index < 0) ? 0
+                            : (selected_index < rows - 1 ? selected_index + 1 : rows - 1);
+            ensure_row_visible(selected_index);
+        } else if (c == '\n') {
+            if (selected_index < 0) return;
+            if (has_parent_row && selected_index == 0) {
+                navigate_up();
+                return;
+            }
+            int file_idx = selected_file_index();
+            if (file_idx >= 0) open_or_run(file_idx);
+        }
     }
 
     void on_mouse_right_click(int mx, int my) override {
@@ -2433,7 +2498,7 @@ public:
         if (has_parent_row && row_idx == 0) return; // ".." has no context menu
 
         int clicked_idx = row_idx - (has_parent_row ? 1 : 0);
-        selected_index = clicked_idx;
+        selected_index = row_idx;
         char filename[13];
         fat32_get_fne_from_entry(&file_list[clicked_idx], filename);
 
@@ -2458,21 +2523,27 @@ public:
             // ".." navigates immediately on a single click -- it isn't a
             // real file to select/double-click, so there's no reason to
             // make it wait for a second click the way real entries do.
+            selected_index = row_idx;
             navigate_up();
             return;
         }
 
+        selected_index = row_idx;
         int clicked_idx = row_idx - (has_parent_row ? 1 : 0);
-        selected_index = clicked_idx;
-        // Basic double-click simulation
-        static int last_click_idx = -1;
-        static uint32_t last_click_tick = 0;
-        if (clicked_idx == last_click_idx && (g_timer_ticks - last_click_tick) < 20) {
+        // Double-click simulation. FIX: last_click_row/last_click_tick
+        // used to be `static` LOCAL variables here, which made them one
+        // variable shared by every FileExplorerWindow instance and never
+        // reset across navigation -- see the member declaration comment
+        // for the full explanation. They're real per-window state now,
+        // in row space (row_idx) rather than file-list space, so a click
+        // on ".." can never accidentally be compared against a real
+        // file's index either.
+        if (row_idx == last_click_row && (g_timer_ticks - last_click_tick) < 20) {
             // Double click! Open in the editor, run it in the emulator,
             // or descend into it, depending on what it actually is.
             open_or_run(clicked_idx);
         }
-        last_click_idx = clicked_idx;
+        last_click_row = row_idx;
         last_click_tick = g_timer_ticks;
     }
 
