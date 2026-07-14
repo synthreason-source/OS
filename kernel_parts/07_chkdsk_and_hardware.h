@@ -406,6 +406,13 @@ void chkdsk(bool fix = false, bool verbose = false) {
             wm.print_to_focused(msg);
             snprintf(msg, 100, "       only %d KB free). Aborting safely.", free_kb);
             wm.print_to_focused(msg);
+            snprintf(msg, 100, "Cluster size: %d KB -- a volume this large with clusters this",
+                     (bpb.sec_per_clus * SECTOR_SIZE) / 1024);
+            wm.print_to_focused(msg);
+            wm.print_to_focused("small has far more clusters than chkdsk's memory budget allows.");
+            wm.print_to_focused("If this volume wasn't formatted with this OS's current 'formatfs'");
+            wm.print_to_focused("(which now scales cluster size to the real disk size), reformatting");
+            wm.print_to_focused("it will very likely bring the cluster count back into range.");
             return;
         }
     }

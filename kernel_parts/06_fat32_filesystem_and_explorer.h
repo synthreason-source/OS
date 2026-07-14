@@ -19,6 +19,7 @@
 #define PORT_CMD_FRE 0x00000010
 #define ATA_CMD_READ_DMA_EXT 0x25
 #define ATA_CMD_WRITE_DMA_EXT 0x35
+#define ATA_CMD_IDENTIFY_DEVICE 0xEC
 #define HBA_PORT_CMD_CR 0x00008000
 #define TFD_STS_BSY 0x80
 #define TFD_STS_DRQ 0x08
@@ -344,6 +345,78 @@ void cmd_list_and_select_disk(const char* arg) {
         }
     }
 
+    return 0;
+}
+
+// Issues ATA IDENTIFY DEVICE (0xEC) through the same AHCI command-slot
+// mechanics as read_write_sectors() (it's still a single-sector PIO-data-in
+// transfer as far as the HBA/PRDT are concerned), and pulls the drive's
+// real total sector count out of the returned 512-byte identify buffer:
+//   words 100-103: 48-bit LBA total sector count (used when the drive
+//                  reports 48-bit addressing support, word 83 bit 10)
+//   words 60-61:   28-bit LBA total sector count (fallback)
+// Returns 0 and leaves *out_total_sectors untouched on any failure, so
+// callers can fall back to a known-safe default instead of formatting
+// using garbage.
+int ahci_get_disk_total_sectors(int port_num, uint64_t* out_total_sectors) {
+    if (port_num < 0 || port_num >= 32 || !ahci_base) return -1;
+
+    HBA_PORT* port = (HBA_PORT*)(ahci_base + 0x100 + (port_num * 0x80));
+    port->is = 0xFFFFFFFF;
+
+    uint32_t slots = (port->sact | port->ci);
+    int slot = -1;
+    for (int i = 0; i < 32; i++) {
+        if ((slots & (1 << i)) == 0) { slot = i; break; }
+    }
+    if (slot == -1) return -1;
+
+    uint16_t* id_buf = new uint16_t[256]; // IDENTIFY DEVICE is always exactly 512 bytes
+
+    HBA_CMD_HEADER* cmd_header = &cmd_list[slot];
+    cmd_header->cfl    = sizeof(FIS_REG_H2D) / sizeof(uint32_t);
+    cmd_header->w      = 0; // device -> host
+    cmd_header->prdtl  = 1;
+
+    uintptr_t       cmd_table_addr = (uintptr_t)cmd_header->ctba;
+    FIS_REG_H2D*    cmd_fis        = (FIS_REG_H2D*)(cmd_table_addr);
+    HBA_PRDT_ENTRY* prdt           = (HBA_PRDT_ENTRY*)(cmd_table_addr + 128);
+
+    prdt->dba = (uint64_t)(uintptr_t)id_buf;
+    prdt->dbc = SECTOR_SIZE - 1;
+    prdt->i   = 0;
+
+    memset(cmd_fis, 0, sizeof(FIS_REG_H2D));
+    cmd_fis->fis_type = FIS_TYPE_REG_H2D;
+    cmd_fis->c        = 1;
+    cmd_fis->command  = ATA_CMD_IDENTIFY_DEVICE;
+    cmd_fis->device   = 0; // master, no LBA bits needed for IDENTIFY
+
+    while (port->tfd & (TFD_STS_BSY | TFD_STS_DRQ));
+    port->ci = (1 << slot);
+
+    const long IO_TIMEOUT = 200000000L;
+    long spin = 0;
+    bool timed_out = false;
+    while (true) {
+        if ((port->ci & (1 << slot)) == 0) break;
+        if (port->is & (1 << 30)) break;
+        if (++spin >= IO_TIMEOUT) { timed_out = true; break; }
+    }
+
+    bool failed = timed_out || (port->is & (1 << 30)) || (port->tfd & 0x01);
+    if (failed) { delete[] id_buf; return -1; }
+
+    uint64_t lba48 = ((uint64_t)id_buf[100])       | ((uint64_t)id_buf[101] << 16) |
+                      ((uint64_t)id_buf[102] << 32) | ((uint64_t)id_buf[103] << 48);
+    uint64_t lba28 = ((uint32_t)id_buf[60]) | ((uint32_t)id_buf[61] << 16);
+    bool supports_lba48 = (id_buf[83] & (1 << 10)) != 0;
+
+    uint64_t total = (supports_lba48 && lba48 > 0) ? lba48 : lba28;
+    delete[] id_buf;
+    if (total == 0) return -1;
+
+    *out_total_sectors = total;
     return 0;
 }
 void stop_cmd(HBA_PORT *port) {
@@ -1926,9 +1999,25 @@ void fat32_format() {
     // Effective partition start that will end up in g_partition_lba after format.
     const uint64_t new_part_lba = raw_disk ? PART_START_LBA : g_partition_lba;
 
-    // Total disk size in sectors (128 MB image).  The partition occupies
-    // disk_total_sectors - new_part_lba sectors.
-    const uint32_t disk_total_sectors = (128u * 1024u * 1024u) / 512u;
+    // Total disk size in sectors. This used to be hardcoded to a 128 MB
+    // image's sector count regardless of what disk was actually attached
+    // -- fine for the test image this was originally developed against,
+    // but on real hardware it silently limited every format to the first
+    // 128 MB of the drive no matter how large it actually was. Query the
+    // real capacity via ATA IDENTIFY DEVICE first; only fall back to the
+    // old 128 MB constant if that query fails (e.g. some virtual disks
+    // that don't answer IDENTIFY the way real hardware does).
+    uint64_t identified_sectors = 0;
+    uint32_t disk_total_sectors = (128u * 1024u * 1024u) / 512u;
+    if (ahci_get_disk_total_sectors(g_ahci_port, &identified_sectors) == 0 && identified_sectors > 0) {
+        // tot_sec32/hidd_sec etc. below are 32-bit fields (this driver
+        // doesn't implement exFAT-style huge-volume extensions), so clamp
+        // to what actually fits rather than wrapping into a bogus value
+        // on a >2TB drive.
+        disk_total_sectors = (identified_sectors > 0xFFFFFFFFu)
+                              ? 0xFFFFFFFFu
+                              : (uint32_t)identified_sectors;
+    }
     // Guard: partition must fit within the disk.
     if (new_part_lba >= disk_total_sectors) {
         wm.print_to_focused("Error: partition start beyond disk end.\n");
@@ -1952,10 +2041,21 @@ void fat32_format() {
     new_bpb.hidd_sec      = (uint32_t)new_part_lba;  // sectors before this partition
     new_bpb.tot_sec32     = part_total_sectors;        // partition size, NOT disk size
 
-    // ── sec_per_clus: smallest value that yields >= 65525 clusters ────────
+    // ── sec_per_clus: scales with volume size, like a real formatter ──────
+    // Must clear the FAT32-spec floor of >=65525 clusters (below that, a
+    // volume is FAT16 territory), but among candidates that clear it,
+    // prefer the LARGEST cluster size that keeps the total cluster count
+    // under a soft cap -- otherwise every disk bigger than a few hundred
+    // MB ends up at 512-byte clusters, which is what used to make the
+    // FAT table (and chkdsk's cluster bitmap, 1 bit/cluster) balloon to
+    // hundreds of MB on any real-sized drive.
     {
         uint8_t spc_candidates[] = { 1, 2, 4, 8, 16, 32, 64, 128 };
-        uint8_t chosen = 128; // safe fallback
+        const uint32_t MIN_CLUSTERS = 65525u;          // FAT32 spec floor
+        const uint32_t MAX_CLUSTERS_SOFT_CAP = 8000000u; // ~1MB chkdsk bitmap worst case
+        uint8_t best_valid  = 0; // largest spc that clears the floor at all
+        uint8_t best_capped = 0; // largest spc that ALSO stays under the soft cap
+
         for (uint32_t k = 0; k < sizeof(spc_candidates); k++) {
             uint8_t spc = spc_candidates[k];
             uint32_t tmp1 = part_total_sectors - new_bpb.rsvd_sec_cnt;
@@ -1965,8 +2065,16 @@ void fat32_format() {
                                 - new_bpb.rsvd_sec_cnt
                                 - new_bpb.num_fats * fat_sz;
             uint32_t clusters = data_sec / spc;
-            if (clusters >= 65525u) { chosen = spc; break; }
+            if (clusters < MIN_CLUSTERS) continue;
+            best_valid = spc; // candidates are ascending, so this ends up largest
+            if (clusters <= MAX_CLUSTERS_SOFT_CAP) best_capped = spc;
         }
+        // Prefer a cluster size that keeps the count sane; if even the
+        // largest candidate (64KB clusters) can't get a truly enormous
+        // disk under the cap, fall back to the largest one that at least
+        // clears the FAT32 floor -- best effort, and the heap-size /
+        // chkdsk-memory-check safety nets below still apply on top.
+        uint8_t chosen = best_capped ? best_capped : (best_valid ? best_valid : 128);
         new_bpb.sec_per_clus = chosen;
     }
 
@@ -2227,15 +2335,24 @@ private:
     // ROW_H must be >= the small icon size (14px) plus a little padding so
     // rows never overlap/clip into each other.
     static constexpr int TITLEBAR_H   = 25;
-    static constexpr int LIST_TOP_PAD = 5;   // gap below titlebar before first row
+    // FIX: current_path used to be drawn directly on top of the titlebar
+    // at a fixed x+100, overlapping the tail of the "File Explorer" title
+    // text (8px/char * 13 chars = 104px just for the word "Explorer" --
+    // anything drawn starting at x+100 collided with it) and getting
+    // harder to read the longer the path got, with nothing to fall back
+    // on for paths too wide for the window. A dedicated bar directly
+    // below the titlebar gives the current folder its own always-visible
+    // row, like a real file manager's address bar.
+    static constexpr int PATH_BAR_H   = 18;
+    static constexpr int LIST_TOP_PAD = 5;   // gap below path bar before first row
     static constexpr int ROW_H        = 18;
     static constexpr int SCROLLBAR_W  = 16;  // width of the scroll sidebar
     static constexpr int ARROW_H      = 16;  // height of each up/down arrow button
 
     int list_area_x() const { return x; }
-    int list_area_y() const { return y + TITLEBAR_H; }
+    int list_area_y() const { return y + TITLEBAR_H + PATH_BAR_H; }
     int list_area_w() const { return w - SCROLLBAR_W; }
-    int list_area_h() const { return h - TITLEBAR_H; }
+    int list_area_h() const { return h - TITLEBAR_H - PATH_BAR_H; }
 
     int max_visible_items() const {
         int n = (list_area_h() - LIST_TOP_PAD) / ROW_H;
@@ -2258,7 +2375,7 @@ private:
     }
 
     int scrollbar_x() const { return x + w - SCROLLBAR_W; }
-    int scrollbar_top() const { return y + TITLEBAR_H; }
+    int scrollbar_top() const { return y + TITLEBAR_H + PATH_BAR_H; }
     int scrollbar_track_top() const { return scrollbar_top() + ARROW_H; }
     int scrollbar_track_h() const { return list_area_h() - 2 * ARROW_H; }
 
@@ -2494,15 +2611,37 @@ public:
         using namespace ColorPalette;
         
         uint32_t titlebar_color = has_focus ? TITLEBAR_ACTIVE : TITLEBAR_INACTIVE;
-        draw_rect_filled(x, y, w, 25, titlebar_color);
+        draw_rect_filled(x, y, w, TITLEBAR_H, titlebar_color);
         draw_string(title, x + 5, y + 8, TEXT_WHITE);
-        draw_string(current_path, x+100, y+8, TEXT_WHITE);
 
         draw_rect_filled(x + w - 22, y + 4, 18, 18, BUTTON_CLOSE);
         draw_string("X", x + w - 17, y + 8, TEXT_WHITE);
+
+        // Dedicated path bar: the current folder, always in its own row
+        // so it's never competing for space with the titlebar text. Long
+        // paths are tail-truncated with a leading "..." -- the DEEPEST
+        // folder (the one you're actually looking at) is what matters
+        // most, so it's the part kept visible rather than the start.
+        draw_rect_filled(x, y + TITLEBAR_H, w, PATH_BAR_H, FILE_EXPLORER_BG);
+        {
+            const int PATH_PAD_X = 6;
+            int avail_chars = (w - 2 * PATH_PAD_X) / 8;
+            if (avail_chars < 1) avail_chars = 1;
+            int path_len = (int)strlen(current_path);
+            if (path_len <= avail_chars) {
+                draw_string(current_path, x + PATH_PAD_X, y + TITLEBAR_H + 5, TEXT_BLACK);
+            } else if (avail_chars > 3) {
+                char truncated[256];
+                truncated[0] = '.'; truncated[1] = '.'; truncated[2] = '.';
+                int tail_len = avail_chars - 3;
+                strncpy(truncated + 3, current_path + (path_len - tail_len), tail_len);
+                truncated[avail_chars] = '\0';
+                draw_string(truncated, x + PATH_PAD_X, y + TITLEBAR_H + 5, TEXT_BLACK);
+            }
+        }
         
         // Main content area
-        draw_rect_filled(x, y + 25, w, h - 25, FILE_EXPLORER_BG);
+        draw_rect_filled(x, list_area_y(), w, list_area_h(), FILE_EXPLORER_BG);
         
         // Draw borders
         for (int i = 0; i < w; i++) put_pixel_back(x + i, y, WINDOW_BORDER);
