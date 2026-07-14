@@ -1306,7 +1306,9 @@ static void path_push_component(char* path, size_t path_bufsize, const char* nam
 // per-window current_path), and the in-kernel TCC compiler's #include
 // resolution (fat32_read_file_as_string_path(), below).
 bool fat32_resolve_path(const char* path, uint32_t base_cluster, const char* base_path,
-                         uint32_t* out_cluster, char* out_path, size_t out_path_size) {
+                         uint32_t* out_cluster, char* out_path, size_t out_path_size,
+                         bool* out_not_a_dir = nullptr) {
+    if (out_not_a_dir) *out_not_a_dir = false;
     if (!ahci_base || !bpb.root_clus) return false;
     if (!path || !*path) {
         *out_cluster = base_cluster;
@@ -1354,7 +1356,10 @@ bool fat32_resolve_path(const char* path, uint32_t base_cluster, const char* bas
         } else {
             fat_dir_entry_t entry;
             if (fat32_find_entry_in(cluster, comp, &entry) != 0) return false;
-            if (!(entry.attr & FAT_ATTR_DIRECTORY)) return false;
+            if (!(entry.attr & FAT_ATTR_DIRECTORY)) {
+                if (out_not_a_dir) *out_not_a_dir = true;
+                return false;
+            }
             uint32_t next = ((uint32_t)entry.fst_clus_hi << 16) | entry.fst_clus_lo;
             if (next == 0) next = bpb.root_clus;
             cluster = next;
@@ -1478,6 +1483,84 @@ char* fat32_read_file_as_string_path(const char* path) {
     uint32_t saved_cluster = current_directory_cluster;
     current_directory_cluster = dir_cluster;
     char* result = fat32_read_file_as_string(file_part);
+    current_directory_cluster = saved_cluster;
+    return result;
+}
+
+// Splits `path` into a directory part (resolved to a cluster, via
+// fat32_resolve_path) and a final filename part. Shared by
+// fat32_find_entry_path()/fat32_write_file_path() below; kept as a
+// standalone helper (rather than reusing fat32_resolve_src(), defined
+// later, after fat32_rename_file()) purely to avoid a forward
+// declaration -- the logic is intentionally identical to
+// fat32_read_file_as_string_path()'s own split above.
+static bool fat32_split_and_resolve_dir(const char* path, uint32_t* dir_cluster_out,
+                                         char* file_part_out, size_t file_part_out_size) {
+    const char* last_slash = strrchr(path, '/');
+    if (!last_slash) {
+        *dir_cluster_out = current_directory_cluster;
+        strncpy(file_part_out, path, file_part_out_size - 1);
+        file_part_out[file_part_out_size - 1] = '\0';
+        return true;
+    }
+
+    const char* file_part = last_slash + 1;
+    if (!*file_part) return false; // path ended in '/' -- not a file
+
+    size_t dir_len = (size_t)(last_slash - path);
+    char dir_part[256];
+    if (dir_len == 0) {
+        strncpy(dir_part, "/", sizeof(dir_part));
+    } else {
+        if (dir_len >= sizeof(dir_part)) dir_len = sizeof(dir_part) - 1;
+        memcpy(dir_part, path, dir_len);
+        dir_part[dir_len] = '\0';
+    }
+
+    char resolved_path[256];
+    if (!fat32_resolve_path(dir_part, current_directory_cluster, current_directory_path,
+                             dir_cluster_out, resolved_path, sizeof(resolved_path))) {
+        return false;
+    }
+    strncpy(file_part_out, file_part, file_part_out_size - 1);
+    file_part_out[file_part_out_size - 1] = '\0';
+    return true;
+}
+
+// Path-aware fat32_find_entry(): resolves a directory-qualified path
+// ("sub/dir/foo.elf") instead of only ever looking in
+// current_directory_cluster. Needed so `bochs`/ELF execution can find a
+// file the File Explorer is showing from inside a subdirectory -- before
+// this, load_and_execute_elf() looked the file up in whatever directory
+// the SHELL happened to be in, which silently diverges from whatever
+// folder an Explorer window is actually displaying.
+int fat32_find_entry_path(const char* path, fat_dir_entry_t* entry_out) {
+    if (!path || !*path) return -1;
+    uint32_t dir_cluster;
+    char name[128];
+    if (!fat32_split_and_resolve_dir(path, &dir_cluster, name, sizeof(name))) return -1;
+
+    uint32_t saved_cluster = current_directory_cluster;
+    current_directory_cluster = dir_cluster;
+    uint32_t sector, offset;
+    int found = fat32_find_entry(name, entry_out, &sector, &offset);
+    current_directory_cluster = saved_cluster;
+    return found;
+}
+
+// Path-aware fat32_write_file(): lets the editor save back to whatever
+// subdirectory a file was opened from, instead of always writing into
+// the shell's current directory regardless of where the file actually
+// came from.
+int fat32_write_file_path(const char* path, const void* data, uint32_t size) {
+    if (!path || !*path) return -1;
+    uint32_t dir_cluster;
+    char name[128];
+    if (!fat32_split_and_resolve_dir(path, &dir_cluster, name, sizeof(name))) return -1;
+
+    uint32_t saved_cluster = current_directory_cluster;
+    current_directory_cluster = dir_cluster;
+    int result = fat32_write_file(name, data, size);
     current_directory_cluster = saved_cluster;
     return result;
 }
@@ -2185,6 +2268,19 @@ private:
     // Elf32_Ehdr type here (it's defined much later in this translation
     // unit, after FileExplorerWindow) — a raw byte comparison is all
     // "is this actually an ELF" requires.
+    // Builds the absolute path of `filename` as it sits inside this
+    // window's current_path (e.g. current_path="/test", filename="foo"
+    // -> "/test/foo"). Used everywhere this window needs to read/run a
+    // file, instead of a bare filename -- a bare filename would resolve
+    // against the SHELL's current_directory_cluster, which has no
+    // reason to match whatever folder this particular Explorer window
+    // happens to be showing.
+    void full_path_for(const char* filename, char* out, size_t out_size) {
+        strncpy(out, current_path, out_size - 1);
+        out[out_size - 1] = '\0';
+        path_push_component(out, out_size, filename);
+    }
+
     bool is_elf_file(int idx) {
         if (idx < 0 || idx >= num_files) return false;
         if (file_list[idx].attr & FAT_ATTR_DIRECTORY) return false;
@@ -2192,7 +2288,9 @@ private:
 
         char filename[13];
         fat32_get_fne_from_entry(&file_list[idx], filename);
-        char* data = fat32_read_file_as_string(filename);
+        char full_path[256];
+        full_path_for(filename, full_path, sizeof(full_path));
+        char* data = fat32_read_file_as_string_path(full_path);
         if (!data) return false;
 
         bool is_elf = (unsigned char)data[0] == 0x7F &&
@@ -2262,11 +2360,14 @@ private:
             return;
         }
 
-        char command_buffer[128];
+        char full_path[256];
+        full_path_for(filename, full_path, sizeof(full_path));
+
+        char command_buffer[280];
         if (is_elf_file(idx)) {
-            snprintf(command_buffer, sizeof(command_buffer), "bochs %s", filename);
+            snprintf(command_buffer, sizeof(command_buffer), "bochs %s", full_path);
         } else {
-            snprintf(command_buffer, sizeof(command_buffer), "edit \"%s\"", filename);
+            snprintf(command_buffer, sizeof(command_buffer), "edit \"%s\"", full_path);
         }
         launch_terminal_with_command(command_buffer);
     }

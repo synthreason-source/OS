@@ -60,7 +60,7 @@ private:
 
     // Editor state
     bool in_editor;
-    char edit_filename[32];
+    char edit_filename[128];
     char** edit_lines;
     int edit_line_count;
     int edit_current_line;
@@ -1164,11 +1164,14 @@ void handle_command() {
         const char* dest = (target && *target) ? target : "/"; // bare 'cd' -> root
         uint32_t new_cluster;
         char new_path[256];
+        bool not_a_dir = false;
         if (fat32_resolve_path(dest, current_directory_cluster, current_directory_path,
-                                &new_cluster, new_path, sizeof(new_path))) {
+                                &new_cluster, new_path, sizeof(new_path), &not_a_dir)) {
             current_directory_cluster = new_cluster;
             strncpy(current_directory_path, new_path, 255);
             current_directory_path[255] = '\0';
+        } else if (not_a_dir) {
+            console_print("cd: not a directory: "); console_print(dest); console_print("\n");
         } else {
             console_print("cd: no such directory: "); console_print(dest); console_print("\n");
         }
@@ -1184,19 +1187,26 @@ void handle_command() {
         } else if (fat32_mkdir(name) == 0) {
             console_print("Directory created.\n");
         } else {
-            console_print("mkdir: failed (name already in use, or disk full)\n");
+            fat_dir_entry_t existing;
+            if (fat32_find_entry_in(current_directory_cluster, name, &existing) == 0) {
+                console_print((existing.attr & FAT_ATTR_DIRECTORY)
+                              ? "mkdir: a directory named that already exists\n"
+                              : "mkdir: a FILE (not a directory) named that already exists\n");
+            } else {
+                console_print("mkdir: failed (disk full?)\n");
+            }
         }
     }
     else if (strcmp(command, "edit") == 0) {
         char* filename = get_arg(args, 0);
         if(filename) {
-            strncpy(edit_filename, filename, 31);
-            edit_filename[31] = '\0';
+            strncpy(edit_filename, filename, 127);
+            edit_filename[127] = '\0';
             in_editor = true;
             edit_current_line = 0;
             edit_cursor_col = 0;
             edit_scroll_offset = 0;
-            char* content = fat32_read_file_as_string(filename);
+            char* content = fat32_read_file_as_string_path(filename);
 
             // Seed with a single empty line; editor_insert_line_at() grows
             // the array as wrapped segments are appended below.
@@ -1555,7 +1565,7 @@ void handle_command() {
     if(!in_editor) print_prompt();
 }
 int load_and_execute_elf(const char* filename, const char* args, TerminalWindow* terminal) {
-    char* elfdata = fat32_read_file_as_string(filename);
+    char* elfdata = fat32_read_file_as_string_path(filename);
     if (!elfdata) {
         if (terminal) terminal->console_print("Failed to read ELF file\n");
         return -1;
@@ -1569,8 +1579,7 @@ int load_and_execute_elf(const char* filename, const char* args, TerminalWindow*
 
     do {
         fat_dir_entry_t entry;
-        uint32_t sector = 0, offset = 0;
-        if (fat32_find_entry(filename, &entry, &sector, &offset) != 0) {
+        if (fat32_find_entry_path(filename, &entry) != 0) {
             if (terminal) terminal->console_print("ELF: directory entry not found\n");
             break;
         }
@@ -2045,7 +2054,7 @@ public:
                    strcat(file_content, "\n");
                 }
             }
-            fat32_write_file(edit_filename, file_content, strlen(file_content));
+            fat32_write_file_path(edit_filename, file_content, strlen(file_content));
             delete[] file_content;
             in_editor = false;
             console_print("File saved.\n");
