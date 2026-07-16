@@ -14,8 +14,8 @@
 //     stock version's chain of SIM->get_param_*() during init is the
 //     source of half the freestanding-port pain.)
 //   * Route guest I/O on ports 0xE9 (putc), 0xE8 (exit), 0xE7 (getc),
-//     and 0xE0-0xE4 (file-level FAT32 disk wrapper) into the glue
-//     layer.
+//     0xE0-0xE4 (file-level FAT32 disk wrapper), and 0xEA-0xEE
+//     (graphics framebuffer blit wrapper) into the glue layer.
 //
 // This file deliberately contains NO panic recovery. If Bochs's panic
 // path is reached, the active slot is told to exit and cpu_loop is
@@ -203,6 +203,16 @@ extern "C" int bochs_guest_getc();
 extern "C" void bochs_guest_disk_cmd(unsigned int mbox_addr, int cmd);
 static Bit32u s_disk_addr_bytes[4] = {0, 0, 0, 0};
 
+// Ports 0xEA-0xEE — guest graphics wrapper (framebuffer blit into the
+// guest's own terminal window; see bochs_drivers.h's gfx_present() /
+// gfx_framebuffer, and bochs_glue.cpp's bochs_guest_gfx_cmd). Same
+// latch-then-trigger shape as the disk mailbox above, just on a
+// different set of ports so the two protocols can't collide: the
+// guest writes the little-endian bytes of its framebuffer's guest-
+// physical address to 0xEA-0xED, then a command byte to 0xEE.
+extern "C" void bochs_guest_gfx_cmd(unsigned int mbox_addr, int cmd);
+static Bit32u s_gfx_addr_bytes[4] = {0, 0, 0, 0};
+
 Bit32u bx_devices_c::inp(Bit16u port, unsigned) {
     if (port == 0xE7) return (Bit32u)(unsigned char)bochs_guest_getc();
     return 0xFFFF;
@@ -226,6 +236,19 @@ void   bx_devices_c::outp(Bit16u port, Bit32u val, unsigned) {
                     | (s_disk_addr_bytes[2] << 16)
                     | (s_disk_addr_bytes[3] << 24);
         bochs_guest_disk_cmd(addr, (int)(val & 0xFF));
+    }
+    // Ports 0xEA-0xED — latch one byte each of the graphics mailbox's
+    // guest-physical address. Consumed when 0xEE is written.
+    else if (port >= 0xEA && port <= 0xED) {
+        s_gfx_addr_bytes[port - 0xEA] = (Bit32u)(val & 0xFF);
+    }
+    // Port 0xEE — graphics command trigger (present/clear).
+    else if (port == 0xEE) {
+        Bit32u addr = s_gfx_addr_bytes[0]
+                    | (s_gfx_addr_bytes[1] << 8)
+                    | (s_gfx_addr_bytes[2] << 16)
+                    | (s_gfx_addr_bytes[3] << 24);
+        bochs_guest_gfx_cmd(addr, (int)(val & 0xFF));
     }
     // All other ports are silently dropped.
 }

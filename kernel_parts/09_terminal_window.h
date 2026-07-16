@@ -837,6 +837,8 @@ void handle_command() {
 					  "  cc <file.c> [out]        -- compile C in-kernel via TCC\n"
 					  "  hello                   -- shortcut: bochs hello\n"
 					  "  reset                   -- shortcut: bochs reset\n"
+					  "  (ELF programs can draw graphics -- see bochs_drivers.h's\n"
+					  "   gfx_present()/gfx_set_pixel(), or run gfx_demo)\n"
 					  "  matrix help             -- NumPy-style arrays + blocked GEMM\n"
 					  "  launch <app> | clock | calc | paint | snake | mines\n"
 					  "  monitor | inspector | about   -- open desktop apps\n");
@@ -1990,6 +1992,42 @@ public:
         }
 
         if (!in_editor) {
+    // ── Guest graphics overlay ───────────────────────────────────────
+    // If the running Bochs ELF has presented a framebuffer (see
+    // bochs_drivers.h's gfx_present()), draw THAT instead of the text
+    // buffer -- a program using graphics mode owns the whole content
+    // area, the same way a real full-screen game would. Once the
+    // guest calls gfx_exit() (or exits/is killed, via
+    // bochs_release_slot's gfx_forget_slot), bochs_gfx_get_frame()
+    // goes back to returning false and this window reverts to
+    // ordinary text on the very next draw().
+    const uint32_t* gfx_px = nullptr;
+    int gfx_w = 0, gfx_h = 0;
+    bool gfx_active = (captured_elf_slot >= 0) &&
+        bochs_gfx_get_frame(captured_elf_slot, &gfx_px, &gfx_w, &gfx_h);
+
+    if (gfx_active) {
+        int content_top = y + 30 + overlay_dy;
+        int avail_w = w - 10;
+        int avail_h = (y + h) - content_top - 5;
+        if (avail_w < 0) avail_w = 0;
+        if (avail_h < 0) avail_h = 0;
+
+        // Centre the guest's canvas inside whatever room is left; clip
+        // rather than scale, so guests always get true 1:1 pixels.
+        int draw_w = gfx_w < avail_w ? gfx_w : avail_w;
+        int draw_h = gfx_h < avail_h ? gfx_h : avail_h;
+        int off_x  = x + 5 + (avail_w - draw_w) / 2;
+        int off_y  = content_top + (avail_h - draw_h) / 2;
+
+        for (int row = 0; row < draw_h; row++) {
+            const uint32_t* src_row = gfx_px + row * gfx_w;
+            int py = off_y + row;
+            for (int col = 0; col < draw_w; col++) {
+                put_pixel_back(off_x + col, py, src_row[col]);
+            }
+        }
+    } else {
     // How many 10px text lines actually fit between the content-area
     // top (y + 30 + overlay_dy) and the window's bottom border (y + h).
     // The old code hard-coded `i < 38`, which — combined with the test
@@ -2009,6 +2047,7 @@ public:
         int screen_row = i - first;
         draw_string(buffer[i], x + 5, y + content_top + screen_row * 10,
                     ColorPalette::TEXT_WHITE);
+    }
     }
 } else {
     for (int row = 0; row < EDIT_ROWS; ++row) {

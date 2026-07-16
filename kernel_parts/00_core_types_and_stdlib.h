@@ -350,6 +350,17 @@ extern "C" void bochs_register_io_callbacks(
     void (*exit_cb )(int, int));
 extern "C" bool bochs_process_wants_input(int slot);
 
+// Graphics mailbox accessor (bochs_glue.cpp). Returns true and fills
+// in *pixels/*w/*h with this slot's most recently presented
+// framebuffer if it has one live; returns false (untouched outputs) if
+// the slot has no graphics frame, so TerminalWindow::draw() can fall
+// back to its normal text rendering. *pixels is row-major, 0xRRGGBB
+// per pixel, owned by bochs_glue.cpp -- valid only until the next
+// bochs_guest_gfx_cmd() call, so callers should use it immediately
+// rather than caching the pointer.
+extern "C" bool bochs_gfx_get_frame(int slot, const uint32_t** pixels,
+                                     int* w, int* h);
+
 // ── In-kernel TCC compiler (tcc_kernel.cpp + i386-libtcc-kern.a) ─────────────
 // tcc_kernel_version() == 0 → stub (no TCC), 2 → real in-kernel TCC.
 extern "C" int  tcc_kernel_version(void);

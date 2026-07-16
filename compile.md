@@ -105,3 +105,39 @@ void _start(void) {
     for (;;) {}
 }
 ```
+
+### Graphics: drawing into the terminal window
+
+`bochs_drivers.h` also gives guest programs a small graphics ABI so a
+program isn't limited to scrolling text — it can take over its
+terminal window and draw pixels instead:
+
+```c
+#include "bochs_drivers.h"
+
+void _start(void) {
+    gfx_clear(0x000000);                 // black background
+    gfx_set_pixel(160, 100, 0xFF0000);   // one red pixel, centre-ish
+    gfx_present();                       // blit gfx_framebuffer to the window
+
+    for (;;) { /* keep drawing frames here */ }
+}
+```
+
+- The canvas is fixed at `GFX_WIDTH x GFX_HEIGHT` (320x200), 32-bit
+  `0xRRGGBB` pixels, addressed row-major via `gfx_set_pixel(x, y, rgb)`
+  or by writing directly into the `gfx_framebuffer[]` array.
+- `gfx_present()` blits the current `gfx_framebuffer` into this
+  program's own terminal window, replacing the scrolling text view for
+  as long as graphics mode stays active. It's synchronous, so it's
+  always safe to start drawing the next frame immediately afterward.
+- `gfx_exit()` drops back to plain text mode (`kputs`/`kputc`); it's
+  also called automatically when the program exits, so a crashed or
+  killed graphics program never leaves a stale frame behind.
+- Build and run it exactly like any other guest program (see
+  `gfx_demo.c` for a complete example):
+  ```bash
+  make cc SRC=gfx_demo.c
+  # in the OS shell:
+  gfx_demo
+  ```

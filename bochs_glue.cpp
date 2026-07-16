@@ -82,6 +82,13 @@ extern "C" {
 
 #define MAX_BOCHS_SLOTS 4
 
+// Forward decl -- defined near the graphics mailbox implementation
+// further down this file. Called from bochs_release_slot() and
+// bochs_reset_all_slots() (defined above that point in the file) so a
+// finished program's last graphics frame can never bleed into the next
+// program that reuses the same slot.
+static void gfx_forget_slot(int slot);
+
 // ─── Per-slot state ───────────────────────────────────────────────────────
 //
 // One SlotState per ElfProcess slot. The mapping fields describe the
@@ -978,6 +985,12 @@ extern "C" void bochs_release_slot(int slot) {
 
     SlotState& s = g_slots[slot];
 
+    // Drop any graphics frame this slot presented -- otherwise the
+    // next program to reuse this slot would have its terminal window
+    // start out showing the PREVIOUS program's last frame until (if
+    // ever) it presents its own.
+    gfx_forget_slot(slot);
+
     // Unregister the mapping BEFORE clearing mem_base, so the
     // unregister can still address the page-index range via vaddr_base.
     mapping_unregister(s);
@@ -1023,6 +1036,7 @@ extern "C" void bochs_reset_all_slots() {
     // of them unconditionally.
     for (int i = 0; i < MAX_BOCHS_SLOTS; ++i) {
         SlotState& s = g_slots[i];
+        gfx_forget_slot(i);
         mapping_unregister(s);
         s.mem_base   = nullptr;
         s.mem_size   = 0;
@@ -1658,6 +1672,87 @@ extern "C" void bochs_guest_disk_cmd(unsigned int mbox_addr, int cmd) {
             mbox->status = DISK_ERR_BADCMD;
             break;
     }
+}
+
+// =====================================================================
+// Graphics mailbox: guest framebuffer blit into its terminal window
+// =====================================================================
+//
+// Protocol (see bochs_drivers.h's gfx_present()/gfx_framebuffer): the
+// guest writes the little-endian bytes of the guest-physical address
+// of a GFX_MAX_W x GFX_MAX_H, 32bpp (0xRRGGBB per pixel) buffer to
+// ports 0xEA-0xED, then a command byte to 0xEE. Just like the disk
+// mailbox, this reuses disk_guest_ptr() to translate that guest
+// address into a host pointer within the active slot's own memory
+// window -- a misbehaving/stale guest gets a clean no-op instead of
+// touching unrelated host memory.
+//
+// The kernel keeps its own host-side copy of the pixels (one per
+// slot) rather than pointing straight at guest memory, because guest
+// memory can be torn down (bochs_release_slot) at any point between
+// one guest PRESENT and the next TerminalWindow::draw() -- copying
+// once here means the window compositor always has a complete, valid
+// frame to blit regardless of what the guest does afterwards.
+
+#define GFX_MAX_W 320
+#define GFX_MAX_H 200
+
+enum { GFX_CMD_PRESENT = 1, GFX_CMD_CLEAR = 2 };
+
+struct GfxSlotState {
+    bool     active = false;   // true once a PRESENT has landed and
+                                // hasn't been cleared/reset since
+    int      width  = 0;
+    int      height = 0;
+    uint32_t pixels[GFX_MAX_W * GFX_MAX_H];
+};
+static GfxSlotState g_gfx[MAX_BOCHS_SLOTS];
+
+extern "C" void bochs_guest_gfx_cmd(unsigned int mbox_addr, int cmd) {
+    if (g_active_slot < 0 || g_active_slot >= MAX_BOCHS_SLOTS) return;
+    GfxSlotState& gs = g_gfx[g_active_slot];
+
+    if (cmd == GFX_CMD_CLEAR) {
+        gs.active = false;
+        return;
+    }
+    if (cmd != GFX_CMD_PRESENT) return;
+
+    // This simple protocol always presents the fixed GFX_MAX_W x
+    // GFX_MAX_H canvas from bochs_drivers.h, so the transfer size is
+    // fixed too -- disk_guest_ptr() still does the real safety work,
+    // rejecting any address whose [addr, addr+len) range isn't
+    // entirely inside the active slot's own memory window.
+    void* src = disk_guest_ptr(mbox_addr, (Bit32u)sizeof(gs.pixels));
+    if (!src) return;
+    __builtin_memcpy(gs.pixels, src, sizeof(gs.pixels));
+    gs.width  = GFX_MAX_W;
+    gs.height = GFX_MAX_H;
+    gs.active = true;
+}
+
+// Called from bochs_release_slot()/bochs_reset_all_slots() so a stale
+// graphics frame from a finished program can never bleed into the
+// next program's window if that program reuses the same slot but only
+// prints text (i.e. never itself calls gfx_exit()).
+static void gfx_forget_slot(int slot) {
+    if (slot < 0 || slot >= MAX_BOCHS_SLOTS) return;
+    g_gfx[slot].active = false;
+}
+
+// Read-only accessor for the kernel/window compositor side
+// (TerminalWindow::draw() in kernel_parts/09_terminal_window.h). Returns
+// false (and touches nothing) if this slot has no live graphics frame,
+// so callers can fall back to plain text rendering.
+extern "C" bool bochs_gfx_get_frame(int slot, const uint32_t** pixels,
+                                     int* w, int* h) {
+    if (slot < 0 || slot >= MAX_BOCHS_SLOTS) return false;
+    GfxSlotState& gs = g_gfx[slot];
+    if (!gs.active) return false;
+    *pixels = gs.pixels;
+    *w = gs.width;
+    *h = gs.height;
+    return true;
 }
 
 // =====================================================================

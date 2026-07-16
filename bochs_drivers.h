@@ -156,3 +156,76 @@ static inline int kfstat(const char *filename, unsigned int *size_out)
     if (mbox.status == DISK_OK && size_out) *size_out = mbox.buf_len;
     return mbox.status;
 }
+
+/* ── graphics ABI: draw pixels straight into this program's terminal
+ * window ────────────────────────────────────────────────────────────
+ *
+ * A guest program can paint a GFX_WIDTH x GFX_HEIGHT canvas of 32-bit
+ * 0x00RRGGBB pixels and have the kernel blit it directly into its own
+ * terminal window in place of the usual scrolling text — the same
+ * window a plain kputs()-based program would otherwise be printing
+ * lines into.
+ *
+ * Usage:
+ *     gfx_clear(0x000000);
+ *     gfx_set_pixel(10, 10, 0xFF0000);
+ *     gfx_present();                 // blit gfx_framebuffer to screen
+ *     ...                            // draw the next frame, loop
+ *     gfx_exit();                    // optional: go back to text mode
+ *
+ * Protocol: like the disk mailbox above, write the little-endian
+ * bytes of a buffer's OWN guest address to ports 0xEA-0xED, then a
+ * command byte to 0xEE. This call is synchronous — like the disk
+ * calls, the kernel has finished copying the pixels before the
+ * triggering OUT returns, so it's always safe to start drawing the
+ * next frame into the same buffer immediately afterward.
+ */
+
+#define GFX_WIDTH  320
+#define GFX_HEIGHT 200
+
+#define GFX_PORT_ADDR0 0xEA
+#define GFX_PORT_ADDR1 0xEB
+#define GFX_PORT_ADDR2 0xEC
+#define GFX_PORT_ADDR3 0xED
+#define GFX_PORT_CMD   0xEE
+
+#define GFX_CMD_PRESENT 1   /* blit the GFX_WIDTH x GFX_HEIGHT buffer  */
+#define GFX_CMD_CLEAR   2   /* drop the frame, revert window to text   */
+
+/* Ready-to-use canvas so most programs never need their own buffer or
+ * bookkeeping — just draw into this with gfx_set_pixel()/gfx_clear()
+ * and call gfx_present(). */
+static unsigned int gfx_framebuffer[GFX_WIDTH * GFX_HEIGHT];
+
+static inline void gfx_set_pixel(int x, int y, unsigned int rgb)
+{
+    if ((unsigned)x < GFX_WIDTH && (unsigned)y < GFX_HEIGHT)
+        gfx_framebuffer[y * GFX_WIDTH + x] = rgb;
+}
+
+static inline void gfx_clear(unsigned int rgb)
+{
+    for (int i = 0; i < GFX_WIDTH * GFX_HEIGHT; i++) gfx_framebuffer[i] = rgb;
+}
+
+/* Present any GFX_WIDTH x GFX_HEIGHT buffer of your own (e.g. if you'd
+ * rather manage double-buffering yourself instead of using
+ * gfx_framebuffer directly). */
+static inline void gfx_present_buf(const void *buf)
+{
+    unsigned int addr = (unsigned int)(unsigned long)buf;
+    outb(GFX_PORT_ADDR0, (unsigned char)(addr & 0xFF));
+    outb(GFX_PORT_ADDR1, (unsigned char)((addr >> 8)  & 0xFF));
+    outb(GFX_PORT_ADDR2, (unsigned char)((addr >> 16) & 0xFF));
+    outb(GFX_PORT_ADDR3, (unsigned char)((addr >> 24) & 0xFF));
+    outb(GFX_PORT_CMD, GFX_CMD_PRESENT);
+}
+
+/* Blit gfx_framebuffer to this program's terminal window. */
+static inline void gfx_present(void) { gfx_present_buf(gfx_framebuffer); }
+
+/* Stop showing the graphics overlay and go back to plain scrolling
+ * text (kputs/kputc) in this window. Not required before exiting —
+ * the kernel drops the frame automatically when the program ends. */
+static inline void gfx_exit(void) { outb(GFX_PORT_CMD, GFX_CMD_CLEAR); }
