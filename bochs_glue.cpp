@@ -1704,7 +1704,7 @@ struct GfxSlotState {
                                 // hasn't been cleared/reset since
     int      width  = 0;
     int      height = 0;
-    uint32_t pixels[GFX_MAX_W * GFX_MAX_H];
+    unsigned int pixels[GFX_MAX_W * GFX_MAX_H];
 };
 static GfxSlotState g_gfx[MAX_BOCHS_SLOTS];
 
@@ -1744,7 +1744,7 @@ static void gfx_forget_slot(int slot) {
 // (TerminalWindow::draw() in kernel_parts/09_terminal_window.h). Returns
 // false (and touches nothing) if this slot has no live graphics frame,
 // so callers can fall back to plain text rendering.
-extern "C" bool bochs_gfx_get_frame(int slot, const uint32_t** pixels,
+extern "C" bool bochs_gfx_get_frame(int slot, const unsigned int** pixels,
                                      int* w, int* h) {
     if (slot < 0 || slot >= MAX_BOCHS_SLOTS) return false;
     GfxSlotState& gs = g_gfx[slot];
