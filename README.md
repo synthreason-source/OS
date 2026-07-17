@@ -6,7 +6,7 @@ CTRL-Q saves and exits text editor...
 
 SATA port selection with 'disk_select'
 
-guest programs require bochs_drivers.h to interface with the OS.
+guest programs require bochs_drivers.h to interface with the OS. Uses 8.3 filesystem so rename it...
 
 TODO: add ethernet, Lynx_(web_browser) & busybox
 
