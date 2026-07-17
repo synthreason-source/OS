@@ -17,7 +17,13 @@ void _start(void)
 {
     int t = 0;
 
-    for (int frame = 0; frame < 600; frame++) {
+    /* Printed BEFORE any graphics frame is presented, so it's visible
+     * in the plain-text terminal immediately -- confirms the program
+     * actually started, independent of how long the first frame takes
+     * to compute. */
+    kputs("gfx_demo: starting, drawing first frame...\n");
+
+    for (int frame = 0; frame < 200; frame++) {
         /* Bail out early if the user typed anything. */
         /* (non-blocking: inb returns 0 if nothing queued) */
         if (inb(0xE7) != 0) break;

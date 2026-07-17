@@ -302,6 +302,17 @@ ifndef SRC
 	@exit 1
 endif
 	@echo ">>> Compiling $(SRC) → $(or $(OUT),$(basename $(notdir $(SRC)))) in $(DISK_IMG) ..."
+	@# Guest programs commonly #include "bochs_drivers.h" (see compile.md).
+	@# The in-kernel `cc` command resolves #include by reading straight
+	@# from disk.img, so make sure a real copy is always there -- via
+	@# mtools mcopy (same tool/overwrite-flag combo tcc_glue.cpp uses for
+	@# the compiled ELF itself), which writes proper VFAT long-filename
+	@# entries for a 13-character base name like this one. Overwrite (-o)
+	@# so re-running `make cc` after editing bochs_drivers.h picks up the
+	@# change; ignore failure (`|| true`) so a disk.img built before this
+	@# existed, or one where the file is already current, never blocks a
+	@# compile over this best-effort sync step.
+	@MTOOLS_SKIP_CHECK=1 mcopy -o -i "$(DISK_IMG)" "bochs_drivers.h" "::bochs_drivers.h" 2>/dev/null || true
 	./$(TCC_TOOL) "$(DISK_IMG)" "$(SRC)" "$(OUT)" "tcc_guest.ld"
 	@echo ">>> Done. Boot the OS and type '$(or $(OUT),$(basename $(notdir $(SRC))))' to run it."
 

@@ -1826,7 +1826,21 @@ extern "C" int bochs_cpu_tick(int n) {
     // internal yield/resume via kill_bochs_request exactly the way
     // the old outer while-loop assumed each individual cpu_loop() call
     // would.
-    Bit64u budget = (Bit64u)n * 256;
+    // Budget multiplier: how many guest instructions one unit of
+    // "steps" (as passed to bochs_cpu_tick/tick_elf_processes) buys.
+    // 256 was tuned for chatty, port-IO-heavy guests (e.g. putc-based
+    // text output, where the guest naturally does an outb every
+    // ~10-15 instructions) -- fine for something like `hello`, but a
+    // CPU-bound guest loop with little or no port I/O in between (e.g.
+    // a graphics program computing tens of thousands of pixels via
+    // gfx_set_pixel before ever calling gfx_present()) could need many
+    // thousands of ticks -- i.e. many seconds of real time at
+    // tick_elf_processes(1)'s one-tick-per-main-loop-iteration cadence
+    // -- before making any visible progress at all. Bumped 256x so a
+    // pixel-heavy frame completes in a handful of ticks instead of
+    // thousands; existing chatty programs are unaffected since they
+    // already finish in far fewer instructions than either budget.
+    Bit64u budget = (Bit64u)n * 65536;
     if (budget > 0x7FFFFFFFull) budget = 0x7FFFFFFFull;  // Bit32s range
 
     BX_CPU(0)->kill_bochs_request = 0;

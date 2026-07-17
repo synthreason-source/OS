@@ -1148,34 +1148,50 @@ int fat32_write_file(const char* filename, const void* data, uint32_t size) {
     return 0;
 }
 
+// Forward decl: fat32_find_entry() is defined just below, but
+// fat32_read_file_as_string() (next) needs to call it and C++ requires
+// the declaration to come first textually.
+int fat32_find_entry(const char* filename, fat_dir_entry_t* entry_out, uint32_t* sector_out, uint32_t* offset_out);
+
 char* fat32_read_file_as_string(const char* filename) {
-    char target[11]; to_83_format(filename, target);
-    uint8_t* dir_buf = new uint8_t[SECTOR_SIZE];
-    // Walk the full directory cluster chain (see fat32_list_files() for
-    // why this matters) instead of stopping after the first cluster.
-    uint32_t cluster = current_directory_cluster;
-    while (cluster >= 2 && cluster < FAT_END_OF_CHAIN) {
-        for (uint8_t s = 0; s < bpb.sec_per_clus; s++) {
-            if (read_write_sectors(g_ahci_port, cluster_to_lba(cluster) + s, 1, false, dir_buf) != 0) { delete[] dir_buf; return nullptr; }
-            for (uint16_t e = 0; e < SECTOR_SIZE / sizeof(fat_dir_entry_t); e++) {
-                fat_dir_entry_t* entry = (fat_dir_entry_t*)(dir_buf + e * sizeof(fat_dir_entry_t));
-                if (entry->name[0] == 0x00) { delete[] dir_buf; return nullptr; }
-                if (memcmp(entry->name, target, 11) == 0) {
-                    uint32_t size = entry->file_size;
-                    if(size == 0) { delete[] dir_buf; char* empty = new char[1]; empty[0] = '\0'; return empty; }
-                    char* data = new char[size + 1];
-                    if (read_data_from_clusters((entry->fst_clus_hi << 16) | entry->fst_clus_lo, data, size)) {
-                        data[size] = '\0';
-                        delete[] dir_buf;
-                        return data;
-                    }
-                    delete[] data; delete[] dir_buf; return nullptr;
-                }
-            }
-        }
-        cluster = read_fat_entry(cluster);
+    // FIX (in-kernel `cc`'s #include "long_name.h" not found): this
+    // used to do its own directory scan comparing ONLY the flat 8.3
+    // short name -- to_83_format(filename) (a naive first-8-characters
+    // truncation) against each entry's raw 11-byte short name, with no
+    // long-file-name (LFN) awareness at all.
+    //
+    // That breaks for any name whose base is over 8 characters, e.g.
+    // "bochs_drivers.h": if the file reached disk.img via mtools
+    // mcopy (as `make cc`'s ELF injection and the documented dev
+    // workflow both do), mtools writes REAL VFAT LFN entries using the
+    // standard Windows "~1" collision-numbering scheme ("BOCHS_D~1.H"),
+    // which doesn't match this function's own from-scratch truncation
+    // ("BOCHS_DR.H") -- so a file that is genuinely, correctly on disk
+    // could still come back "not found" the moment its name didn't fit
+    // 8.3 cleanly. That's exactly the failure libtcc's preprocessor hit
+    // resolving #include "bochs_drivers.h" through this function (see
+    // tcc_kernel.cpp's open()).
+    //
+    // fat32_find_entry() (right below) already does this correctly: it
+    // parses real LFN entry chains AND falls back to short-name
+    // matching, and is the same lookup `cd`/`ls`/the File Explorer all
+    // rely on. Delegate to it instead of maintaining a second, weaker
+    // lookup that silently disagreed with it.
+    fat_dir_entry_t entry;
+    uint32_t sector, offset;
+    if (fat32_find_entry(filename, &entry, &sector, &offset) != 0) return nullptr;
+
+    uint32_t size = entry.file_size;
+    if (size == 0) { char* empty = new char[1]; empty[0] = '\0'; return empty; }
+
+    char* data = new char[size + 1];
+    uint32_t first_cluster = (entry.fst_clus_hi << 16) | entry.fst_clus_lo;
+    if (read_data_from_clusters(first_cluster, data, size)) {
+        data[size] = '\0';
+        return data;
     }
-    delete[] dir_buf; return nullptr;
+    delete[] data;
+    return nullptr;
 }
 
 int fat32_find_entry(const char* filename, fat_dir_entry_t* entry_out, uint32_t* sector_out, uint32_t* offset_out) {

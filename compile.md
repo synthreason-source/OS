@@ -141,3 +141,36 @@ void _start(void) {
   # in the OS shell:
   gfx_demo
   ```
+
+**Using the in-kernel `cc` command instead of `make cc`:** the shell's
+own `cc <file.c>` compiles straight from the OS's FAT32 disk, and any
+`#include "local_header.h"` has to resolve to a *file already on that
+same disk*. This used to fail for `bochs_drivers.h` specifically: the
+function backing that lookup (`fat32_read_file_as_string`) only ever
+compared against a naive first-8-characters short name it computed
+itself, ignoring the real long-filename (VFAT LFN) entries mtools
+writes for a 13-character base name like `bochs_drivers` — so the
+header could come back "not on disk" even when it genuinely was. Fixed
+by making that lookup reuse the same long-name-aware matching
+`cd`/`ls`/the File Explorer already rely on
+(`kernel_parts/06_fat32_filesystem_and_explorer.h`'s
+`fat32_find_entry`), and by having `make cc` always `mcopy` a current
+copy of `bochs_drivers.h` onto `disk.img` before compiling, so it's
+never missing in the first place. `#include "bochs_drivers.h"` now
+just works from the in-kernel `cc` command:
+```
+cc gfx_demo.c
+gfx_demo
+```
+(`gfx_demo_standalone.c` — the same demo with those few lines inlined
+instead of `#include`d — is still there if you ever want a single
+self-contained file with no local include at all, but it's no longer
+necessary to work around this.)
+
+**If a frame doesn't show up right away:** a program computing a full
+320x200 frame does tens of thousands of `gfx_set_pixel` calls with no
+port I/O in between, unlike a `kputs`-based program that naturally
+yields every ~10-15 instructions. Give it a moment — the demo prints a
+"starting..." message via `kputs` immediately, before it ever touches
+graphics, so you can confirm it launched even before the first frame
+appears.
