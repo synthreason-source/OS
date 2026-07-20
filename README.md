@@ -8,6 +8,7 @@ SATA port selection with 'disk_select'
 
 TODO: gfx.c demo, add mouse clicking to ELF executable windows and basic app compositor library.
 
+TODO: fix 8.3 filename gliches in filesystem/tcc
 guest programs require bochs_drivers.h to interface with the OS.
 
 TODO: add ethernet, Lynx_(web_browser) & busybox
