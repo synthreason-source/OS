@@ -14,7 +14,7 @@
  * at any point and control simply goes back to the compositor, same
  * as clicking any other window — this program doesn't see it.
  */
-#include "compositor.h"
+#include "comp.h"
 
 static ui_button_t    s_button    = { 10, 10, 90, 22, "Click me" };
 static ui_scrollbar_t  s_scroll;
