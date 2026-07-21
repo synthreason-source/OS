@@ -11,8 +11,7 @@
  * snapshot into buttons, a scrollbar, and a text box a guest program
  * can just drop into its own draw loop.
  *
- *     #include "bochs_drivers.h"
- *     #include "compositor.h"
+ *     #include "comp.h"
  *
  *     ui_button_t   quit_btn = { 10, 10, 60, 20, "Quit" };
  *     ui_scrollbar_t bar;    ui_scrollbar_init(&bar, 300, 10, 12, 180, 0, 100, 0);
