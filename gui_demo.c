@@ -14,7 +14,6 @@
  * at any point and control simply goes back to the compositor, same
  * as clicking any other window — this program doesn't see it.
  */
-#include "bochs_drivers.h"
 #include "compositor.h"
 
 static ui_button_t    s_button    = { 10, 10, 90, 22, "Click me" };
