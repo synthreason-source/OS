@@ -89,6 +89,11 @@ extern "C" {
 // program that reuses the same slot.
 static void gfx_forget_slot(int slot);
 
+// Forward decl -- defined near the mouse-wrapper implementation
+// further down this file. Same reuse-hygiene purpose as
+// gfx_forget_slot() above, just for the per-slot mouse snapshot.
+static void mouse_forget_slot(int slot);
+
 // ─── Per-slot state ───────────────────────────────────────────────────────
 //
 // One SlotState per ElfProcess slot. The mapping fields describe the
@@ -990,6 +995,7 @@ extern "C" void bochs_release_slot(int slot) {
     // start out showing the PREVIOUS program's last frame until (if
     // ever) it presents its own.
     gfx_forget_slot(slot);
+    mouse_forget_slot(slot);
 
     // Unregister the mapping BEFORE clearing mem_base, so the
     // unregister can still address the page-index range via vaddr_base.
@@ -1037,6 +1043,7 @@ extern "C" void bochs_reset_all_slots() {
     for (int i = 0; i < MAX_BOCHS_SLOTS; ++i) {
         SlotState& s = g_slots[i];
         gfx_forget_slot(i);
+        mouse_forget_slot(i);
         mapping_unregister(s);
         s.mem_base   = nullptr;
         s.mem_size   = 0;
@@ -1489,6 +1496,27 @@ extern "C" int bochs_guest_getc() {
     return c;
 }
 
+// Guest non-blocking key peek (port 0xF5, used by bochs_drivers.h's
+// key_poll() in compositor.h's GUI frame loop).
+//
+// Intentionally does NOT set wants_input on an empty queue — that's
+// the whole point: a GUI program calling key_poll() once per frame
+// should keep getting its slice and servicing mouse_poll()/gfx_present()
+// even when no key has been pressed. Setting wants_input would cause
+// the kernel main loop's line
+//     if (proc.waiting_for_input && in_empty(i)) continue;
+// to skip this slot's entire tick, starving mouse and graphics in a
+// steady no-key-pressed state, which is the NORMAL state for GUI apps.
+//
+// bx_devices_c::inp() routes port 0xF5 here (bochs_infra.cpp).
+extern "C" int bochs_guest_key_poll() {
+    if (g_active_slot < 0 || g_active_slot >= MAX_BOCHS_SLOTS) return 0;
+    SlotState& s = g_slots[g_active_slot];
+    if (!s.read_cb) return 0;
+    // Peek only — pop if present, return 0 if empty, no side effects.
+    return s.read_cb(g_active_slot);
+}
+
 // =====================================================================
 // Guest disk wrapper (ports 0xE0-0xE4 = file-level FAT32 access)
 // =====================================================================
@@ -1753,6 +1781,71 @@ extern "C" bool bochs_gfx_get_frame(int slot, const unsigned int** pixels,
     *w = gs.width;
     *h = gs.height;
     return true;
+}
+
+// =====================================================================
+// Guest mouse wrapper (ports 0xEF, 0xF0-0xF4 = compositor cursor passthrough)
+// =====================================================================
+//
+// Protocol (see bochs_drivers.h's mouse_poll()/mouse_state_t): the
+// guest triggers `out al, 0xEF` to take a snapshot, then reads the
+// five fields back with `in al, 0xF0`..0xF4. There's no guest-address
+// mailbox here (unlike disk/gfx) — the data lives entirely on the
+// host side — so the "latch bytes, then trigger" shape of those two
+// protocols isn't needed; we just snapshot straight into a per-slot
+// struct on the trigger and serve reads from it.
+//
+// kernel_gfx_mouse_poll() (defined in kernel_parts/11_kernel_main.h,
+// alongside the WindowManager it needs) is the actual authority on
+// "is this slot's window focused, and if so where's the cursor in its
+// canvas": it returns false (leaving the snapshot all-zero) for any
+// slot that isn't the CURRENTLY FOCUSED window's own ELF process,
+// which is what keeps clicks on other windows / the desktop / titlebar
+// going to the compositor only, never leaking into a background or
+// unfocused guest's input snapshot.
+extern "C" bool kernel_gfx_mouse_poll(int slot, int* out_x, int* out_y,
+                                       unsigned char* out_buttons);
+
+struct MouseSlotState {
+    int x = 0, y = 0;
+    unsigned char buttons = 0;
+};
+static MouseSlotState g_mouse_snapshot[MAX_BOCHS_SLOTS];
+
+extern "C" void bochs_guest_mouse_poll() {
+    if (g_active_slot < 0 || g_active_slot >= MAX_BOCHS_SLOTS) return;
+    MouseSlotState& ms = g_mouse_snapshot[g_active_slot];
+    int x = 0, y = 0;
+    unsigned char btn = 0;
+    // Return value intentionally ignored: on failure (slot not
+    // focused, no owning window, or not currently in gfx mode) the
+    // out-params are already left at all-zero by kernel_gfx_mouse_poll
+    // itself, which is exactly the "cursor absent" snapshot we want.
+    kernel_gfx_mouse_poll(g_active_slot, &x, &y, &btn);
+    ms.x = x;
+    ms.y = y;
+    ms.buttons = btn;
+}
+
+extern "C" unsigned char bochs_guest_mouse_field(int field) {
+    if (g_active_slot < 0 || g_active_slot >= MAX_BOCHS_SLOTS) return 0;
+    MouseSlotState& ms = g_mouse_snapshot[g_active_slot];
+    switch (field) {
+        case 0: return (unsigned char)(ms.x & 0xFF);          // MX_LO
+        case 1: return (unsigned char)((ms.x >> 8) & 0xFF);   // MX_HI
+        case 2: return (unsigned char)(ms.y & 0xFF);           // MY_LO
+        case 3: return (unsigned char)((ms.y >> 8) & 0xFF);   // MY_HI
+        case 4: return ms.buttons;                             // BUTTONS
+        default: return 0;
+    }
+}
+
+// Called from bochs_release_slot()/bochs_reset_all_slots() so a stale
+// mouse snapshot from a finished program never bleeds into whatever
+// next program happens to reuse the same slot.
+static void mouse_forget_slot(int slot) {
+    if (slot < 0 || slot >= MAX_BOCHS_SLOTS) return;
+    g_mouse_snapshot[slot] = MouseSlotState{};
 }
 
 // =====================================================================

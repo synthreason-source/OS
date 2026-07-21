@@ -14,8 +14,9 @@
 //     stock version's chain of SIM->get_param_*() during init is the
 //     source of half the freestanding-port pain.)
 //   * Route guest I/O on ports 0xE9 (putc), 0xE8 (exit), 0xE7 (getc),
-//     0xE0-0xE4 (file-level FAT32 disk wrapper), and 0xEA-0xEE
-//     (graphics framebuffer blit wrapper) into the glue layer.
+//     0xE0-0xE4 (file-level FAT32 disk wrapper), 0xEA-0xEE (graphics
+//     framebuffer blit wrapper), and 0xEF/0xF0-0xF4 (compositor mouse
+//     cursor wrapper) into the glue layer.
 //
 // This file deliberately contains NO panic recovery. If Bochs's panic
 // path is reached, the active slot is told to exit and cpu_loop is
@@ -213,8 +214,26 @@ static Bit32u s_disk_addr_bytes[4] = {0, 0, 0, 0};
 extern "C" void bochs_guest_gfx_cmd(unsigned int mbox_addr, int cmd);
 static Bit32u s_gfx_addr_bytes[4] = {0, 0, 0, 0};
 
+// Port 0xEF / 0xF0-0xF4 — guest mouse wrapper (compositor cursor
+// passthrough into the active gfx-mode window; see bochs_drivers.h's
+// mouse_poll() and bochs_glue.cpp's bochs_guest_mouse_poll() /
+// bochs_guest_mouse_field()). `out al, 0xEF` takes a snapshot of the
+// cursor for the active slot; the five fields of that snapshot
+// (x lo/hi, y lo/hi, buttons) are then read back individually via
+// 0xF0-0xF4, mirroring the latch-then-read shape of 0xE7's getc.
+extern "C" void          bochs_guest_mouse_poll();
+extern "C" unsigned char bochs_guest_mouse_field(int field);
+
+// Port 0xF5 — non-blocking key peek (bochs_drivers.h's key_poll()).
+// Same as 0xE7 (bochs_guest_getc) except it does NOT set wants_input,
+// so calling it from a GUI frame loop never causes the kernel to pause
+// the slot. See bochs_glue.cpp's bochs_guest_key_poll() for detail.
+extern "C" int bochs_guest_key_poll();
+
 Bit32u bx_devices_c::inp(Bit16u port, unsigned) {
     if (port == 0xE7) return (Bit32u)(unsigned char)bochs_guest_getc();
+    if (port == 0xF5) return (Bit32u)(unsigned char)bochs_guest_key_poll();
+    if (port >= 0xF0 && port <= 0xF4) return (Bit32u)bochs_guest_mouse_field((int)(port - 0xF0));
     return 0xFFFF;
 }
 void   bx_devices_c::outp(Bit16u port, Bit32u val, unsigned) {
@@ -249,6 +268,13 @@ void   bx_devices_c::outp(Bit16u port, Bit32u val, unsigned) {
                     | (s_gfx_addr_bytes[2] << 16)
                     | (s_gfx_addr_bytes[3] << 24);
         bochs_guest_gfx_cmd(addr, (int)(val & 0xFF));
+    }
+    // Port 0xEF — mouse snapshot trigger (see bochs_guest_mouse_poll's
+    // banner comment above and in bochs_glue.cpp). Takes no address —
+    // the mouse state isn't guest memory, it's compositor state — so,
+    // unlike the disk/gfx mailboxes, there's nothing to latch first.
+    else if (port == 0xEF) {
+        bochs_guest_mouse_poll();
     }
     // All other ports are silently dropped.
 }

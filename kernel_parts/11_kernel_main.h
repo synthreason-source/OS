@@ -868,6 +868,17 @@ static SVGAResult vmware_svga_init(uint32_t w, uint32_t h) {
 }
 
 
+// Sticky click-edge latches for the guest mouse ABI (bochs_drivers.h's
+// mouse_poll()). Set in the main loop below whenever mouse_left_down /
+// mouse_right_down transitions from up to down; cleared only once
+// kernel_gfx_mouse_poll() (defined further down, called from
+// bochs_glue.cpp's bochs_guest_mouse_poll()) has actually reported the
+// click to whichever guest program is the focused window's own ELF
+// process. File scope (not a kernel_main local) because
+// kernel_gfx_mouse_poll() needs to reach them from outside the loop.
+static bool g_gfx_click_left_pending  = false;
+static bool g_gfx_click_right_pending = false;
+
 extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
 
     // ── Verify Multiboot 1 magic FIRST, before any hardware probing ───────────
@@ -1066,6 +1077,17 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
 
         bool leftClickedThisFrame  = (mouse_left_down  && !prev_left);
         bool rightClickedThisFrame = (mouse_right_down && !prev_right);
+
+        // Latch click edges for the guest mouse ABI (bochs_drivers.h's
+        // mouse_poll(), via kernel_gfx_mouse_poll() below). This loop
+        // runs every iteration, but tick_elf_processes() -- where a
+        // guest actually gets to poll -- only runs once every
+        // TICKS_PER_FRAME iterations, so a plain "clicked this frame"
+        // bool would often be gone again before any guest ever saw it.
+        // Sticky-until-consumed fixes that: set here, cleared only by
+        // kernel_gfx_mouse_poll() once it's actually been reported.
+        if (leftClickedThisFrame)  g_gfx_click_left_pending  = true;
+        if (rightClickedThisFrame) g_gfx_click_right_pending = true;
         bool mouse_moved = (mouse_x != prev_mouse_x || mouse_y != prev_mouse_y);
         bool key_pressed = (last_key_press != 0);
 
@@ -1163,6 +1185,45 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
 // C linkage so the linker resolves them without name-mangling.
 
 extern "C" {
+
+// Bridge for bochs_glue.cpp's bochs_guest_mouse_poll() (guest port
+// 0xEF, see bochs_drivers.h's mouse_poll()). Reports the compositor's
+// cursor to ELF slot `slot` ONLY if that slot's window is BOTH the
+// currently focused window AND showing a live gfx canvas the cursor
+// happens to be over — everything else (titlebar drags, clicks on
+// other windows, the desktop, the taskbar) is handled entirely by
+// WindowManager::handle_input() above and never touches this path at
+// all, which is what keeps those clicks going to the compositor only.
+// On any "no" (wrong/no slot, not focused, no window, not in gfx
+// mode, cursor outside the canvas) this leaves *out_x/*out_y/
+// *out_buttons at their caller-supplied zero and returns false — a
+// clean "cursor absent" snapshot rather than stale or foreign data.
+bool kernel_gfx_mouse_poll(int slot, int* out_x, int* out_y,
+                            unsigned char* out_buttons) {
+    if (slot < 0 || wm.get_focused_elf_slot() != slot) return false;
+
+    Window* win = wm.find_window_by_elf_slot(slot);
+    if (!win) return false;
+
+    int lx = 0, ly = 0;
+    bool in_win = win->gfx_hit_test(mouse_x, mouse_y, &lx, &ly);
+    if (in_win) {
+        *out_x = lx;
+        *out_y = ly;
+        *out_buttons |= 0x10; // MOUSE_BIT_IN_WINDOW (bochs_drivers.h)
+    }
+    if (mouse_left_down)  *out_buttons |= 0x01; // MOUSE_BIT_LEFT_DOWN
+    if (mouse_right_down) *out_buttons |= 0x02; // MOUSE_BIT_RIGHT_DOWN
+    if (g_gfx_click_left_pending) {
+        *out_buttons |= 0x04; // MOUSE_BIT_LEFT_CLICKED
+        g_gfx_click_left_pending = false;
+    }
+    if (g_gfx_click_right_pending) {
+        *out_buttons |= 0x08; // MOUSE_BIT_RIGHT_CLICKED
+        g_gfx_click_right_pending = false;
+    }
+    return true;
+}
 
 void tcc_bridge_console_print(const char* s) {
     console_print(s);

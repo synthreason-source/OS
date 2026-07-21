@@ -6,10 +6,6 @@ CTRL-Q saves and exits text editor...
 
 SATA port selection with 'disk_select'
 
-TODO: gfx.c demo, add mouse clicking to ELF executable windows and basic app compositor library.
-
-TODO: inspect 8.3 filenames in filesystem/TCC
-
 guest programs require bochs_drivers.h to interface with the OS.
 
 TODO: add ethernet, Lynx_(web_browser) & busybox

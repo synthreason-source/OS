@@ -1862,6 +1862,26 @@ public:
     int get_elf_slot() const override { return captured_elf_slot; }
     int get_taskbar_id() const override { return term_id; }
 
+    // Screen-space rect the guest's gfx canvas was actually drawn into
+    // on the most recent draw() call (see the "Guest graphics overlay"
+    // block below) — cached there every frame so the mouse ABI can
+    // convert screen coordinates to canvas-local ones without redoing
+    // the centre/clip math itself. gfx_rect_valid is false whenever
+    // this window isn't currently showing a live gfx frame (text mode,
+    // editor, or no guest gfx frame present at all).
+    int  gfx_rect_x = 0, gfx_rect_y = 0, gfx_rect_w = 0, gfx_rect_h = 0;
+    bool gfx_rect_valid = false;
+
+    bool gfx_hit_test(int mx, int my, int* local_x, int* local_y) const override {
+        if (!gfx_rect_valid) return false;
+        int lx = mx - gfx_rect_x;
+        int ly = my - gfx_rect_y;
+        if (lx < 0 || ly < 0 || lx >= gfx_rect_w || ly >= gfx_rect_h) return false;
+        *local_x = lx;
+        *local_y = ly;
+        return true;
+    }
+
     void close() override {
         // If this window owned the Bochs self-test overlay, relinquish it
         // so g_test_overlay_owner never dangles after we are deleted.
@@ -2027,7 +2047,18 @@ public:
                 put_pixel_back(off_x + col, py, src_row[col]);
             }
         }
+
+        // Publish this frame's canvas rect for the mouse ABI (see
+        // gfx_hit_test() above) — kernel_gfx_mouse_poll() reads these
+        // every time a guest polls, so they must stay in lockstep with
+        // where the canvas was actually just blitted on screen.
+        gfx_rect_x = off_x;
+        gfx_rect_y = off_y;
+        gfx_rect_w = draw_w;
+        gfx_rect_h = draw_h;
+        gfx_rect_valid = (draw_w > 0 && draw_h > 0);
     } else {
+        gfx_rect_valid = false;
     // How many 10px text lines actually fit between the content-area
     // top (y + 30 + overlay_dy) and the window's bottom border (y + h).
     // The old code hard-coded `i < 38`, which — combined with the test
@@ -2050,6 +2081,7 @@ public:
     }
     }
 } else {
+    gfx_rect_valid = false;  // editor mode never shows a guest gfx canvas
     for (int row = 0; row < EDIT_ROWS; ++row) {
         int line_idx = edit_scroll_offset + row;
         int y_line = y + 30 + row * EDIT_LINE_PIX;

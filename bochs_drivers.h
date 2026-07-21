@@ -1,4 +1,5 @@
 /* bochs_drivers.h — guest ABI for in-kernel TCC programs */
+#pragma once
 
 /* port I/O helpers */
 static inline void outb(unsigned short port, unsigned char val)
@@ -229,3 +230,97 @@ static inline void gfx_present(void) { gfx_present_buf(gfx_framebuffer); }
  * text (kputs/kputc) in this window. Not required before exiting —
  * the kernel drops the frame automatically when the program ends. */
 static inline void gfx_exit(void) { outb(GFX_PORT_CMD, GFX_CMD_CLEAR); }
+
+/* ── mouse ABI: the compositor's shared cursor, relayed into this
+ * program's own gfx canvas ───────────────────────────────────────────
+ *
+ * The kernel's window manager (the "compositor") owns the ONE system
+ * cursor and ALWAYS handles clicks on titlebars, the close/minimize
+ * buttons, other windows, desktop icons, and the taskbar itself —
+ * none of that ever reaches a guest program, with or without this
+ * ABI. What this adds is a read-only, per-frame snapshot of where
+ * that cursor is *relative to this program's own gfx_present() canvas*
+ * and what it's doing there, but ONLY while this program's window is
+ * the focused one. Click somewhere else (another window, the desktop,
+ * the titlebar) and control simply goes back to the compositor as
+ * normal — mouse_poll() will just report in_window == 0 here, the
+ * same as if the cursor had never entered the canvas at all.
+ *
+ * Usage (typical per-frame GUI loop):
+ *     for (;;) {
+ *         mouse_state_t ms;
+ *         mouse_poll(&ms);
+ *         gfx_clear(0x202020);
+ *         if (ms.in_window && ms.left_clicked && hit_test(ms.x, ms.y))
+ *             ...button pressed...
+ *         gfx_present();
+ *     }
+ *
+ * Protocol: `out al, 0xEF` takes one snapshot of the cursor (and
+ * consumes/latches any button-down transition since the previous
+ * snapshot, so a fast click between two frames is never lost); the
+ * five fields are then read back with individual `in al, 0xF0..0xF4`
+ * byte reads. Like the disk/gfx mailboxes, this is synchronous — the
+ * snapshot is already complete by the time the triggering OUT
+ * returns, so the follow-up reads always see a consistent frame.
+ */
+
+#define INPUT_PORT_POLL     0xEF   /* out: take a cursor snapshot     */
+#define INPUT_PORT_MX_LO    0xF0   /* in:  canvas-local X, low byte   */
+#define INPUT_PORT_MX_HI    0xF1   /* in:  canvas-local X, high byte  */
+#define INPUT_PORT_MY_LO    0xF2   /* in:  canvas-local Y, low byte   */
+#define INPUT_PORT_MY_HI    0xF3   /* in:  canvas-local Y, high byte  */
+#define INPUT_PORT_BUTTONS  0xF4   /* in:  button/focus bitfield      */
+
+#define MOUSE_BIT_LEFT_DOWN     0x01  /* left button currently held           */
+#define MOUSE_BIT_RIGHT_DOWN    0x02  /* right button currently held          */
+#define MOUSE_BIT_LEFT_CLICKED  0x04  /* left button went down since last poll (one-shot) */
+#define MOUSE_BIT_RIGHT_CLICKED 0x08  /* right button went down since last poll (one-shot) */
+#define MOUSE_BIT_IN_WINDOW     0x10  /* this window is focused AND the cursor is over the canvas */
+
+typedef struct {
+    int x, y;                    /* canvas-local pixel coords (same space as gfx_set_pixel); only meaningful when in_window */
+    unsigned char left_down;
+    unsigned char right_down;
+    unsigned char left_clicked;  /* one-shot edge: true only on the poll where the button transitioned down */
+    unsigned char right_clicked; /* one-shot edge, same as above                                            */
+    unsigned char in_window;     /* 0 if this window isn't focused, or the cursor is outside the canvas     */
+} mouse_state_t;
+
+static inline void mouse_poll(mouse_state_t *ms)
+{
+    outb(INPUT_PORT_POLL, 1);
+    unsigned mx = (unsigned)inb(INPUT_PORT_MX_LO) | ((unsigned)inb(INPUT_PORT_MX_HI) << 8);
+    unsigned my = (unsigned)inb(INPUT_PORT_MY_LO) | ((unsigned)inb(INPUT_PORT_MY_HI) << 8);
+    unsigned char btn = inb(INPUT_PORT_BUTTONS);
+
+    ms->x            = (int)mx;
+    ms->y             = (int)my;
+    ms->left_down     = (btn & MOUSE_BIT_LEFT_DOWN)    ? 1 : 0;
+    ms->right_down    = (btn & MOUSE_BIT_RIGHT_DOWN)   ? 1 : 0;
+    ms->left_clicked  = (btn & MOUSE_BIT_LEFT_CLICKED) ? 1 : 0;
+    ms->right_clicked = (btn & MOUSE_BIT_RIGHT_CLICKED)? 1 : 0;
+    ms->in_window     = (btn & MOUSE_BIT_IN_WINDOW)    ? 1 : 0;
+}
+
+/* Non-printable key sentinels — mirrors kernel_parts/03_input_ps2_mouse.h's
+ * KEY_* constants exactly (arrow keys, delete, home, end have no ASCII
+ * representation, so the kernel encodes them as small negative values
+ * before queuing). A guest sees these via getch()/key_poll() the same
+ * way it sees any other queued character. */
+#define KEY_UP     -1
+#define KEY_DOWN   -2
+#define KEY_LEFT   -3
+#define KEY_RIGHT  -4
+#define KEY_DELETE -5
+#define KEY_HOME   -6
+#define KEY_END    -7
+
+/* Non-blocking keystroke peek (port 0xF5, NOT the same as getch's
+ * 0xE7). Returns 0 immediately when the queue is empty, or the next
+ * character/KEY_* code when one is waiting. Unlike getch() / port
+ * 0xE7, this does NOT set wants_input and therefore does NOT cause the
+ * kernel's tick loop to pause this slot until a key arrives — which
+ * would starve mouse_poll() and gfx_present() in a GUI frame loop.
+ * Safe to call once per frame alongside mouse_poll(). */
+static inline int key_poll(void) { return (int)(signed char)inb(0xF5); }

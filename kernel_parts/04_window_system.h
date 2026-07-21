@@ -94,6 +94,15 @@ public:
     virtual void update() = 0;
     virtual void console_print(const char* s) {}
     virtual int  get_elf_slot() const { return -1; }  // overridden by TerminalWindow
+    // Is (mx, my) — screen coordinates — inside this window's live gfx
+    // canvas (see bochs_drivers.h's gfx_present())? If so, fills
+    // *local_x/*local_y with the position in the guest's own
+    // gfx_set_pixel() coordinate space and returns true. Base
+    // implementation is "never" — only TerminalWindow, and only while
+    // it's actually showing a guest gfx frame, overrides this. Used by
+    // kernel_gfx_mouse_poll() (kernel_parts/11_kernel_main.h) to relay
+    // the compositor's cursor into a guest program via the mouse ABI.
+    virtual bool gfx_hit_test(int mx, int my, int* local_x, int* local_y) const { return false; }
     // Stable per-window ID used for taskbar buttons (overridden by
     // TerminalWindow). -1 means "doesn't get a taskbar button".
     virtual int  get_taskbar_id() const { return -1; }
@@ -218,6 +227,19 @@ void load_desktop_items() {
     int get_focused_elf_slot() const {
         if (focused_idx < 0 || focused_idx >= num_windows) return -1;
         return windows[focused_idx]->get_elf_slot();
+    }
+
+    // Which window (if any) currently has ELF slot `slot` captured —
+    // regardless of focus. Used by kernel_gfx_mouse_poll() to find the
+    // TerminalWindow whose gfx canvas to hit-test against; it separately
+    // checks get_focused_elf_slot() itself so unfocused windows never
+    // get cursor data even though this lookup would find them.
+    Window* find_window_by_elf_slot(int slot) {
+        if (slot < 0) return nullptr;
+        for (int i = 0; i < num_windows; i++) {
+            if (windows[i]->get_elf_slot() == slot) return windows[i];
+        }
+        return nullptr;
     }
 
     void cleanup_closed_windows() {

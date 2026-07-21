@@ -174,3 +174,86 @@ yields every ~10-15 instructions. Give it a moment — the demo prints a
 "starting..." message via `kputs` immediately, before it ever touches
 graphics, so you can confirm it launched even before the first frame
 appears.
+
+### Mouse: reading the compositor's cursor into your gfx canvas
+
+A gfx-mode program can also poll the desktop's one shared mouse
+cursor — but only while its own window is the FOCUSED one. Click a
+titlebar, another window, the desktop, or the taskbar and that's
+handled entirely by the window manager (the "compositor") as normal;
+none of it ever reaches a guest program, with or without this ABI.
+
+```c
+#include "bochs_drivers.h"
+
+void _start(void) {
+    for (;;) {
+        mouse_state_t ms;
+        mouse_poll(&ms);          // synchronous, always safe to call every frame
+
+        gfx_clear(0x202020);
+        if (ms.in_window) {
+            gfx_set_pixel(ms.x, ms.y, 0xFFFFFF);   // draw a dot at the cursor
+            if (ms.left_clicked) { /* ... */ }
+        }
+        gfx_present();
+    }
+}
+```
+
+- `mouse_state_t.x`/`.y` are in the SAME coordinate space as
+  `gfx_set_pixel()` — 0..319, 0..199 — already converted from screen
+  coordinates, already accounting for however the window is
+  positioned/sized/centred on screen.
+- `.left_clicked`/`.right_clicked` are one-shot edges: true only on
+  the very next `mouse_poll()` after the button went down, even if
+  that poll happens on a later frame than the actual click (the
+  kernel latches it so a fast click between two frames is never
+  dropped).
+- `.in_window` is 0 whenever this window isn't focused, or the cursor
+  is simply outside the canvas — check it before trusting `.x`/`.y`.
+- `key_poll()` is `getch()`'s non-blocking sibling: returns 0
+  immediately if nothing's queued (instead of spinning), which is
+  what a per-frame GUI loop needs alongside `mouse_poll()`.
+
+### compositor.h: buttons, a scrollbar, and a text box
+
+`compositor.h` is a small GUI widget library built on top of the gfx +
+mouse ABI above — buttons, a vertical scrollbar, and a single-line
+text box, all driven by `mouse_poll()`/`key_poll()` under the hood so
+individual programs don't have to hand-roll hit-testing and drag
+state themselves. See `gui_demo.c` for a complete example:
+
+```bash
+make cc SRC=gui_demo.c
+# in the OS shell:
+gui_demo
+```
+
+```c
+#include "bochs_drivers.h"
+#include "compositor.h"
+
+static ui_button_t quit_btn = { 10, 10, 60, 20, "Quit" };
+
+void _start(void) {
+    for (;;) {
+        ui_frame_t f;
+        ui_frame_begin(&f, UI_COLOR_BG);   // polls mouse+key, clears the canvas
+
+        if (ui_button(&f, &quit_btn)) break;
+
+        ui_frame_end();                    // gfx_present()
+    }
+    gfx_exit();
+    kexit(0);
+}
+```
+
+Widget state (scrollbar drag, text box contents/focus) lives in plain
+structs the caller owns — usually file-scope `static` — the same
+"no hidden state" style as the rest of this ABI. `compositor.h`
+`#include`s `bochs_drivers.h` and `font.h` itself, so a program only
+needs both headers present (`make cc` syncs all three onto `disk.img`
+automatically, the same way it already does for `bochs_drivers.h`
+alone).

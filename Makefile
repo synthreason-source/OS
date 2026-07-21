@@ -313,6 +313,11 @@ endif
 	@# existed, or one where the file is already current, never blocks a
 	@# compile over this best-effort sync step.
 	@MTOOLS_SKIP_CHECK=1 mcopy -o -i "$(DISK_IMG)" "bochs_drivers.h" "::bochs_drivers.h" 2>/dev/null || true
+	@# compositor.h (the GUI widget library) #includes both of these,
+	@# so any guest program using it from the in-kernel `cc` command
+	@# needs all three present on disk.img -- same best-effort sync.
+	@MTOOLS_SKIP_CHECK=1 mcopy -o -i "$(DISK_IMG)" "font.h" "::font.h" 2>/dev/null || true
+	@MTOOLS_SKIP_CHECK=1 mcopy -o -i "$(DISK_IMG)" "compositor.h" "::compositor.h" 2>/dev/null || true
 	./$(TCC_TOOL) "$(DISK_IMG)" "$(SRC)" "$(OUT)" "tcc_guest.ld"
 	@echo ">>> Done. Boot the OS and type '$(or $(OUT),$(basename $(notdir $(SRC))))' to run it."
 
