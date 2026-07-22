@@ -1757,6 +1757,20 @@ extern "C" void bochs_guest_gfx_cmd(unsigned int mbox_addr, int cmd) {
     gs.width  = GFX_MAX_W;
     gs.height = GFX_MAX_H;
     gs.active = true;
+
+    // Yield back to the kernel main loop so it can repaint the canvas
+    // and service mouse/input before the guest starts its next frame.
+    //
+    // Without this, cpu_loop() never returns between frames: none of
+    // the mouse/key/gfx port handlers set kill_bochs_request, so a
+    // tight for(;;){...gfx_present();} loop runs indefinitely inside
+    // cpu_loop(), starving the kernel's repaint and input polling and
+    // making the whole system appear frozen. This is the same mechanism
+    // bochs_guest_exit() uses to cleanly hand control back to the main
+    // loop. One yield per gfx_present() = one kernel repaint per guest
+    // frame, which is exactly the frame-pacing we want anyway.
+    BX_CPU(0)->kill_bochs_request = 1;
+    BX_CPU(0)->async_event        = 1;
 }
 
 // Called from bochs_release_slot()/bochs_reset_all_slots() so a stale
@@ -1906,19 +1920,19 @@ extern "C" int bochs_cpu_tick(int n) {
 
     // NOTE (Bochs 2.0 port): this version's cpu_loop(Bit32s
     // max_instr_count) takes the instruction budget as a direct
-    // argument and internally loops, executing guest instructions
-    // until either max_instr_count is reached or something sets
-    // kill_bochs_request (our outp() handler does this via
-    // bochs_guest_exit()/bochs_guest_putc() on port 0xE8/0xE9) - it
-    // returns to us either way. There's no get_icount() in this
-    // version to measure exactly how many instructions actually ran,
-    // so the old "poll icount, loop calling cpu_loop() with the
-    // remaining budget" pattern doesn't have anywhere to plug in the
-    // "elapsed" half of that comparison. A single call with the full
-    // budget is the direct equivalent: cpu_loop() already handles the
-    // internal yield/resume via kill_bochs_request exactly the way
-    // the old outer while-loop assumed each individual cpu_loop() call
-    // would.
+    // argument but in practice exits on kill_bochs_request, NOT on
+    // the instruction count alone. Callers must ensure at least one
+    // kill_bochs_request yield happens within the budget window, or
+    // cpu_loop() will run until the guest program exits. The
+    // established yield points are:
+    //   • port 0xE8 (bochs_guest_exit)    — program exit
+    //   • port 0xE7 (bochs_guest_getc)    — getch() when queue empty
+    //   • port 0xEE/GFX_CMD_PRESENT       — gfx_present() frame end
+    // gfx programs MUST call gfx_present() (or getch()/exit()) at
+    // least once per loop to avoid blocking the kernel main loop.
+    // A single cpu_loop() call with the full budget is the direct
+    // equivalent of the old outer-loop design: it runs until the
+    // guest hits one of those yield points, at which point it returns.
     // Budget multiplier: how many guest instructions one unit of
     // "steps" (as passed to bochs_cpu_tick/tick_elf_processes) buys.
     // 256 was tuned for chatty, port-IO-heavy guests (e.g. putc-based
