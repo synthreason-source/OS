@@ -42,7 +42,7 @@
  * separate buffer to manage.
  */
 #pragma once
-#include "bochs_drivers.h"
+#include "drivers.h"
 #include "font.h"
 
 /* ── palette ──────────────────────────────────────────────────────── */
