@@ -182,8 +182,8 @@ static inline int kfstat(const char *filename, unsigned int *size_out)
  * next frame into the same buffer immediately afterward.
  */
 
-#define GFX_WIDTH  320
-#define GFX_HEIGHT 200
+#define GFX_WIDTH  480
+#define GFX_HEIGHT 320
 
 #define GFX_PORT_ADDR0 0xEA
 #define GFX_PORT_ADDR1 0xEB
