@@ -7,7 +7,8 @@ CTRL-Q saves and exits text editor...
 SATA port selection with 'disk_select'
 
 guest programs require bochs_drivers.h to interface with the OS.
-TODO, fix 8.3 filename extension misplacement
+TODO: fix 8.3 filename extension misplacement
+TODO: resizable windows with renamable titles(in code).
 TODO: add ethernet, Lynx_(web_browser) & busybox
 
 # Build Instructions
