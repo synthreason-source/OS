@@ -6,7 +6,7 @@ CTRL-Q saves and exits text editor...
 
 SATA port selection with 'disk_select'
 
-guest programs require bochs_drivers.h to interface with the OS.
+guest programs require drivers.h and comp.h to interface with the OS.
 
 TODO: fix 8.3 filename extension misplacement
 
