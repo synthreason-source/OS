@@ -8,10 +8,6 @@ SATA port selection with 'disk_select'
 
 guest programs require drivers.h and comp.h to interface with the OS.
 
-TODO: fix 8.3 filename extension misplacement
-
-TODO: resizable windows with renamable titles(in code).
-
 TODO: add ethernet, Lynx_(web_browser) & busybox
 
 # Build Instructions
@@ -51,21 +47,12 @@ make tcc-clean        # removes tcc-local/, tcc-src/, tcc-mob.tar.gz
 
 ---
 
-## Bochs test
-
-```bash
-sudo make test_main
-qemu-system-i386 -cdrom test_main.iso -m 256 -debugcon stdio -no-reboot -no-shutdown
-```
-
----
-
 ## Full kernel build
 
 ```bash
 make clean
 rm -rf bochs-2.0 bochs-2.0-src.tar.gz tcc-src tcc-local i386-libtcc-kern.a i386-libtcc.a
-make world
+make
 ```
 
 Run in QEMU:
