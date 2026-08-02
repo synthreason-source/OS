@@ -344,7 +344,7 @@ endif
 	@# needs all three present on disk.img -- same best-effort sync.
 	@MTOOLS_SKIP_CHECK=1 mcopy -o -i "$(DISK_IMG)" "font.h" "::font.h" 2>/dev/null || true
 	@MTOOLS_SKIP_CHECK=1 mcopy -o -i "$(DISK_IMG)" "comp.h" "::comp.h" 2>/dev/null || true
-	./$(TCC_TOOL) "$(DISK_IMG)" "$(SRC)" "$(OUT)" "tcc_guest.ld"
+	./$(TCC_TOOL) "$(DISK_IMG)" "$(SRC)" "$(OUT)" "tcc_guest.ld" -I ../
 	@echo ">>> Done. Boot the OS and type '$(or $(OUT),$(basename $(notdir $(SRC))))' to run it."
 
 # ============================================================

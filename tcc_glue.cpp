@@ -107,22 +107,56 @@ static int do_compile(const char* src_host, const char* obj_host,
     char cmd[4096];
 
     // Step 1: i386-tcc -c  →  .o
+    //
+    // -I. : src_host lives alone in a freshly mkdtemp'd staging dir (only
+    // src.c is ever copied there — see tcc_glue_compile), so tcc's default
+    // "search the source file's own directory first" rule finds nothing.
+    // Guest programs commonly #include "comp.h" / "font.h" /
+    // "bochs_drivers.h", which live in the project base dir instead. This
+    // process never chdir()s, so its cwd is still wherever tcc_tool was
+    // launched from (the base dir, per the Makefile's `./$(TCC_TOOL) ...`),
+    // so "-I." lets tcc fall through to those headers there.
     snprintf(cmd, sizeof(cmd),
-        "i386-tcc -c -nostdlib -o '%s' '%s'",
+        "i386-tcc -c -nostdlib -I. -o '%s' '%s'",
         obj_host, src_host);
     if (run_cmd(cmd, errbuf, elen) != 0) {
         err_append(errbuf, elen, "tcc: compilation failed\n");
         return -1;
     }
 
-    // Confirm the object is i386.
+    // Confirm the object is i386 (ELF e_machine == EM_386).
+    //
+    // Previously shelled out to `file '%s' | grep -q 'Intel 80386'`, which
+    // is fragile: it fails identically (system() returns nonzero either
+    // way) whether the object is genuinely the wrong arch OR `file` simply
+    // isn't installed on this machine, OR its libmagic version phrases the
+    // description differently ("80386" without "Intel", different word
+    // order, etc — this text isn't stable across distros/versions). Read
+    // the ELF header directly instead: e_machine lives at offset 18-19
+    // (little-endian u16), and EM_386 is value 3. No external tools, no
+    // text-matching, so this can't produce a false "not installed?" verdict
+    // for reasons unrelated to i386-tcc actually being present.
     {
-        char check[512];
-        snprintf(check, sizeof(check),
-            "file '%s' | grep -q 'Intel 80386'", obj_host);
-        if (system(check) != 0) {  // NOLINT
+        FILE* of = fopen(obj_host, "rb");
+        if (!of) {
             err_append(errbuf, elen,
-                "tcc: object is not 32-bit i386 — is i386-tcc installed?\n");
+                "tcc: could not open compiled object '%s' for verification\n",
+                obj_host);
+            return -1;
+        }
+        unsigned char hdr[20];
+        size_t got = fread(hdr, 1, sizeof(hdr), of);
+        fclose(of);
+
+        bool is_elf = (got == sizeof(hdr) &&
+                       hdr[0] == 0x7F && hdr[1] == 'E' &&
+                       hdr[2] == 'L'  && hdr[3] == 'F');
+        unsigned short e_machine = is_elf ? (unsigned short)(hdr[18] | (hdr[19] << 8)) : 0;
+
+        if (!is_elf || e_machine != 3 /* EM_386 */) {
+            err_append(errbuf, elen,
+                "tcc: object is not 32-bit i386 (e_machine=%u) — is i386-tcc installed?\n",
+                e_machine);
             return -1;
         }
     }
