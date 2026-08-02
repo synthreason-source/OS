@@ -2125,16 +2125,68 @@ public:
     int visible_rows = (h - content_top) / 10;
     if (visible_rows < 1) visible_rows = 1;
 
-    // When the buffer holds more lines than fit, show the most recent
-    // ones (tail) rather than the oldest (head) — otherwise fresh guest
-    // output scrolls off the bottom and stale text stays pinned at top.
-    int first = line_count - visible_rows;
-    if (first < 0) first = 0;
+    // ── Auto text rewrap ─────────────────────────────────────────────
+    // buffer[] lines were already word-wrapped once, at whatever width
+    // the window happened to be when each line was printed/typed (see
+    // term_cols_cont()/push_wrapped_text() above). That's fine until
+    // the window is resized afterward — a line wrapped for a wide
+    // window then just runs past the border of a narrower one. Rather
+    // than only fixing that going forward, re-flow EVERY visible
+    // buffer[] line against the window's width right here, every
+    // frame, so already-printed text reflows live as the resize grip
+    // is dragged, the same way the guest gfx canvas above rescales
+    // live. (One inherent limit: buffer[] only stores rendered text,
+    // not which line breaks were real newlines vs. earlier wrap
+    // points, so widening the window back out can't rejoin a line
+    // that a previous, narrower wrap already split across rows —
+    // it can only re-split, never re-merge.)
+    int chars_per_line = (w - 10) / 8;
+    if (chars_per_line < 8) chars_per_line = 8;
+    if (chars_per_line > 118) chars_per_line = 118; // matches term_cols_cont()'s cap
 
-    for (int i = first; i < line_count; i++) {
-        int screen_row = i - first;
-        draw_string(buffer[i], x + 5, y + content_top + screen_row * 10,
-                    ColorPalette::TEXT_WHITE);
+    // Walk backward from the newest logical line to find where the
+    // last `visible_rows` WRAPPED screen rows begin: which logical
+    // line to start from, and how many of ITS wrapped chunks to skip
+    // (since only the tail of that line's wrap may be on screen).
+    int start_line = 0, skip_chunks = 0;
+    {
+        int collected = 0;
+        bool found = false;
+        for (int i = line_count - 1; i >= 0; --i) {
+            int len = (int)strlen(buffer[i]);
+            int chunks = (len == 0) ? 1 : (len + chars_per_line - 1) / chars_per_line;
+            if (collected + chunks >= visible_rows) {
+                start_line   = i;
+                skip_chunks  = (collected + chunks) - visible_rows;
+                found = true;
+                break;
+            }
+            collected += chunks;
+        }
+        if (!found) { start_line = 0; skip_chunks = 0; }
+    }
+
+    // Render forward from start_line, splitting each logical line into
+    // chars_per_line-wide chunks, skipping skip_chunks of the first
+    // line, until the content area is full.
+    int screen_row = 0;
+    for (int i = start_line; i < line_count && screen_row < visible_rows; ++i) {
+        const char* line = buffer[i];
+        int len = (int)strlen(line);
+        int chunks = (len == 0) ? 1 : (len + chars_per_line - 1) / chars_per_line;
+        int chunk_start = (i == start_line) ? skip_chunks : 0;
+        for (int c = chunk_start; c < chunks && screen_row < visible_rows; ++c) {
+            char seg[TERM_WIDTH];
+            int off  = c * chars_per_line;
+            int slen = len - off;
+            if (slen > chars_per_line) slen = chars_per_line;
+            if (slen < 0) slen = 0;
+            for (int k = 0; k < slen; ++k) seg[k] = line[off + k];
+            seg[slen] = '\0';
+            draw_string(seg, x + 5, y + content_top + screen_row * 10,
+                        ColorPalette::TEXT_WHITE);
+            screen_row++;
+        }
     }
     }
 } else {
