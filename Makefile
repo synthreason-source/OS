@@ -284,6 +284,28 @@ ifndef OUT
 OUT :=
 endif
 
+# FIX ("make cc SRC=x.c usage" not actually enforced): the ifndef SRC
+# check that used to live only inside the cc/tcc recipe body (further
+# down) never actually protected anyone from forgetting SRC=. Make
+# always builds a target's PREREQUISITES before running its own recipe
+# -- and cc/tcc depend on $(TCC_TOOL), which on a fresh checkout means
+# downloading and building the entire TCC toolchain from source first.
+# So a plain `make cc` (SRC= forgotten, or just explored out of
+# curiosity) didn't fail fast with the usage message at all: it silently
+# kicked off a multi-minute, network-dependent TCC build, and the
+# "Usage: make cc SRC=<file.c>" text only had a chance to print
+# afterward, once prerequisites finally finished.
+#
+# Check at PARSE time instead, gated on $(MAKECMDGOALS) so it only
+# fires when cc/tcc is actually the goal being run (make all/world/
+# clean/etc. don't touch SRC and are unaffected). $(error ...) halts
+# immediately, before make even looks at $(TCC_TOOL)/$(DISK_IMG).
+ifneq ($(filter cc tcc,$(MAKECMDGOALS)),)
+ifeq ($(strip $(SRC)),)
+$(error Usage: make cc SRC=<file.c> [OUT=<name>]. Compiles SRC to a 32-bit ELF and writes it to $(DISK_IMG))
+endif
+endif
+
 # Ensure i386-tcc is on PATH from the local build.
 export PATH := $(CURDIR)/$(TCC_LOCAL)/bin:$(PATH)
 
@@ -296,6 +318,10 @@ cc tcc: $(TCC_TOOL) $(DISK_IMG) tcc_guest.ld
 	    echo ""; \
 	    exit 1; \
 	fi
+	@# Redundant safety net -- the real guard is the parse-time $(error)
+	@# above, which now stops SRC-less invocations before prerequisites
+	@# are even considered. This is just defense in depth in case SRC
+	@# somehow ends up set-but-blank by the time the recipe runs.
 ifndef SRC
 	@echo "Usage: make cc SRC=<file.c> [OUT=<name>]"
 	@echo "  Compiles SRC to a 32-bit ELF and writes it to $(DISK_IMG)."
@@ -317,7 +343,7 @@ endif
 	@# so any guest program using it from the in-kernel `cc` command
 	@# needs all three present on disk.img -- same best-effort sync.
 	@MTOOLS_SKIP_CHECK=1 mcopy -o -i "$(DISK_IMG)" "font.h" "::font.h" 2>/dev/null || true
-	@MTOOLS_SKIP_CHECK=1 mcopy -o -i "$(DISK_IMG)" "compositor.h" "::compositor.h" 2>/dev/null || true
+	@MTOOLS_SKIP_CHECK=1 mcopy -o -i "$(DISK_IMG)" "comp.h" "::comp.h" 2>/dev/null || true
 	./$(TCC_TOOL) "$(DISK_IMG)" "$(SRC)" "$(OUT)" "tcc_guest.ld"
 	@echo ">>> Done. Boot the OS and type '$(or $(OUT),$(basename $(notdir $(SRC))))' to run it."
 

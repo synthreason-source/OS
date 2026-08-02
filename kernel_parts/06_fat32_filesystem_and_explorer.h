@@ -1047,12 +1047,405 @@ void fat32_list_files() {
     }
     delete[] buffer;
 }
+
+// ── LFN-aware directory entry creation ──────────────────────────────────
+//
+// BUG THIS SECTION FIXES ("filesystem > 8.3 misplacement"):
+// fat32_write_file() used to build ONLY an 8.3 short-name entry via
+// to_83_format() -- a naive first-8-chars/first-3-chars truncation with
+// NO collision numbering and NO accompanying long-file-name (LFN)
+// entries. fat32_find_entry() (used by ls/cd/cat/the Explorer/etc.) is
+// already LFN-aware and correctly resolves real VFAT LFN chains (e.g.
+// ones mtools writes when the Makefile injects a file) -- but any file
+// the KERNEL itself created or renamed with a name that didn't fit
+// cleanly in 8.3 got silently stored under a mangled short name with no
+// LFN pointing back to what was actually typed. Symptoms: saving a
+// file called "my_long_filename.txt" (or `cc`'s in-kernel output, or `mv` to a long
+// name) appears to succeed, but the file then shows up in `ls`/Explorer
+// under a garbled 8.3 name instead, and re-opening it by the name you
+// actually gave it fails ("not found") -- the file is, in effect,
+// misplaced under a name nobody asked for. Worse, two different long
+// names sharing the same 8-char prefix (e.g. "long_name_a.txt" and
+// "long_name_b.txt") both truncated to the SAME short name, so writing
+// the second silently created a duplicate/colliding short entry instead
+// of a distinct file.
+//
+// Fix: names that already fit 8.3 exactly (short, uppercase, single
+// dot, no spaces) are stored exactly as before -- untouched, byte-for-
+// byte compatible with every already-written disk image. Names that
+// don't get a real LFN chain (Windows/mtools-style "first 6 chars +
+// ~N" numeric-tail short name, collision-checked against the directory)
+// immediately followed by the short entry, which is exactly the layout
+// fat32_find_entry()'s existing LFN reader already expects.
+
+// True if `filename` can be stored as a short entry with NO LFN chain
+// needed: <=8 char base, <=3 char extension, exactly one dot (or none),
+// no spaces, and no lowercase letters (lowercase would silently become
+// uppercase on read-back without an LFN entry to preserve the real
+// casing -- see from_83_format()/to_83_format() above).
+static bool fat_short_name_fits_exactly(const char* filename) {
+    int i = 0, base_len = 0;
+    while (filename[i] && filename[i] != '.') {
+        char c = filename[i];
+        if (c == ' ' || (c >= 'a' && c <= 'z')) return false;
+        base_len++; i++;
+    }
+    if (base_len == 0 || base_len > 8) return false;
+    if (filename[i] == '.') {
+        i++;
+        int ext_len = 0;
+        while (filename[i]) {
+            char c = filename[i];
+            if (c == '.' || c == ' ' || (c >= 'a' && c <= 'z')) return false;
+            ext_len++; i++;
+        }
+        if (ext_len == 0 || ext_len > 3) return false;
+    }
+    return true;
+}
+
+// True if an 11-byte space-padded short name already exists anywhere in
+// dir_cluster's chain (LFN entries are skipped -- they aren't short
+// names). Used by fat_generate_short_name() below to pick a numeric
+// tail that doesn't collide with an existing file.
+static bool fat_short_name_exists(const char cand83[11], uint32_t dir_cluster) {
+    uint8_t* dir_buf = new uint8_t[SECTOR_SIZE];
+    uint32_t cluster = dir_cluster;
+    bool found = false;
+    while (!found && cluster >= 2 && cluster < FAT_END_OF_CHAIN) {
+        for (uint8_t s = 0; s < bpb.sec_per_clus && !found; s++) {
+            uint64_t sector_lba = cluster_to_lba(cluster) + s;
+            if (read_write_sectors(g_ahci_port, sector_lba, 1, false, dir_buf) != 0) continue;
+            for (uint16_t e = 0; e < SECTOR_SIZE / sizeof(fat_dir_entry_t); e++) {
+                fat_dir_entry_t* entry = (fat_dir_entry_t*)(dir_buf + e * sizeof(fat_dir_entry_t));
+                if (entry->name[0] == 0x00) break;
+                if ((uint8_t)entry->name[0] == DELETED_ENTRY) continue;
+                if (entry->attr == ATTR_LONG_NAME) continue;
+                if (memcmp(entry->name, cand83, 11) == 0) { found = true; break; }
+            }
+        }
+        cluster = read_fat_entry(cluster);
+    }
+    delete[] dir_buf;
+    return found;
+}
+
+// Builds a unique 8.3 short name for a `filename` that doesn't fit 8.3
+// exactly, using the standard "first N valid chars + ~digit" numeric
+// tail scheme (mirrors what mtools/Windows generate), checked against
+// the directory so two names with the same prefix never collide.
+static void fat_generate_short_name(const char* filename, uint32_t dir_cluster, char out83[11]) {
+    char base[9] = {0}, ext[4] = {0};
+    int i = 0, bi = 0;
+    while (filename[i] && filename[i] != '.' && bi < 8) {
+        char c = filename[i++];
+        if (c == ' ') continue;
+        base[bi++] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;
+    }
+    if (bi == 0) { base[0] = '_'; bi = 1; } // pathological "leading dot" guard
+    while (filename[i] && filename[i] != '.') i++;
+    if (filename[i] == '.') {
+        i++;
+        int ei = 0;
+        while (filename[i] && ei < 3) {
+            char c = filename[i++];
+            if (c == ' ') continue;
+            ext[ei++] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;
+        }
+    }
+    int ext_len = (int)strlen(ext);
+
+    for (int n = 1; n <= 999999; n++) {
+        char tail[8];
+        int tail_len = snprintf(tail, sizeof(tail), "~%d", n);
+        int keep = 8 - tail_len;
+        if (keep > bi) keep = bi;
+        if (keep < 1) keep = 1;
+
+        char cand[11];
+        memset(cand, ' ', 11);
+        memcpy(cand, base, keep);
+        memcpy(cand + keep, tail, tail_len);
+        memcpy(cand + 8, ext, ext_len);
+
+        if (!fat_short_name_exists(cand, dir_cluster)) {
+            memcpy(out83, cand, 11);
+            return;
+        }
+    }
+    to_83_format(filename, out83); // astronomically unlikely fallback
+}
+
+// Fills `total_slots` consecutive on-disk directory entries starting at
+// `out` with an LFN chain (if lfn_count > 0) followed by the short
+// entry. `out` need not be sector-aligned: callers point it at an
+// arbitrary in-buffer offset, including into a scratch buffer that
+// later gets split across two clusters (see fat_write_directory_entry
+// below, the cluster-boundary-straddling case).
+static void fat_build_entry_sequence(uint8_t* out, const char* filename, int name_len,
+                                      bool need_lfn, int lfn_count, uint8_t checksum,
+                                      const char short83[11],
+                                      uint32_t first_data_cluster, uint32_t size) {
+    int slot = 0;
+    if (need_lfn) {
+        // Highest sequence number first (order | 0x40 marks the LAST
+        // physical name chunk), immediately followed by the short
+        // entry -- exactly what fat32_find_entry()'s LFN reader (and
+        // any standard VFAT reader) expects.
+        for (int seq = lfn_count; seq >= 1; seq--) {
+            fat_lfn_entry_t* lfn = (fat_lfn_entry_t*)(out + slot * sizeof(fat_dir_entry_t));
+            memset(lfn, 0xFF, sizeof(fat_lfn_entry_t)); // unused chars pad to 0xFFFF
+            lfn->order       = (uint8_t)seq | (seq == lfn_count ? 0x40 : 0x00);
+            lfn->attr        = ATTR_LONG_NAME;
+            lfn->type        = 0;
+            lfn->checksum    = checksum;
+            lfn->fst_clus_lo = 0;
+
+            int base = (seq - 1) * 13;
+            uint16_t chars[13];
+            for (int k = 0; k < 13; k++) {
+                int idx = base + k;
+                if (idx < name_len)       chars[k] = (uint16_t)(unsigned char)filename[idx];
+                else if (idx == name_len) chars[k] = 0x0000;
+                else                      chars[k] = 0xFFFF;
+            }
+            for (int k = 0; k < 5; k++) lfn->name1[k] = chars[k];
+            for (int k = 0; k < 6; k++) lfn->name2[k] = chars[5 + k];
+            for (int k = 0; k < 2; k++) lfn->name3[k] = chars[11 + k];
+            slot++;
+        }
+    }
+
+    fat_dir_entry_t* short_entry = (fat_dir_entry_t*)(out + slot * sizeof(fat_dir_entry_t));
+    memset(short_entry, 0, sizeof(fat_dir_entry_t));
+    memcpy(short_entry->name, short83, 11);
+    short_entry->attr        = ATTR_ARCHIVE;
+    short_entry->file_size   = size;
+    short_entry->fst_clus_lo = first_data_cluster & 0xFFFF;
+    short_entry->fst_clus_hi = (first_data_cluster >> 16) & 0xFFFF;
+}
+
+// Zero-fills an already-allocated cluster on disk, so every never-yet-
+// used entry in it reads back as a proper 0x00 end-of-directory
+// terminator.
+static bool fat_zero_cluster(uint32_t cluster) {
+    uint32_t cluster_bytes = bpb.sec_per_clus * SECTOR_SIZE;
+    uint8_t* zero_buf = new uint8_t[cluster_bytes];
+    memset(zero_buf, 0, cluster_bytes);
+    bool ok = (read_write_sectors(g_ahci_port, cluster_to_lba(cluster), bpb.sec_per_clus, true, zero_buf) == 0);
+    delete[] zero_buf;
+    return ok;
+}
+
+// Writes filename's directory entry -- a short entry only if it fits
+// 8.3 exactly, otherwise a real LFN chain immediately followed by a
+// disambiguated short entry -- pointing at first_data_cluster/size.
+// This is the ONE place fat32_write_file() (and fat32_rename_file(),
+// via fat_delete_directory_entry() + a fresh call here) creates
+// directory entries, so the LFN logic only has to be right in a
+// single spot.
+//
+// PLACEMENT RULE (this is the part that's easy to get subtly wrong):
+// a name[0]==0x00 entry means "everything from here to the end of the
+// directory is unused" -- fat32_find_entry()/list_files() (and every
+// standard FAT32 reader, including mtools) STOP SCANNING the instant
+// they see one. So a new entry can only go:
+//   (a) into a run of DELETED_ENTRY (0xE5) holes found BEFORE the
+//       first 0x00 -- reusing space from a prior delete, which never
+//       touches the terminator at all, or
+//   (b) starting EXACTLY at the position of the first 0x00 -- never
+//       at some other free run found further along, even if one
+//       exists (e.g. in a later, still-empty cluster). Placing there
+//       instead would leave the real 0x00 stale, permanently hiding
+//       the new entry from every reader that stops at it.
+// If (b) doesn't leave enough contiguous room before the end of that
+// cluster, a fresh cluster is appended and the entry sequence is
+// allowed to straddle the boundary (clusters aren't a scanning
+// barrier the way a 0x00 entry is -- readers just follow the chain).
+static int fat_write_directory_entry(uint32_t dir_cluster, const char* filename,
+                                      uint32_t first_data_cluster, uint32_t size) {
+    char short83[11];
+    bool need_lfn = !fat_short_name_fits_exactly(filename);
+    if (need_lfn) fat_generate_short_name(filename, dir_cluster, short83);
+    else          to_83_format(filename, short83);
+
+    // Clamp to 128 chars (~10 LFN entries + short entry = 11 slots)
+    // so the straddling case below only ever has to deal with two
+    // clusters, never three or more.
+    int name_len = (int)strlen(filename);
+    if (name_len > 128) name_len = 128;
+    int lfn_count = need_lfn ? (name_len + 12) / 13 : 0;
+    int total_slots = lfn_count + 1;
+    uint8_t checksum = need_lfn ? lfn_checksum((const unsigned char*)short83) : 0;
+
+    const int entries_per_sector  = SECTOR_SIZE / sizeof(fat_dir_entry_t);
+    const int entries_per_cluster = entries_per_sector * bpb.sec_per_clus;
+    const uint32_t cluster_bytes  = bpb.sec_per_clus * SECTOR_SIZE;
+
+    // --- Single forward scan: look for a DELETED-hole run good enough
+    // to use (strategy (a) above), and separately remember exactly
+    // where the first 0x00 terminator is (for strategy (b)) in case no
+    // hole was big enough.
+    uint32_t hole_cluster = 0; uint64_t hole_sector_lba = 0; int hole_entry_in_sector = -1;
+    uint32_t end_cluster = 0; int end_entry_in_cluster = -1;
+    bool have_end = false;
+    {
+        uint8_t* dir_buf = new uint8_t[SECTOR_SIZE];
+        uint32_t cluster = dir_cluster;
+        while (!have_end && cluster >= 2 && cluster < FAT_END_OF_CHAIN) {
+            for (uint8_t s = 0; s < bpb.sec_per_clus && !have_end; s++) {
+                uint64_t sector_lba = cluster_to_lba(cluster) + s;
+                if (read_write_sectors(g_ahci_port, sector_lba, 1, false, dir_buf) != 0) continue;
+
+                int run = 0, run_start = -1;
+                for (int e = 0; e < entries_per_sector; e++) {
+                    fat_dir_entry_t* entry = (fat_dir_entry_t*)(dir_buf + e * sizeof(fat_dir_entry_t));
+                    if (entry->name[0] == 0x00) {
+                        have_end             = true;
+                        end_cluster          = cluster;
+                        end_entry_in_cluster = s * entries_per_sector + e;
+                        break;
+                    }
+                    if ((uint8_t)entry->name[0] == DELETED_ENTRY) {
+                        if (run == 0) run_start = e;
+                        run++;
+                        if (run >= total_slots && hole_entry_in_sector < 0) {
+                            hole_cluster         = cluster;
+                            hole_sector_lba      = sector_lba;
+                            hole_entry_in_sector = run_start;
+                        }
+                    } else {
+                        run = 0;
+                    }
+                }
+            }
+            if (!have_end) cluster = read_fat_entry(cluster);
+        }
+        delete[] dir_buf;
+    }
+
+    // Strategy (a): a deleted-entry hole was big enough -- use it.
+    if (hole_entry_in_sector >= 0) {
+        uint8_t* buf = new uint8_t[SECTOR_SIZE];
+        if (read_write_sectors(g_ahci_port, hole_sector_lba, 1, false, buf) != 0) { delete[] buf; return -1; }
+        fat_build_entry_sequence(buf + hole_entry_in_sector * sizeof(fat_dir_entry_t),
+                                  filename, name_len, need_lfn, lfn_count, checksum,
+                                  short83, first_data_cluster, size);
+        int rc = read_write_sectors(g_ahci_port, hole_sector_lba, 1, true, buf);
+        delete[] buf;
+        return rc;
+    }
+
+    if (!have_end) {
+        // Shouldn't normally happen -- clusters are always zero-
+        // initialized on allocation, so a 0x00 always exists somewhere
+        // -- but handle it defensively by growing a fresh cluster and
+        // writing at its very start.
+        uint32_t new_cluster = allocate_cluster();
+        if (new_cluster == 0) return -1;
+        if (!fat_zero_cluster(new_cluster)) { free_cluster_chain(new_cluster); return -1; }
+        uint32_t last = dir_cluster, c = dir_cluster;
+        while (c >= 2 && c < FAT_END_OF_CHAIN) { last = c; c = read_fat_entry(c); }
+        write_fat_entry(last, new_cluster);
+        write_fat_entry(new_cluster, FAT_END_OF_CHAIN);
+        end_cluster          = new_cluster;
+        end_entry_in_cluster = 0;
+    }
+
+    // Strategy (b): place starting exactly at the terminator.
+    int room_in_cluster = entries_per_cluster - end_entry_in_cluster;
+    if (room_in_cluster >= total_slots) {
+        // Fits entirely within the tail cluster -- operate on the
+        // whole cluster as one buffer so the sequence can straddle a
+        // SECTOR boundary within it (still fine; only cluster
+        // boundaries need the special handling below) without extra
+        // bookkeeping.
+        uint8_t* cbuf = new uint8_t[cluster_bytes];
+        if (read_write_sectors(g_ahci_port, cluster_to_lba(end_cluster), bpb.sec_per_clus, false, cbuf) != 0) {
+            delete[] cbuf; return -1;
+        }
+        fat_build_entry_sequence(cbuf + end_entry_in_cluster * sizeof(fat_dir_entry_t),
+                                  filename, name_len, need_lfn, lfn_count, checksum,
+                                  short83, first_data_cluster, size);
+        int rc = read_write_sectors(g_ahci_port, cluster_to_lba(end_cluster), bpb.sec_per_clus, true, cbuf);
+        delete[] cbuf;
+        return rc;
+    }
+
+    // Doesn't fit in what's left of the tail cluster: append a fresh
+    // cluster and let the sequence straddle the boundary. This MUST
+    // link directly onto end_cluster (the cluster that actually holds
+    // the terminator) and write starting at end_entry_in_cluster with
+    // zero gap -- any gap would recreate the exact "stale 0x00" bug
+    // this function exists to avoid, just at cluster granularity.
+    uint32_t new_cluster = allocate_cluster();
+    if (new_cluster == 0) return -1;
+    if (!fat_zero_cluster(new_cluster)) { free_cluster_chain(new_cluster); return -1; }
+    write_fat_entry(end_cluster, new_cluster);
+    write_fat_entry(new_cluster, FAT_END_OF_CHAIN);
+
+    uint8_t* cbuf1 = new uint8_t[cluster_bytes];
+    uint8_t* cbuf2 = new uint8_t[cluster_bytes];
+    bool read_ok = (read_write_sectors(g_ahci_port, cluster_to_lba(end_cluster), bpb.sec_per_clus, false, cbuf1) == 0) &&
+                   (read_write_sectors(g_ahci_port, cluster_to_lba(new_cluster), bpb.sec_per_clus, false, cbuf2) == 0);
+    if (!read_ok) { delete[] cbuf1; delete[] cbuf2; return -1; }
+
+    uint8_t* seq = new uint8_t[total_slots * sizeof(fat_dir_entry_t)];
+    fat_build_entry_sequence(seq, filename, name_len, need_lfn, lfn_count, checksum,
+                              short83, first_data_cluster, size);
+
+    int fits_in_cbuf1 = room_in_cluster; // < total_slots, guaranteed by the branch above
+    memcpy(cbuf1 + end_entry_in_cluster * sizeof(fat_dir_entry_t), seq,
+           fits_in_cbuf1 * sizeof(fat_dir_entry_t));
+    memcpy(cbuf2, seq + fits_in_cbuf1 * sizeof(fat_dir_entry_t),
+           (total_slots - fits_in_cbuf1) * sizeof(fat_dir_entry_t));
+    delete[] seq;
+
+    bool write_ok = (read_write_sectors(g_ahci_port, cluster_to_lba(end_cluster), bpb.sec_per_clus, true, cbuf1) == 0) &&
+                     (read_write_sectors(g_ahci_port, cluster_to_lba(new_cluster), bpb.sec_per_clus, true, cbuf2) == 0);
+    delete[] cbuf1;
+    delete[] cbuf2;
+    return write_ok ? 0 : -1;
+}
+
+// Deletes filename's directory entry (short name + any immediately-
+// preceding LFN chain) WITHOUT touching its data clusters. Split out
+// of fat32_remove_file() so fat32_rename_file() can reuse it to drop
+// the OLD entry while keeping the file's clusters alive for the new
+// entry fat_write_directory_entry() creates right after.
+static int fat_delete_directory_entry(const char* filename) {
+    fat_dir_entry_t entry;
+    uint32_t sector, offset;
+    if (fat32_find_entry(filename, &entry, &sector, &offset) != 0) return -1;
+
+    uint8_t* dir_buf = new uint8_t[SECTOR_SIZE];
+    if (read_write_sectors(g_ahci_port, sector, 1, false, dir_buf) != 0) { delete[] dir_buf; return -1; }
+
+    int idx = (int)(offset / sizeof(fat_dir_entry_t));
+    ((fat_dir_entry_t*)(dir_buf + idx * sizeof(fat_dir_entry_t)))->name[0] = DELETED_ENTRY;
+
+    // Walk backward over any LFN chain immediately preceding the short
+    // entry (fat_write_directory_entry() always writes them contiguous
+    // in the same sector, so this never has to cross a sector
+    // boundary) and mark those deleted too -- otherwise every
+    // long-named file left permanent orphaned LFN garbage behind.
+    for (int e = idx - 1; e >= 0; e--) {
+        fat_dir_entry_t* prev = (fat_dir_entry_t*)(dir_buf + e * sizeof(fat_dir_entry_t));
+        if (prev->attr != ATTR_LONG_NAME) break;
+        bool was_last_lfn = (((fat_lfn_entry_t*)prev)->order & 0x40) != 0;
+        prev->name[0] = DELETED_ENTRY;
+        if (was_last_lfn) break;
+    }
+
+    int rc = read_write_sectors(g_ahci_port, sector, 1, true, dir_buf);
+    delete[] dir_buf;
+    return rc;
+}
+
 int fat32_write_file(const char* filename, const void* data, uint32_t size) {
     // First, safely remove the file if it already exists to handle overwrites correctly.
     fat32_remove_file(filename);
 
-    char target_83[11];
-    to_83_format(filename, target_83);
     uint32_t first_cluster = 0;
 
     if (size > 0) {
@@ -1067,85 +1460,9 @@ int fat32_write_file(const char* filename, const void* data, uint32_t size) {
         }
     }
 
-    uint8_t* dir_buf = new uint8_t[SECTOR_SIZE];
-
-    // Walk the directory's ENTIRE cluster chain looking for a free slot,
-    // instead of only ever looking at the first cluster. A directory is
-    // just a cluster chain like any file; a 512-byte cluster only holds
-    // 16 entries, so it's trivial to fill the first cluster and spill
-    // into a second one — something any real OS handles transparently.
-    // Before this fix, once cluster #1 was full this function returned
-    // "Directory is full" even with the whole rest of the disk empty,
-    // and any files that DID make it into a later cluster (e.g. written
-    // by another OS) were invisible to fat32_find_entry/list_files too.
-    uint32_t cluster = current_directory_cluster;
-    uint32_t last_cluster = cluster;
-    while (cluster >= 2 && cluster < FAT_END_OF_CHAIN) {
-        last_cluster = cluster;
-        for (uint8_t s = 0; s < bpb.sec_per_clus; s++) {
-            uint64_t sector_lba = cluster_to_lba(cluster) + s;
-            if (read_write_sectors(g_ahci_port, sector_lba, 1, false, dir_buf) != 0) continue;
-
-            for (uint16_t e = 0; e < SECTOR_SIZE / sizeof(fat_dir_entry_t); e++) {
-                fat_dir_entry_t* entry = (fat_dir_entry_t*)(dir_buf + e * sizeof(fat_dir_entry_t));
-                if (entry->name[0] == 0x00 || (uint8_t)entry->name[0] == DELETED_ENTRY) {
-                    // Found a free slot, create the entry.
-                    memset(entry, 0, sizeof(fat_dir_entry_t));
-                    memcpy(entry->name, target_83, 11);
-                    entry->attr = ATTR_ARCHIVE;
-                    entry->file_size = size;
-                    entry->fst_clus_lo = first_cluster & 0xFFFF;
-                    entry->fst_clus_hi = (first_cluster >> 16) & 0xFFFF;
-
-                    if (read_write_sectors(g_ahci_port, sector_lba, 1, true, dir_buf) == 0) {
-                        delete[] dir_buf;
-                        return 0; // Success
-                    } else {
-                        delete[] dir_buf;
-                        if(first_cluster > 0) free_cluster_chain(first_cluster);
-                        return -1; // Directory write error
-                    }
-                }
-            }
-        }
-        cluster = read_fat_entry(cluster);
-    }
-
-    // Every existing directory cluster is completely full (no 0x00 and no
-    // deleted-entry slot anywhere in the chain): grow the directory by
-    // appending a fresh cluster, exactly like a real FAT32 driver would.
-    uint32_t new_dir_cluster = allocate_cluster();
-    if (new_dir_cluster == 0) {
-        delete[] dir_buf;
-        if (first_cluster > 0) free_cluster_chain(first_cluster);
-        return -1; // Disk is genuinely full, can't grow the directory
-    }
-
-    uint32_t cluster_bytes = bpb.sec_per_clus * SECTOR_SIZE;
-    uint8_t* new_clus_buf = new uint8_t[cluster_bytes];
-    memset(new_clus_buf, 0, cluster_bytes); // zeroed => first unused entry marks end-of-directory
-
-    fat_dir_entry_t* new_entry = (fat_dir_entry_t*)new_clus_buf;
-    memcpy(new_entry->name, target_83, 11);
-    new_entry->attr = ATTR_ARCHIVE;
-    new_entry->file_size = size;
-    new_entry->fst_clus_lo = first_cluster & 0xFFFF;
-    new_entry->fst_clus_hi = (first_cluster >> 16) & 0xFFFF;
-
-    bool wrote_ok = (read_write_sectors(g_ahci_port, cluster_to_lba(new_dir_cluster), bpb.sec_per_clus, true, new_clus_buf) == 0);
-    delete[] new_clus_buf;
-    delete[] dir_buf;
-
-    if (!wrote_ok) {
-        free_cluster_chain(new_dir_cluster);
-        if (first_cluster > 0) free_cluster_chain(first_cluster);
-        return -1;
-    }
-
-    // Link the new cluster onto the end of the directory's FAT chain.
-    write_fat_entry(last_cluster, new_dir_cluster);
-    write_fat_entry(new_dir_cluster, FAT_END_OF_CHAIN);
-    return 0;
+    int rc = fat_write_directory_entry(current_directory_cluster, filename, first_cluster, size);
+    if (rc != 0 && first_cluster > 0) free_cluster_chain(first_cluster);
+    return rc;
 }
 
 // Forward decl: fat32_find_entry() is defined just below, but
@@ -1725,13 +2042,14 @@ int fat32_remove_file(const char* filename) {
     uint32_t sector, offset;
     if(fat32_find_entry(filename, &entry, &sector, &offset) != 0) return -1;
     uint32_t start_cluster = (entry.fst_clus_hi << 16) | entry.fst_clus_lo;
-    if(start_cluster != 0) free_cluster_chain(start_cluster);
-    
-    uint8_t* dir_buf = new uint8_t[SECTOR_SIZE];
-    read_write_sectors(g_ahci_port, sector, 1, false, dir_buf);
-    ((fat_dir_entry_t*)(dir_buf + offset))->name[0] = DELETED_ENTRY;
-    read_write_sectors(g_ahci_port, sector, 1, true, dir_buf);
-    delete[] dir_buf;
+
+    // fat_delete_directory_entry() (defined above, next to
+    // fat_write_directory_entry()) removes the short entry AND any LFN
+    // chain immediately preceding it -- plain 8.3 names have no such
+    // chain and are unaffected, so this is a strict superset of what
+    // this function used to do inline.
+    if (fat_delete_directory_entry(filename) != 0) return -1;
+    if (start_cluster != 0) free_cluster_chain(start_cluster);
     return 0;
 }
 // ADD THIS NEW FUNCTION after fat32_rename_file
@@ -1782,24 +2100,24 @@ int fat32_rename_file(const char* old_name, const char* new_name) {
     if (fat32_find_entry(old_name, &entry, &sector, &offset) != 0) {
         return -1; // Source file not found
     }
-    
-    // 3. Read, modify, and write back the directory sector.
-    uint8_t* dir_buf = new uint8_t[SECTOR_SIZE];
-    if (read_write_sectors(g_ahci_port, sector, 1, false, dir_buf) != 0) {
-        delete[] dir_buf;
-        return -1;
-    }
 
-    fat_dir_entry_t* target_entry = (fat_dir_entry_t*)(dir_buf + offset);
-    to_83_format(new_name, target_entry->name);
-    
-    if (read_write_sectors(g_ahci_port, sector, 1, true, dir_buf) != 0) {
-        delete[] dir_buf;
-        return -1;
-    }
+    // 3. Drop the OLD entry (short name + any LFN chain -- see
+    //    fat_delete_directory_entry()) WITHOUT freeing its data
+    //    clusters, then create a fresh entry for new_name pointing at
+    //    those same clusters.
+    //
+    //    This replaces the old approach of patching the 11-byte short
+    //    name field in place, which never touched the LFN chain: a
+    //    rename TO a long name silently truncated it into a mangled
+    //    short name with no LFN (the exact "misplacement" bug
+    //    fat_write_directory_entry() exists to fix), and a rename AWAY
+    //    from one left the old LFN chain behind as permanent directory
+    //    garbage.
+    uint32_t first_cluster = (entry.fst_clus_hi << 16) | entry.fst_clus_lo;
+    uint32_t size = entry.file_size;
 
-    delete[] dir_buf;
-    return 0; // Success
+    if (fat_delete_directory_entry(old_name) != 0) return -1;
+    return fat_write_directory_entry(current_directory_cluster, new_name, first_cluster, size);
 }
 
 // =============================================================================

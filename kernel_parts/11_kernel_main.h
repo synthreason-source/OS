@@ -1040,16 +1040,16 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
 
     // ── Main loop ─────────────────────────────────────────────────────────────
     const uint32_t TICKS_PER_FRAME = 1;
-    // Seeded so that (g_timer_ticks - last_paint_tick) >= TICKS_PER_FRAME is
+    // Seeded so that (g_timer_ticks - last_tick_tick) >= TICKS_PER_FRAME is
     // already true on the very first loop iteration (0 - (uint32_t)-1
-    // wraps around to 1). With last_paint_tick starting at 0 (matching
+    // wraps around to 1). With last_tick_tick starting at 0 (matching
     // g_timer_ticks' own starting value of 0), that gating check read
     // (0 - 0) >= 1, i.e. false — so despite the g_evt_timer/g_evt_dirty
     // flags being forced below, the paint block a few lines down was
     // still skipped on frame one and the desktop (icons, taskbar, clock)
     // stayed blank until the software timer's poll_counter first reached
     // 500, rather than appearing immediately as the comment intended.
-    uint32_t last_paint_tick = (uint32_t)0 - TICKS_PER_FRAME;
+    uint32_t last_tick_tick = (uint32_t)0 - TICKS_PER_FRAME;
     int prev_mouse_x = mouse_x;
     int prev_mouse_y = mouse_y;
 
@@ -1148,7 +1148,11 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
 
         wm.cleanup_closed_windows();
 
-        if (g_evt_timer && (g_timer_ticks - last_paint_tick) >= TICKS_PER_FRAME) {
+        // Guest-process ticking stays paced by the software timer (as
+        // before) — this is what governs how much CPU-emulation work a
+        // running ELF guest gets per iteration, and shouldn't speed up
+        // or slow down just because the mouse is being moved.
+        if (g_evt_timer && (g_timer_ticks - last_tick_tick) >= TICKS_PER_FRAME) {
             // Tick ELF processes BEFORE the paint so any breadcrumbs they
             // write (x86_breadcrumb at row 2, glue's tick markers at row 0
             // col 72/73, panic tags at col 70) are reflected in the next
@@ -1157,23 +1161,40 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
             // pointing at where the hang happened.
             tick_elf_processes(1);
 
-            if (g_evt_dirty || g_input_state.hasNewInput) {
-                last_paint_tick           = g_timer_ticks;
-                g_evt_dirty               = false;
-                g_input_state.hasNewInput = false;
-                g_gfx.clear_screen(ColorPalette::DESKTOP_GRAY );
-                wm.update_all();
-                draw_cursor(mouse_x, mouse_y, ColorPalette::CURSOR_WHITE);
-                // Diagnostic overlay: paint VGA text-mode rows 0/1/2
-                // (boot/panic/tick breadcrumbs, host-IDT fault tags,
-                // x86_tick lazy-init progress) onto the framebuffer so
-                // they are visible in graphics mode. Drawn last so it
-                // overlays everything.
-                draw_vga_overlay();
-                swap_buffers();
-            }
+            last_tick_tick = g_timer_ticks;
+            g_evt_timer     = false;
+        }
 
-            g_evt_timer = false;
+        // Repaint is intentionally NOT gated on g_evt_timer above — only
+        // on whether anything actually changed (g_evt_dirty /
+        // hasNewInput). It used to require BOTH the timer *and* a dirty
+        // flag, but the software timer here only fires once every 500
+        // raw loop iterations (poll_counter, further up — there's no
+        // real PIT/IRQ0 to drive it). Mouse movement/clicks and
+        // keystrokes are polled and flagged dirty on EVERY iteration
+        // (see poll_input_universal() + the g_evt_input block above),
+        // so gating the actual repaint behind that same slow timer made
+        // the on-screen cursor visibly lag ~500 iterations behind the
+        // real, continuously-updated mouse_x/mouse_y — i.e. the mouse
+        // felt "slow"/laggy even though input was being read promptly.
+        // Repainting as soon as something is dirty fixes that; the
+        // timer above still exists to pace guest ticking and to cover
+        // the "nothing moved, but a guest changed its own frame"
+        // periodic case via g_evt_timer's own g_evt_dirty = true (set
+        // where poll_counter reaches 500, further up).
+        if (g_evt_dirty || g_input_state.hasNewInput) {
+            g_evt_dirty               = false;
+            g_input_state.hasNewInput = false;
+            g_gfx.clear_screen(ColorPalette::DESKTOP_GRAY );
+            wm.update_all();
+            draw_cursor(mouse_x, mouse_y, ColorPalette::CURSOR_WHITE);
+            // Diagnostic overlay: paint VGA text-mode rows 0/1/2
+            // (boot/panic/tick breadcrumbs, host-IDT fault tags,
+            // x86_tick lazy-init progress) onto the framebuffer so
+            // they are visible in graphics mode. Drawn last so it
+            // overlays everything.
+            draw_vga_overlay();
+            swap_buffers();
         }
     }
 }
