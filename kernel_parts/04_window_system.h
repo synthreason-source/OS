@@ -111,6 +111,42 @@ public:
     bool is_in_close_button(int mx, int my) { int btn_x = x + w - 22, btn_y = y + 4; return mx >= btn_x && mx < btn_x + 18 && my >= btn_y && my < btn_y + 18; }
     // Minimize ("_") button sits directly to the left of the close button.
     bool is_in_minimize_button(int mx, int my) { int btn_x = x + w - 44, btn_y = y + 4; return mx >= btn_x && mx < btn_x + 18 && my >= btn_y && my < btn_y + 18; }
+
+    // ── Resizing ──────────────────────────────────────────────────────
+    // A RESIZE_GRIP_SIZE x RESIZE_GRIP_SIZE hotspot in the bottom-right
+    // corner of every window. WindowManager checks this on left-click
+    // (see handle_input()'s resize block) before falling through to the
+    // titlebar-drag check, and drags w/h instead of x/y while active.
+    static constexpr int RESIZE_GRIP_SIZE = 12;
+    bool is_in_resize_grip(int mx, int my) const {
+        int gx = x + w - RESIZE_GRIP_SIZE, gy = y + h - RESIZE_GRIP_SIZE;
+        return mx >= gx && mx < x + w && my >= gy && my < y + h;
+    }
+    // Smallest w/h this window will shrink to. Subclasses with more
+    // cramped chrome (e.g. TerminalWindow, which needs room for its
+    // title bar plus a few lines of text) can override with a larger
+    // floor; the base default suits simple chrome-only apps.
+    virtual int min_w() const { return 160; }
+    virtual int min_h() const { return 110; }
+
+    // Small diagonal-grip glyph drawn in the bottom-right corner so the
+    // resize hotspot is discoverable. Subclasses call this at the end of
+    // their draw() (after the border) to opt into the visual affordance;
+    // is_in_resize_grip() above works regardless of whether this is
+    // called, but without it users have no visual cue the corner is
+    // draggable.
+    void draw_resize_grip() const {
+        using namespace ColorPalette;
+        int gx = x + w - RESIZE_GRIP_SIZE, gy = y + h - RESIZE_GRIP_SIZE;
+        for (int i = 2; i < RESIZE_GRIP_SIZE - 1; i += 3) {
+            // Two short diagonal strokes per "tick", light-over-dark for
+            // a subtle carved look matching the taskbar's 3D style.
+            put_pixel_back(gx + RESIZE_GRIP_SIZE - 1, gy + i, BUTTON_SHADOW);
+            put_pixel_back(gx + RESIZE_GRIP_SIZE - 2, gy + i + 1, BUTTON_SHADOW);
+            put_pixel_back(gx + RESIZE_GRIP_SIZE - 1, gy + i + 1, BUTTON_HIGHLIGHT);
+        }
+    }
+
     virtual void close() { is_closed = true; }
 };
 
@@ -121,6 +157,14 @@ private:
     int focused_idx;
     int dragging_idx;
     int drag_offset_x, drag_offset_y;
+
+    // Corner-drag resizing (mirrors dragging_idx/drag_offset_* above,
+    // but for growing/shrinking a window instead of moving it). See
+    // Window::is_in_resize_grip() and the resize block near the top of
+    // handle_input().
+    int resizing_idx;
+    int resize_start_mx, resize_start_my;
+    int resize_orig_w, resize_orig_h;
 
     // New: Desktop & Context Menu management
     DesktopItem desktop_items[64];
@@ -138,7 +182,8 @@ private:
     
 
 public:
-    WindowManager() : num_windows(0), focused_idx(-1), dragging_idx(-1), 
+    WindowManager() : num_windows(0), focused_idx(-1), dragging_idx(-1),
+                      resizing_idx(-1),
                       num_desktop_items(0), dragging_icon_idx(-1), 
                       context_menu_active(false) {}
     void show_file_context_menu(int mx, int my, const char* filename, bool is_executable) {

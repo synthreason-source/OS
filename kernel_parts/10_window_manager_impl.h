@@ -149,6 +149,32 @@ void WindowManager::handle_input(char key, int mx, int my, bool left_down, bool 
         return;
     }
 
+    // --- 1.5. Handle Corner-Drag Resizing ---
+    if (resizing_idx != -1) {
+        if (left_down) {
+            Window* rw = windows[resizing_idx];
+            int new_w = resize_orig_w + (mx - resize_start_mx);
+            int new_h = resize_orig_h + (my - resize_start_my);
+            int minw = rw->min_w(), minh = rw->min_h();
+            if (new_w < minw) new_w = minw;
+            if (new_h < minh) new_h = minh;
+            // Keep the window from growing past the visible screen (and
+            // out from under the taskbar) — same bound draw_desktop()
+            // uses for the taskbar's own height.
+            int maxw = (int)fb_info.width - rw->x;
+            int maxh = ((int)fb_info.height - 40) - rw->y;
+            if (maxw < minw) maxw = minw;
+            if (maxh < minh) maxh = minh;
+            if (new_w > maxw) new_w = maxw;
+            if (new_h > maxh) new_h = maxh;
+            rw->w = new_w;
+            rw->h = new_h;
+        } else {
+            resizing_idx = -1;
+        }
+        return;
+    }
+
     // --- 2. Handle Dragging ---
     if (dragging_idx != -1) { // Dragging a window
         if (left_down) {
@@ -260,6 +286,19 @@ void WindowManager::handle_input(char key, int mx, int my, bool left_down, bool 
                     // render one, so don't treat that screen area as a
                     // hidden hotspot for them.
                     target->is_minimized = true;
+                } else if (target->get_taskbar_id() >= 0 && target->is_in_resize_grip(mx, my)) {
+                    // Resize grip is only drawn for (and, for now, only
+                    // active on) terminal windows — see draw_resize_grip()
+                    // in TerminalWindow::draw(). Same get_taskbar_id() >= 0
+                    // gate the minimize button above uses, since the other
+                    // desktop-suite mini-apps (calculator, snake, etc.)
+                    // draw fixed layouts that weren't built to relayout at
+                    // arbitrary sizes.
+                    resizing_idx = focused_idx;
+                    resize_start_mx = mx;
+                    resize_start_my = my;
+                    resize_orig_w = target->w;
+                    resize_orig_h = target->h;
                 } else if (target->is_in_titlebar(mx, my)) {
                     dragging_idx = focused_idx;
                     drag_offset_x = mx - target->x;

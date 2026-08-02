@@ -1862,6 +1862,13 @@ public:
     int get_elf_slot() const override { return captured_elf_slot; }
     int get_taskbar_id() const override { return term_id; }
 
+    // Terminal chrome needs more headroom than a bare BaseAppWindow: the
+    // titlebar, minimize/close buttons, and at least a handful of text
+    // rows (or, in editor mode, EDIT_COL_PIX/EDIT_LINE_PIX-sized text)
+    // all have to fit without overlapping.
+    int min_w() const override { return 260; }
+    int min_h() const override { return 160; }
+
     // Screen-space rect the guest's gfx canvas was actually drawn into
     // on the most recent draw() call (see the "Guest graphics overlay"
     // block below) — cached there every frame so the mouse ABI can
@@ -1870,6 +1877,14 @@ public:
     // this window isn't currently showing a live gfx frame (text mode,
     // editor, or no guest gfx frame present at all).
     int  gfx_rect_x = 0, gfx_rect_y = 0, gfx_rect_w = 0, gfx_rect_h = 0;
+    // The guest's own canvas size (GFX_WIDTH x GFX_HEIGHT, i.e. gfx_w/gfx_h
+    // as passed to bochs_gfx_get_frame()) at the time gfx_rect_* above was
+    // last published. Needed because the canvas is now scaled to fill the
+    // window's content area rather than blitted 1:1 -- gfx_hit_test() has
+    // to map a screen-space pixel back into this source space so the
+    // guest's mouse ABI still sees coordinates in its own gfx_set_pixel()
+    // space regardless of how big the window currently is.
+    int  gfx_src_w = 0, gfx_src_h = 0;
     bool gfx_rect_valid = false;
 
     bool gfx_hit_test(int mx, int my, int* local_x, int* local_y) const override {
@@ -1877,8 +1892,16 @@ public:
         int lx = mx - gfx_rect_x;
         int ly = my - gfx_rect_y;
         if (lx < 0 || ly < 0 || lx >= gfx_rect_w || ly >= gfx_rect_h) return false;
-        *local_x = lx;
-        *local_y = ly;
+        // Scale the screen-space hit position back down into the guest's
+        // own GFX_WIDTH x GFX_HEIGHT canvas space (see the "Guest graphics
+        // overlay" block in draw(), which now stretches gfx_src_w x
+        // gfx_src_h to fill gfx_rect_w x gfx_rect_h).
+        int gx = (gfx_src_w > 0 && gfx_rect_w > 0) ? (lx * gfx_src_w) / gfx_rect_w : lx;
+        int gy = (gfx_src_h > 0 && gfx_rect_h > 0) ? (ly * gfx_src_h) / gfx_rect_h : ly;
+        if (gx >= gfx_src_w) gx = gfx_src_w - 1;
+        if (gy >= gfx_src_h) gy = gfx_src_h - 1;
+        *local_x = gx;
+        *local_y = gy;
         return true;
     }
 
@@ -1999,6 +2022,10 @@ public:
         for (int i = 0; i < h; i++) put_pixel_back(x, y + i, WINDOW_BORDER);
         for (int i = 0; i < h; i++) put_pixel_back(x + w - 1, y + i, WINDOW_BORDER);
 
+        // Bottom-right drag-to-resize handle — see is_in_resize_grip()
+        // and WindowManager::handle_input()'s resize block.
+        draw_resize_grip();
+
         // ── Bochs self-test VGA overlay ─────────────────────────────────
         // When this terminal activated the `test` module, paint the three
         // VGA-style rows (breadcrumbs / fault tag / GUEST line) the module
@@ -2033,29 +2060,59 @@ public:
         if (avail_w < 0) avail_w = 0;
         if (avail_h < 0) avail_h = 0;
 
-        // Centre the guest's canvas inside whatever room is left; clip
-        // rather than scale, so guests always get true 1:1 pixels.
-        int draw_w = gfx_w < avail_w ? gfx_w : avail_w;
-        int draw_h = gfx_h < avail_h ? gfx_h : avail_h;
-        int off_x  = x + 5 + (avail_w - draw_w) / 2;
-        int off_y  = content_top + (avail_h - draw_h) / 2;
+        // Stretch the guest's GFX_WIDTH x GFX_HEIGHT canvas to fill the
+        // ENTIRE content area, edge to edge -- a program using graphics
+        // mode should occupy the full terminal window, not a small
+        // fixed-size box floating in the middle of it. This also means
+        // the canvas grows/shrinks automatically as the window is
+        // resized (see Window::is_in_resize_grip() / WindowManager's
+        // resize handling), since avail_w/avail_h are recomputed from
+        // the window's current w/h every frame.
+        //
+        // Nearest-neighbor scaling via 16.16 fixed-point steps -- this
+        // kernel is freestanding (no guaranteed FPU/SSE init), so no
+        // floating point here.
+        int draw_w = avail_w;
+        int draw_h = avail_h;
+        int off_x  = x + 5;
+        int off_y  = content_top;
 
-        for (int row = 0; row < draw_h; row++) {
-            const uint32_t* src_row = gfx_px + row * gfx_w;
-            int py = off_y + row;
-            for (int col = 0; col < draw_w; col++) {
-                put_pixel_back(off_x + col, py, src_row[col]);
+        if (draw_w > 0 && draw_h > 0 && gfx_w > 0 && gfx_h > 0) {
+            uint32_t step_x = ((uint32_t)gfx_w << 16) / (uint32_t)draw_w;
+            uint32_t step_y = ((uint32_t)gfx_h << 16) / (uint32_t)draw_h;
+
+            uint32_t src_y_fp = 0;
+            for (int row = 0; row < draw_h; row++) {
+                int sy = (int)(src_y_fp >> 16);
+                if (sy >= gfx_h) sy = gfx_h - 1;
+                const uint32_t* src_row = gfx_px + sy * gfx_w;
+                int py = off_y + row;
+
+                uint32_t src_x_fp = 0;
+                for (int col = 0; col < draw_w; col++) {
+                    int sx = (int)(src_x_fp >> 16);
+                    if (sx >= gfx_w) sx = gfx_w - 1;
+                    put_pixel_back(off_x + col, py, src_row[sx]);
+                    src_x_fp += step_x;
+                }
+                src_y_fp += step_y;
             }
+        } else {
+            draw_w = 0;
+            draw_h = 0;
         }
 
-        // Publish this frame's canvas rect for the mouse ABI (see
-        // gfx_hit_test() above) — kernel_gfx_mouse_poll() reads these
-        // every time a guest polls, so they must stay in lockstep with
-        // where the canvas was actually just blitted on screen.
+        // Publish this frame's canvas rect (and the guest's own source
+        // canvas size) for the mouse ABI (see gfx_hit_test() above) —
+        // kernel_gfx_mouse_poll() reads these every time a guest polls,
+        // so they must stay in lockstep with where/how the canvas was
+        // actually just blitted on screen.
         gfx_rect_x = off_x;
         gfx_rect_y = off_y;
         gfx_rect_w = draw_w;
         gfx_rect_h = draw_h;
+        gfx_src_w  = gfx_w;
+        gfx_src_h  = gfx_h;
         gfx_rect_valid = (draw_w > 0 && draw_h > 0);
     } else {
         gfx_rect_valid = false;
