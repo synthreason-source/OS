@@ -1091,20 +1091,9 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
         bool mouse_moved = (mouse_x != prev_mouse_x || mouse_y != prev_mouse_y);
         bool key_pressed = (last_key_press != 0);
 
-        // Anything that can actually change what's on screen beyond the
-        // cursor's own position: a key, a fresh click edge, or a button
-        // being held (drag/resize/paint-canvas in progress). A plain
-        // hover-move with nothing held is deliberately NOT included here
-        // -- see the cursor-only fast path further down for why forcing
-        // a full repaint for that case is what made mouse movement feel
-        // heavy.
-        bool input_needs_full_repaint = key_pressed || leftClickedThisFrame ||
-                                         rightClickedThisFrame || mouse_left_down ||
-                                         mouse_right_down;
-
         if (key_pressed || mouse_moved || leftClickedThisFrame || rightClickedThisFrame) {
             g_evt_input = true;
-            if (input_needs_full_repaint) g_input_state.hasNewInput = true;
+            g_input_state.hasNewInput = true;
             prev_mouse_x = mouse_x;
             prev_mouse_y = mouse_y;
         }
@@ -1154,12 +1143,7 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
                             leftClickedThisFrame,
                             rightClickedThisFrame);
             if (last_key_press != 0) last_key_press = 0;
-            // Only force the expensive full-desktop repaint for input
-            // that can actually change what's drawn. handle_input()
-            // early-returns doing nothing at all for a plain hover-move
-            // (no button down, no click edge), so there's nothing here
-            // for a full repaint to pick up in that case anyway.
-            if (input_needs_full_repaint) g_evt_dirty = true;
+            g_evt_dirty = true;
         }
 
         wm.cleanup_closed_windows();
@@ -1203,6 +1187,7 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
             g_input_state.hasNewInput = false;
             g_gfx.clear_screen(ColorPalette::DESKTOP_GRAY );
             wm.update_all();
+            draw_cursor(mouse_x, mouse_y, ColorPalette::CURSOR_WHITE);
             // Diagnostic overlay: paint VGA text-mode rows 0/1/2
             // (boot/panic/tick breadcrumbs, host-IDT fault tags,
             // x86_tick lazy-init progress) onto the framebuffer so
@@ -1210,26 +1195,6 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
             // overlays everything.
             draw_vga_overlay();
             swap_buffers();
-            // The backbuffer just pushed to the screen has no cursor in
-            // it (draw_cursor() is intentionally not called here any
-            // more -- see the cursor-only fast path comment below), so
-            // draw the cursor glyph straight onto the framebuffer now
-            // and remember where. That's what lets the *next* frame, if
-            // it's just a plain pointer move, skip the full repaint
-            // entirely.
-            erase_cursor_from_screen(); // no-op the first time through
-            draw_cursor_to_screen(mouse_x, mouse_y, ColorPalette::CURSOR_WHITE);
-            g_backbuffer_is_clean_on_screen = true;
-        } else if (mouse_moved && g_backbuffer_is_clean_on_screen) {
-            // Cursor-only fast path: nothing but the pointer position
-            // changed this frame (no key, no click, no button held --
-            // handle_input() already established there's nothing else
-            // to redraw). Move just the ~8x12px cursor glyph directly
-            // on the framebuffer instead of clearing and redrawing the
-            // entire desktop/every window/the taskbar clock and doing a
-            // full 1024x768 blit for a one-pixel pointer nudge.
-            erase_cursor_from_screen();
-            draw_cursor_to_screen(mouse_x, mouse_y, ColorPalette::CURSOR_WHITE);
         }
     }
 }
