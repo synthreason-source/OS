@@ -8,8 +8,8 @@ SATA port selection with 'disk_select'
 
 guest programs require drivers.h and comp.h to interface with the OS.
 
-TODO: add ethernet, web_browser & hardware discovery kit and for drivers.h
-
+TODO: custom resolution for elf's, add ethernet, web_browser & hardware discovery kit and for drivers.h
+TODO: fix mouse movement smoothness, fix compiler usage vulnerabilities... 
 # Build Instructions
 
 ## Prerequisites (one-time apt installs)
