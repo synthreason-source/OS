@@ -214,7 +214,22 @@ $(TCC_SRC_DIR)/.extracted: $(TCC_ARCHIVE)
 	mkdir -p $(TCC_SRC_DIR)
 	tar -xzf $(TCC_ARCHIVE) --strip-components=1 -C $(TCC_SRC_DIR)
 	touch $@
-	sed -i 's/tcc_error_noabort("'"'"'%s'"'"' defined twice", name);/\/\* ignore \*\//' $(TCC_SRC_DIR)/tccelf.c
+	# Silence tccelf.c's "link symbol '%s' defined twice" fatal error.
+	# tcc_kernel.cpp's single-TCCState compile+link design avoids the
+	# common cause of this (merging an externally-produced .o makes TCC's
+	# internal linker re-encounter its own anonymous section symbols),
+	# but it can still legitimately fire (with an EMPTY name -- an
+	# anonymous symbol, not a real duplicate identifier in the user's
+	# source) in this from-scratch-linker setup; tcc_kernel.cpp is
+	# written to tolerate that instead of aborting the whole compile.
+	#
+	# NOTE: this sed pattern previously searched for
+	# tcc_error_noabort("'%s' defined twice", name); -- missing the
+	# "link symbol " text that's actually part of the message in this
+	# TCC version -- so it silently matched nothing and the intended
+	# patch never applied (sed doesn't error on a no-op substitution).
+	# Verified against the actual downloaded source before fixing.
+	sed -i 's/tcc_error_noabort("link symbol '"'"'%s'"'"' defined twice", name);/\/\* ignore \*\//' $(TCC_SRC_DIR)/tccelf.c
 	touch $@
 
 # Build i386-tcc cross-compiler + libtcc into tcc-local/.
