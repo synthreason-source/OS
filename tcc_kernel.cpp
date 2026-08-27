@@ -906,11 +906,34 @@ extern "C" void tcc_kernel_cmd_cc(void* terminal_opaque,
     // tccelf_add_crtbegin(). If options are set after, crtbegin is loaded
     // from CONFIG_TCC_CRTPREFIX (a path that doesn't exist here), its
     // symbols get merged in, and every global symbol appears twice.
-    tcc_set_options(s1, "-nostdlib -nostdinc");
+    //
+    // These three calls used to be unchecked. If tcc_set_options() ever
+    // fails to apply -nostdlib (e.g. i386-libtcc-kern.a was built from a
+    // stale/different tcc-src checkout than this file expects -- the
+    // upstream "mob" branch is a moving target), the failure was
+    // invisible: tcc_set_output_type() would then try to link a crt
+    // stub that doesn't exist in this freestanding environment, and the
+    // one real problem ("-nostdlib didn't apply") got buried under a
+    // cascade of confusing downstream errors ('crti.o' not found, etc.)
+    // with no indication of the actual cause. Check each one and bail
+    // out with a specific, actionable message instead.
+    if (tcc_set_options(s1, "-nostdlib -nostdinc") < 0) {
+        console_print("cc: internal error: this build's TCC didn't accept "
+                       "-nostdlib -- try: make tcc-clean && make setup-tcc && make clean && make BOCHS=1\n");
+        free(full); tcc_delete(s1); return;
+    }
     tcc_set_lib_path(s1, "/nonexistent");
     tcc_set_output_type(s1, TCC_OUTPUT_EXE);   // nostdlib is now set — safe
-    tcc_set_options(s1, "-Wl,-e=_start");
-    tcc_set_options(s1, "-Wl,-Ttext=0x08002000");
+    if (tcc_set_options(s1, "-Wl,-e=_start") < 0) {
+        console_print("cc: internal error: this build's TCC didn't accept "
+                       "-Wl,-e=_start -- try: make tcc-clean && make setup-tcc && make clean && make BOCHS=1\n");
+        free(full); tcc_delete(s1); return;
+    }
+    if (tcc_set_options(s1, "-Wl,-Ttext=0x08002000") < 0) {
+        console_print("cc: internal error: this build's TCC didn't accept "
+                       "-Wl,-Ttext=0x08002000 -- try: make tcc-clean && make setup-tcc && make clean && make BOCHS=1\n");
+        free(full); tcc_delete(s1); return;
+    }
 
     int rc = tcc_compile_string(s1, full);
     free(full);

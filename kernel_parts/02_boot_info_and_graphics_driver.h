@@ -116,23 +116,31 @@ static inline void wrmsr64(uint32_t msr, uint64_t value) {
 // confidently (no MSR/MTRR support, no WC support, no free variable MTRR,
 // or a base/size that isn't naturally power-of-two aligned) -- worst case
 // the framebuffer is left exactly as slow as it already was, never worse.
-void setup_framebuffer_write_combining() {
-    if (!fb_info.ptr) return;
+//
+// Returns a short human-readable reason so the boot log can show WHETHER
+// this actually took effect. Silently no-op'ing here used to mean "mouse
+// (and everything else needing a full repaint) is slow on real hardware"
+// had no visible cause -- this several bail-out conditions (no free MTRR
+// slot in particular is common once firmware has already claimed all of
+// them) could fail with zero feedback.
+const char* setup_framebuffer_write_combining() {
+    if (!fb_info.ptr) return "skipped: no framebuffer";
 
     uint32_t eax, ebx, ecx, edx;
     cpuid_regs(1, eax, ebx, ecx, edx);
     bool has_msr  = (edx & (1u << 5))  != 0;
     bool has_mtrr = (edx & (1u << 12)) != 0;
-    if (!has_msr || !has_mtrr) return;
+    if (!has_msr || !has_mtrr) return "skipped: no MSR/MTRR support";
 
     uint64_t mtrrcap = rdmsr64(IA32_MTRRCAP);
     uint32_t vcnt = (uint32_t)(mtrrcap & 0xFF);
     bool wc_supported = (mtrrcap & (1ull << 10)) != 0;
-    if (!wc_supported || vcnt == 0) return;
+    if (!wc_supported) return "skipped: CPU doesn't support WC memory type";
+    if (vcnt == 0) return "skipped: CPU reports 0 variable MTRRs";
 
     uint64_t base = (uint64_t)(uintptr_t)fb_info.ptr;
     uint64_t fb_bytes = (uint64_t)fb_info.pitch * (uint64_t)fb_info.height;
-    if (fb_bytes == 0) return;
+    if (fb_bytes == 0) return "skipped: zero-size framebuffer";
 
     // Smallest power-of-two size (>= fb_bytes, <= 256MB) that `base` is
     // naturally aligned to. If nothing up to 256MB works, bail out.
@@ -141,14 +149,33 @@ void setup_framebuffer_write_combining() {
     for (; size <= (256ull * 1024 * 1024); size <<= 1) {
         if (size >= fb_bytes && (base % size) == 0) { found = true; break; }
     }
-    if (!found) return;
+    if (!found) return "skipped: framebuffer base isn't power-of-two aligned";
 
     int slot = -1;
     for (uint32_t i = 0; i < vcnt; i++) {
         uint64_t mask = rdmsr64(IA32_MTRR_PHYSMASK0 + i * 2);
         if (!(mask & (1ull << 11))) { slot = (int)i; break; } // valid bit clear = free
     }
-    if (slot < 0) return; // all variable MTRRs already in use -- don't clobber the BIOS's
+    if (slot < 0) {
+        // No free slot -- see if firmware already covers this exact range
+        // with something, so the log says what's actually stuck instead
+        // of just "no slot" (which reads like a dead end either way, but
+        // "already WB, nothing to fix" vs "already UC, no slot to fix
+        // it" are very different situations for a real-hardware report).
+        for (uint32_t i = 0; i < vcnt; i++) {
+            uint64_t pb = rdmsr64(IA32_MTRR_PHYSBASE0 + i * 2);
+            uint64_t pm = rdmsr64(IA32_MTRR_PHYSMASK0 + i * 2);
+            if (!(pm & (1ull << 11))) continue; // not valid
+            uint64_t existing_mask = pm & 0xFFFFFFFFFull & ~(1ull << 11);
+            uint64_t existing_base = pb & 0xFFFFFFFFFull & ~0xFFFull;
+            if ((base & existing_mask) == (existing_base & existing_mask)) {
+                uint8_t t = (uint8_t)(pb & 0xFF);
+                if (t == 1 || t == 6) return "already fast (WC/WB) via an existing MTRR -- not the bottleneck";
+                return "skipped: framebuffer stuck UC by an existing MTRR, no free slot to override it";
+            }
+        }
+        return "skipped: all variable MTRRs already in use by firmware";
+    }
 
     asm volatile("cli");
 
@@ -166,6 +193,8 @@ void setup_framebuffer_write_combining() {
     wrmsr64(IA32_MTRR_DEF_TYPE, def_type | (1ull << 11)); // re-enable MTRRs
 
     asm volatile("sti");
+
+    return "enabled";
 }
 
 // =============================================================================

@@ -75,15 +75,21 @@ struct TProgram {
     int   loc_count = 0;
 
     int add_local(const char* name, unsigned char t, int array_size = 0){
-        for(int i=0;i<loc_count;i++){ if(simple_strcmp(loc_name[i], name)==0) return i; }
+        // Truncate consistently with get_local() below (see
+        // simple_strcpy_bounded's comment) so a declaration and its
+        // later uses agree on the same (possibly-truncated) name rather
+        // than the declaration silently overflowing loc_name[][32].
+        char truncated[32]; simple_strcpy_bounded(truncated, name, sizeof(truncated));
+        for(int i=0;i<loc_count;i++){ if(simple_strcmp(loc_name[i], truncated)==0) return i; }
         if(loc_count>=LOC_MAX) return -1;
-        simple_strcpy(loc_name[loc_count], name);
+        simple_strcpy_bounded(loc_name[loc_count], truncated, sizeof(loc_name[loc_count]));
         loc_type[loc_count]=t;
         loc_array_size[loc_count] = array_size;
         return loc_count++;
     }
     int get_local(const char* name){
-        for(int i=0;i<loc_count;i++){ if(simple_strcmp(loc_name[i], name)==0) return i; }
+        char truncated[32]; simple_strcpy_bounded(truncated, name, sizeof(truncated));
+        for(int i=0;i<loc_count;i++){ if(simple_strcmp(loc_name[i], truncated)==0) return i; }
         return -1;
     }
     int get_local_type(int idx){ return (idx>=0 && idx<loc_count)? loc_type[idx] : 0; }
@@ -164,7 +170,12 @@ struct TLex {
 
     TTok string(){
         TTok t; t.t=TT_STR; int i=0; pos++;
-        while(src[pos] && src[pos]!='"'){ if(i<256) t.v[i++]=src[pos]; pos++; }
+        // Bound to 255, not 256: one byte must be reserved for the
+        // NUL terminator below, or a literal >=256 chars writes t.v[256]
+        // -- one past the end of TTok::v[256] (see this struct's
+        // definition above). Off-by-one stack overflow, reachable with
+        // any source file containing a long enough string literal.
+        while(src[pos] && src[pos]!='"'){ if(i<255) t.v[i++]=src[pos]; pos++; }
         t.v[i]=0; if(src[pos]=='"') pos++; return t;
     }
 
@@ -320,7 +331,7 @@ struct TCompiler {
         if(tk.t==TT_ID){
             int idx = pr.get_local(tk.v);
             if(idx<0){ printf("Unknown var %s\n", tk.v); }
-            char var_name[32]; simple_strcpy(var_name, tk.v);
+            char var_name[32]; simple_strcpy_bounded(var_name, tk.v, sizeof(var_name));
             adv();
 
             // Array indexing
@@ -368,7 +379,7 @@ struct TCompiler {
         while(tk.t==TT_OP && (simple_strcmp(tk.v,"==")==0 || simple_strcmp(tk.v,"!=")==0 ||
               simple_strcmp(tk.v,"<")==0 || simple_strcmp(tk.v,"<=")==0 ||
               simple_strcmp(tk.v,">")==0 || simple_strcmp(tk.v,">=")==0)){
-            char opv[3]; simple_strcpy(opv, tk.v); adv(); parse_arith();
+            char opv[3]; simple_strcpy_bounded(opv, tk.v, sizeof(opv)); adv(); parse_arith();
             if(simple_strcmp(opv,"==")==0) pr.emit1(T_EQ);
             else if(simple_strcmp(opv,"!=")==0) pr.emit1(T_NE);
             else if(simple_strcmp(opv,"<")==0)  pr.emit1(T_LT);
@@ -383,7 +394,7 @@ struct TCompiler {
     void parse_decl(unsigned char tkind){
         adv(); // past type keyword
         if(tk.t!=TT_ID){ printf("Expected identifier\n"); return; }
-        char nm[32]; simple_strcpy(nm, tk.v); adv();
+        char nm[32]; simple_strcpy_bounded(nm, tk.v, sizeof(nm)); adv();
 
         int array_size = 0;
         // Array declaration syntax: int arr[size] or string arr[size]
@@ -452,7 +463,7 @@ struct TCompiler {
                 else if(tk.t==TT_STR){ const char* p=pr.add_lit(tk.v); pr.emit1(T_PUSH_STR); pr.emit4((int)p); adv(); pr.emit1(T_PRINT_STR); }
                 else if(tk.t==TT_KW && simple_strcmp(tk.v,"argv")==0){ adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_PUSH_ARGV_PTR); pr.emit1(T_PRINT_STR); }
                 else if(tk.t==TT_ID){
-                    char var_name[32]; simple_strcpy(var_name, tk.v);
+                    char var_name[32]; simple_strcpy_bounded(var_name, tk.v, sizeof(var_name));
                     int idx = pr.get_local(tk.v); int ty = pr.get_local_type(idx); adv();
 
                     // Handle array element printing vs whole array printing

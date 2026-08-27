@@ -780,6 +780,22 @@ void simple_strcpy(char* dest, const char* src) {
     *dest = '\0';
 }
 
+// Bounded copy for fixed-size stack/struct buffers. simple_strcpy() above
+// is unbounded (identical hazard to libc strcpy) -- fine when the source
+// is already known to fit, but the compiler front-end (08_...) copies
+// lexer tokens (up to ~63 chars, see TTok::v[256] in that file) into
+// 32-byte identifier buffers with plain simple_strcpy(). This kernel is
+// built with -fno-stack-protector, so an identifier over 31 characters
+// in a compiled source file silently smashed the compiler's own stack --
+// reachable just by running the OS's own `compile` command on a crafted
+// .cpp file. Truncates safely instead of overflowing; always
+// NUL-terminates within destsize (destsize must be >= 1).
+void simple_strcpy_bounded(char* dest, const char* src, int destsize) {
+    int i = 0;
+    for (; i < destsize - 1 && src[i]; i++) dest[i] = src[i];
+    dest[i] = '\0';
+}
+
 int simple_strcmp(const char* s1, const char* s2) {
     while (*s1 && (*s1 == *s2)) {
         s1++;

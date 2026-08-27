@@ -947,7 +947,7 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
     // it's what makes every-frame swap_buffers() blits, and therefore
     // mouse tracking, not feel sluggish on real silicon). No-op under
     // VMware/emulation, where this was never the bottleneck.
-    setup_framebuffer_write_combining();
+    const char* g_fb_wc_status = setup_framebuffer_write_combining();
 
     // ── Step 3: commit and paint ──────────────────────────────────────────────
     backbuffer = backbuffer_storage;
@@ -958,6 +958,19 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
 
     // ── Open first terminal window ────────────────────────────────────────────
     launch_new_terminal();
+
+    // Report whether the WC fix above actually took effect. This used to
+    // fail silently, so "everything on real hardware is slow -- typing,
+    // opening windows, all of it" had no visible cause: every one of
+    // those triggers a full swap_buffers() blit, and if the framebuffer
+    // is still stuck Uncacheable (no free MTRR slot is the common real-
+    // hardware case -- firmware often claims all of them), that blit
+    // stays 20-100x slower no matter what else gets optimized.
+    {
+        char wcmsg[128];
+        vga_cat(wcmsg, "Framebuffer write-combining: ", g_fb_wc_status, "\n");
+        wm.print_to_focused(wcmsg);
+    }
 
     // ── PS/2 mouse ────────────────────────────────────────────────────────────
     ps2_flush_output_buffer();
@@ -1091,9 +1104,20 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
         bool mouse_moved = (mouse_x != prev_mouse_x || mouse_y != prev_mouse_y);
         bool key_pressed = (last_key_press != 0);
 
+        // Anything that can actually change what's on screen beyond the
+        // cursor's own position: a key, a fresh click edge, or a button
+        // being held (drag/resize/paint-canvas in progress). A plain
+        // hover-move with nothing held is deliberately NOT included here
+        // -- see the cursor-only fast path further down for why forcing
+        // a full repaint for that case is what made mouse movement feel
+        // heavy.
+        bool input_needs_full_repaint = key_pressed || leftClickedThisFrame ||
+                                         rightClickedThisFrame || mouse_left_down ||
+                                         mouse_right_down;
+
         if (key_pressed || mouse_moved || leftClickedThisFrame || rightClickedThisFrame) {
             g_evt_input = true;
-            g_input_state.hasNewInput = true;
+            if (input_needs_full_repaint) g_input_state.hasNewInput = true;
             prev_mouse_x = mouse_x;
             prev_mouse_y = mouse_y;
         }
@@ -1143,7 +1167,12 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
                             leftClickedThisFrame,
                             rightClickedThisFrame);
             if (last_key_press != 0) last_key_press = 0;
-            g_evt_dirty = true;
+            // Only force the expensive full-desktop repaint for input
+            // that can actually change what's drawn. handle_input()
+            // early-returns doing nothing at all for a plain hover-move
+            // (no button down, no click edge), so there's nothing here
+            // for a full repaint to pick up in that case anyway.
+            if (input_needs_full_repaint) g_evt_dirty = true;
         }
 
         wm.cleanup_closed_windows();
@@ -1159,7 +1188,47 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
             // swap_buffers. Otherwise a hang inside tick_elf_processes
             // would leave the last painted frame without the breadcrumbs
             // pointing at where the hang happened.
-            tick_elf_processes(1);
+            //
+            // A single tick_elf_processes() call can itself block for a
+            // perceptible chunk of wall time -- bochs_cpu_tick() (see
+            // bochs_glue.cpp) hands the guest a budget of up to tens of
+            // thousands of software-interpreted instructions per call,
+            // and a CPU-bound guest with little port I/O to yield on
+            // (its main way of handing control back early) can burn
+            // through that whole budget before returning. During that
+            // entire call the mouse can't be polled or redrawn at all --
+            // "everything is smooth until a program is actually running,
+            // then the cursor stutters" is exactly what that looks like.
+            // Splitting the interval's guest-execution budget into
+            // several smaller ticks and polling+redrawing the cursor
+            // between each one gives the pointer many more chances to
+            // stay current while a program runs, instead of only one at
+            // the very end of the interval. (A single sub-tick can still
+            // block for its own full budget if the guest never yields at
+            // all -- this doesn't fix that pathological case, but it's
+            // the common one: any guest doing the usual putc/getc-style
+            // I/O yields far more often than that.)
+            const int GUEST_SUBTICKS = 8;
+            for (int st = 0; st < GUEST_SUBTICKS; st++) {
+                tick_elf_processes(1);
+
+                poll_input_universal();
+                bool subtick_mouse_moved = (mouse_x != prev_mouse_x || mouse_y != prev_mouse_y);
+                if (subtick_mouse_moved) {
+                    prev_mouse_x = mouse_x;
+                    prev_mouse_y = mouse_y;
+                    // Only the cheap cursor-only redraw here -- if a
+                    // button is down (drag/resize/paint in progress) or
+                    // the backbuffer isn't in a known-clean state, leave
+                    // it for the normal full-repaint path below instead
+                    // of risking a partial/stale-looking mid-tick frame.
+                    if (g_backbuffer_is_clean_on_screen &&
+                        !mouse_left_down && !mouse_right_down) {
+                        erase_cursor_from_screen();
+                        draw_cursor_to_screen(mouse_x, mouse_y, ColorPalette::CURSOR_WHITE);
+                    }
+                }
+            }
 
             last_tick_tick = g_timer_ticks;
             g_evt_timer     = false;
@@ -1187,7 +1256,6 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
             g_input_state.hasNewInput = false;
             g_gfx.clear_screen(ColorPalette::DESKTOP_GRAY );
             wm.update_all();
-            draw_cursor(mouse_x, mouse_y, ColorPalette::CURSOR_WHITE);
             // Diagnostic overlay: paint VGA text-mode rows 0/1/2
             // (boot/panic/tick breadcrumbs, host-IDT fault tags,
             // x86_tick lazy-init progress) onto the framebuffer so
@@ -1195,6 +1263,26 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
             // overlays everything.
             draw_vga_overlay();
             swap_buffers();
+            // The backbuffer just pushed to the screen has no cursor in
+            // it (draw_cursor() is intentionally not called here any
+            // more -- see the cursor-only fast path comment below), so
+            // draw the cursor glyph straight onto the framebuffer now
+            // and remember where. That's what lets the *next* frame, if
+            // it's just a plain pointer move, skip the full repaint
+            // entirely.
+            erase_cursor_from_screen(); // no-op the first time through
+            draw_cursor_to_screen(mouse_x, mouse_y, ColorPalette::CURSOR_WHITE);
+            g_backbuffer_is_clean_on_screen = true;
+        } else if (mouse_moved && g_backbuffer_is_clean_on_screen) {
+            // Cursor-only fast path: nothing but the pointer position
+            // changed this frame (no key, no click, no button held --
+            // handle_input() already established there's nothing else
+            // to redraw). Move just the ~8x12px cursor glyph directly
+            // on the framebuffer instead of clearing and redrawing the
+            // entire desktop/every window/the taskbar clock and doing a
+            // full 1024x768 blit for a one-pixel pointer nudge.
+            erase_cursor_from_screen();
+            draw_cursor_to_screen(mouse_x, mouse_y, ColorPalette::CURSOR_WHITE);
         }
     }
 }

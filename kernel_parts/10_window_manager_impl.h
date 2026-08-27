@@ -469,6 +469,13 @@ extern "C" void test_sink_flush(void) {
     draw_cursor(mouse_x, mouse_y, ColorPalette::CURSOR_WHITE);
     draw_vga_overlay();                    // framebuffer breadcrumb rows
     swap_buffers();                        // push frame to the display
+    // This path (unlike the main loop) draws the cursor INTO the
+    // backbuffer above, which breaks the "backbuffer is always
+    // cursor-free" invariant the main loop's cursor-only fast path
+    // relies on (see 05_io_wait_ps2_funcs.h). Force the main loop back
+    // through a full repaint next time it runs so it re-establishes a
+    // clean backbuffer before it trusts it again.
+    g_backbuffer_is_clean_on_screen = false;
 }
 
 static volatile bool g_evt_timer = false;
