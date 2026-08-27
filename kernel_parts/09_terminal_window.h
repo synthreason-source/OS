@@ -66,6 +66,21 @@ private:
     int edit_current_line;
     int edit_cursor_col;
     int edit_scroll_offset;
+    // Parallel array, same length/indexing as edit_lines: true at index i
+    // means edit_lines[i] doesn't end with a real newline -- it's a
+    // WORD-WRAP continuation, and edit_lines[i+1] is the rest of the
+    // same paragraph. Defaults false (a real line end) for every new
+    // line; only the wrap code paths (live typing, file load) set it
+    // true on the line they just split. This is what lets Ctrl+Q save
+    // reconstruct the original paragraph instead of writing a real '\n'
+    // at every wrap point -- previously EVERY line break in edit_lines[]
+    // was written back as a literal newline regardless of whether it
+    // came from Enter or just word-wrap, so a paragraph that had
+    // visually wrapped across screen lines got permanently chopped into
+    // separate lines on disk, and reopening+resaving it repeatedly kept
+    // re-wrapping (and re-hardening) it into progressively more and
+    // shorter fragmented lines.
+    bool* edit_line_soft_wrap;
 
     // Prompt visual state for multi-line input
     int prompt_visual_lines;
@@ -135,13 +150,20 @@ void editor_ensure_cursor_visible() {
 }
 private:
     // Insert a new line at a given index, copying the provided text into it.
+    // The new line's own soft-wrap flag always starts false (a real end,
+    // until/unless something wraps it further); callers that just split
+    // a line via word-wrap are responsible for marking the PRECEDING
+    // line (index-1, the one that got split) as a soft wrap afterward --
+    // see the call sites in on_key_press() and the "edit" file loader.
     void editor_insert_line_at(int index, const char* text) {
         if (index < 0 || index > edit_line_count) return;
 
         char** new_lines = new char*[edit_line_count + 1];
+        bool* new_soft_wrap = new bool[edit_line_count + 1];
 
         for (int i = 0; i < index; ++i) {
             new_lines[i] = edit_lines[i];
+            new_soft_wrap[i] = edit_line_soft_wrap[i];
         }
 
         new_lines[index] = new char[TERM_WIDTH];
@@ -149,15 +171,19 @@ private:
         if (text) {
             strncpy(new_lines[index], text, TERM_WIDTH - 1);
         }
+        new_soft_wrap[index] = false;
 
         for (int i = index; i < edit_line_count; ++i) {
             new_lines[i + 1] = edit_lines[i];
+            new_soft_wrap[i + 1] = edit_line_soft_wrap[i];
         }
 
         if (edit_lines) {
             delete[] edit_lines;
+            delete[] edit_line_soft_wrap;
         }
         edit_lines = new_lines;
+        edit_line_soft_wrap = new_soft_wrap;
         edit_line_count++;
     }
 
@@ -168,17 +194,22 @@ private:
         delete[] edit_lines[index];
 
         char** new_lines = new char*[edit_line_count - 1];
-        
+        bool* new_soft_wrap = new bool[edit_line_count - 1];
+
         for (int i = 0; i < index; ++i) {
             new_lines[i] = edit_lines[i];
+            new_soft_wrap[i] = edit_line_soft_wrap[i];
         }
 
         for (int i = index + 1; i < edit_line_count; ++i) {
             new_lines[i - 1] = edit_lines[i];
+            new_soft_wrap[i - 1] = edit_line_soft_wrap[i];
         }
 
         delete[] edit_lines;
+        delete[] edit_line_soft_wrap;
         edit_lines = new_lines;
+        edit_line_soft_wrap = new_soft_wrap;
         edit_line_count--;
     }
 
