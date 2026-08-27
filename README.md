@@ -8,8 +8,8 @@ SATA port selection with 'disk_select'
 
 guest programs require drivers.h and comp.h to interface with the OS.
 
-TODO: add ethernet, Lynx_(web_browser) & busybox
-
+TODO: add ethernet, web browser & busybox implementation
+TODO: add driver kit, CPU resource optimising
 # Build Instructions
 
 ## Prerequisites (one-time apt installs)
