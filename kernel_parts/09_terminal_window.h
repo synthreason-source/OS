@@ -1257,6 +1257,8 @@ void handle_command() {
             edit_lines = new char*[1];
             edit_lines[0] = new char[120];
             memset(edit_lines[0], 0, 120);
+            edit_line_soft_wrap = new bool[1];
+            edit_line_soft_wrap[0] = false;
             edit_line_count = 1;
 
             if (content) {
@@ -1285,16 +1287,27 @@ void handle_command() {
                             char saved_c = seg[take];
                             seg[take] = '\0';
 
+                            int just_added_index;
                             if (!first_segment_used) {
                                 strncpy(edit_lines[0], seg, 119);
                                 first_segment_used = true;
+                                just_added_index = 0;
                             } else {
                                 editor_insert_line_at(edit_line_count, seg);
+                                just_added_index = edit_line_count - 1;
                             }
 
                             seg[take] = saved_c;
                             seg += take;
                             while (*seg == ' ' || *seg == '\t') seg++;
+
+                            // If there's more of THIS raw (real-newline-
+                            // delimited) line left after this chunk, the
+                            // break we just made was a word-wrap, not a
+                            // real newline -- mark it so Ctrl+Q save can
+                            // reconstruct the original line instead of
+                            // writing a real '\n' at every wrap point.
+                            if (*seg) edit_line_soft_wrap[just_added_index] = true;
                         } while (*seg);
 
                         *p = saved;
@@ -1857,6 +1870,7 @@ public:
           line_count(0), line_pos(0), in_editor(false),
           edit_lines(nullptr), edit_line_count(0), edit_current_line(0),
           edit_cursor_col(0), edit_scroll_offset(0),
+          edit_line_soft_wrap(nullptr),
           prompt_visual_lines(0),
           is_emulator_window(emulator_mode) {
         memset(buffer, 0, sizeof(buffer));
@@ -1968,6 +1982,7 @@ public:
         if(edit_lines) {
             for(int i = 0; i < edit_line_count; i++) delete[] edit_lines[i];
             delete[] edit_lines;
+            delete[] edit_line_soft_wrap;
         }
     }
 
@@ -2262,7 +2277,18 @@ public:
             for (int i = 0; i < edit_line_count; i++) {
                 strcat(file_content, edit_lines[i]);
                 if (i < edit_line_count - 1) {
-                   strcat(file_content, "\n");
+                    // A soft-wrapped line was never a real newline in the
+                    // first place -- it was split from one longer line
+                    // purely so it would fit the editor's width. Writing
+                    // a literal '\n' here would permanently chop that
+                    // paragraph into separate lines on disk (and each
+                    // future open+edit+save would re-wrap and re-harden
+                    // it further, since the loader has no way to tell
+                    // the difference once it's written that way). Put
+                    // back the single space the wrap removed instead,
+                    // reconstructing the original line; only a REAL
+                    // Enter press writes an actual newline.
+                    strcat(file_content, edit_line_soft_wrap[i] ? " " : "\n");
                 }
             }
             fat32_write_file_path(edit_filename, file_content, strlen(file_content));
@@ -2299,13 +2325,28 @@ public:
                 char* next_line_ptr = edit_lines[edit_current_line + 1];
                 if (current_len + strlen(next_line_ptr) < TERM_WIDTH - 1) {
                     strcat(current_line_ptr, next_line_ptr);
+                    // The merged line now ends wherever the deleted
+                    // (next) line used to end -- inherit its status
+                    // before it's gone.
+                    bool merged_trailing = edit_line_soft_wrap[edit_current_line + 1];
                     editor_delete_line_at(edit_current_line + 1);
+                    edit_line_soft_wrap[edit_current_line] = merged_trailing;
                 }
             }
         }
         else if (c == '\n') { // Enter key
             const char* right_part_text = &current_line_ptr[edit_cursor_col];
+            // Capture the ORIGINAL line's relationship to whatever came
+            // after it before splitting -- that status (real break or
+            // word-wrap continuation) belongs to the second half now,
+            // since the second half is what the rest of the file
+            // actually continues from.
+            bool original_trailing_soft_wrap = edit_line_soft_wrap[edit_current_line];
             editor_insert_line_at(edit_current_line + 1, right_part_text);
+            // The first half now ends with a real, user-pressed newline,
+            // regardless of what the whole line's status used to be.
+            edit_line_soft_wrap[edit_current_line]     = false;
+            edit_line_soft_wrap[edit_current_line + 1] = original_trailing_soft_wrap;
             current_line_ptr[edit_cursor_col] = '\0';
             edit_current_line++;
             edit_cursor_col = 0;
@@ -2322,7 +2363,12 @@ public:
                 int prev_len = strlen(prev_line_ptr);
                 if (prev_len + current_len < TERM_WIDTH - 1) {
                     strcat(prev_line_ptr, current_line_ptr);
+                    // Same as the KEY_DELETE join above: the merged line
+                    // ends wherever the (about to be deleted) current
+                    // line used to end.
+                    bool merged_trailing = edit_line_soft_wrap[edit_current_line];
                     editor_delete_line_at(edit_current_line);
+                    edit_line_soft_wrap[prev_line_idx] = merged_trailing;
                     edit_current_line = prev_line_idx;
                     edit_cursor_col = prev_len;
                 }
@@ -2375,6 +2421,12 @@ public:
                     
                     // Insert wrapped text as new line
                     editor_insert_line_at(edit_current_line + 1, trimmed);
+                    // This break is a word-wrap, not a real newline --
+                    // mark the line we just split so Ctrl+Q save
+                    // reconstructs the paragraph instead of writing a
+                    // literal '\n' here (see edit_line_soft_wrap's
+                    // declaration for the full story).
+                    edit_line_soft_wrap[edit_current_line] = true;
                     
                     // Move cursor to next line if it was past wrap point
                     if (edit_cursor_col > wrap_pos) {

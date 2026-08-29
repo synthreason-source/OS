@@ -1076,8 +1076,12 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
     uint32_t hb_counter = 0;
     const char hb_chars[] = "|/-\\";
     static uint32_t poll_counter = 0;
+    // Power-saving idle backoff -- see the big comment at the bottom of
+    // the loop body for why this uses `pause` and not `hlt`.
+    uint32_t idle_streak = 0;
 
     for (;;) {
+        bool did_anything_this_iteration = false;
         if (++hb_counter % 10000 == 0) {
             *vga_hb = (uint16_t)(0x0A00u | (uint8_t)hb_chars[(hb_counter/10000)%4]);
 
@@ -1209,7 +1213,32 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
             // the common one: any guest doing the usual putc/getc-style
             // I/O yields far more often than that.)
             const int GUEST_SUBTICKS = 8;
-            for (int st = 0; st < GUEST_SUBTICKS; st++) {
+
+            // ── CPU budget: share the interval's ticks across active processes ──
+            // tick_elf_processes(1) itself ticks EVERY active-and-running
+            // process once per call (its own per-process exit/cleanup
+            // bookkeeping is deliberately left untouched here -- see that
+            // function's comments on how fragile surgical changes there
+            // have been). Without this, N concurrently-running processes
+            // would each get the FULL GUEST_SUBTICKS rounds independently,
+            // so total guest-emulation work -- and worst-case time before
+            // the next mouse poll -- scaled linearly with process count.
+            // Dividing the round count by how many processes are actually
+            // competing keeps the TOTAL budget for this timer interval
+            // roughly constant regardless of how many programs are
+            // running at once, the way a real scheduler's time-slice
+            // would, rather than handing out unlimited independent
+            // allowances.
+            int active_count = 0;
+            for (int i = 0; i < MAX_ELF_PROCESSES; i++) {
+                if (elf_processes[i].active && !elf_processes[i].completed) active_count++;
+            }
+            int subtick_rounds = GUEST_SUBTICKS;
+            if (active_count > 1) {
+                subtick_rounds = GUEST_SUBTICKS / active_count;
+                if (subtick_rounds < 1) subtick_rounds = 1;
+            }
+            for (int st = 0; st < subtick_rounds; st++) {
                 tick_elf_processes(1);
 
                 poll_input_universal();
@@ -1228,6 +1257,7 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
                         draw_cursor_to_screen(mouse_x, mouse_y, ColorPalette::CURSOR_WHITE);
                     }
                 }
+                if (active_count > 0) did_anything_this_iteration = true;
             }
 
             last_tick_tick = g_timer_ticks;
@@ -1273,6 +1303,7 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
             erase_cursor_from_screen(); // no-op the first time through
             draw_cursor_to_screen(mouse_x, mouse_y, ColorPalette::CURSOR_WHITE);
             g_backbuffer_is_clean_on_screen = true;
+            did_anything_this_iteration = true;
         } else if (mouse_moved && g_backbuffer_is_clean_on_screen) {
             // Cursor-only fast path: nothing but the pointer position
             // changed this frame (no key, no click, no button held --
@@ -1283,6 +1314,37 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
             // full 1024x768 blit for a one-pixel pointer nudge.
             erase_cursor_from_screen();
             draw_cursor_to_screen(mouse_x, mouse_y, ColorPalette::CURSOR_WHITE);
+            did_anything_this_iteration = true;
+        }
+
+        // ── Power saving: back off the busy-poll spin when idle ────────────
+        // This kernel has no working periodic hardware interrupt (see the
+        // "Software timer (no PIT...)" comment above) and mouse/keyboard
+        // input is polled, not interrupt-driven -- so `hlt` is NOT safe
+        // here. Nothing would ever fire to wake the CPU back up once
+        // halted, and the very first genuinely idle moment would hang the
+        // machine solid. `pause` is the safe alternative: it's a hint to
+        // the CPU that this is a spin-wait rather than real work, which on
+        // real hardware measurably cuts power draw and heat in a busy-poll
+        // loop like this one without changing behavior -- the very next
+        // instruction still executes immediately afterward, so it can
+        // never cause a missed input or a delayed guest tick.
+        //
+        // Back off adaptively: the longer nothing has happened, the more
+        // pauses this iteration spends (capped), which lowers the
+        // polling loop's CPU floor further the longer the system sits
+        // genuinely idle. Any real input, redraw, or active guest process
+        // resets it to full responsiveness immediately -- this never adds
+        // latency to anything, it only spends idle cycles more cheaply.
+        if (did_anything_this_iteration) {
+            idle_streak = 0;
+        } else if (idle_streak < 0xFFFFFFFFu) {
+            idle_streak++;
+        }
+        {
+            uint32_t pause_count = 1 + (idle_streak >> 6); // ramps 1 -> 64
+            if (pause_count > 64) pause_count = 64;
+            for (uint32_t p = 0; p < pause_count; p++) asm volatile("pause");
         }
     }
 }
