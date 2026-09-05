@@ -4,6 +4,83 @@
 
 This is the **FIXED** version of the OS project with all 4 critical Bochs ELF execution glitches resolved.
 
+## Fix #6 (added): `editf` (comp.h GUI editor) couldn't be built at all
+
+**Symptom:** `make cc SRC=EDITF.C` failed immediately with
+`tcc: error: EDITF.C: unrecognized file type`, and even working around
+that failed with `include file 'comp.h' not found`.
+
+**Root cause:** two case-sensitivity bugs, invisible on the
+case-insensitive filesystem (macOS/Windows) this project was evidently
+authored on, but fatal on the case-sensitive Linux host the Makefile
+otherwise assumes (it already uses gcc/apt/mtools/wget, all Linux-only
+tooling):
+
+1. The source file was named `EDITF.C` (uppercase extension). TCC's
+   driver dispatches on file extension and only recognizes lowercase
+   `.c`, so it refused to compile the file at all via the documented
+   `make cc SRC=...` host path.
+2. `EDITF.C` did `#include "comp.h"` (lowercase), but the header it
+   needed was checked in as `COMP.H` (uppercase). On a case-sensitive
+   filesystem that `#include` can never resolve, and the Makefile's own
+   `mcopy -o -i "$(DISK_IMG)" "comp.h" "::comp.h"` step (meant to sync
+   the header onto disk.img for the in-kernel `cc` path) silently
+   failed for the same reason — it's guarded by `|| true`, so the
+   missing header was never surfaced as a build error, just a mysterious
+   runtime/compile failure whenever anyone actually tried to build the
+   editor.
+
+**Fix:** renamed `EDITF.C` → `editf.c` and `COMP.H` → `comp.h` (no code
+changes needed — `comp.h`'s own contents and every other `#include` in
+the tree already used the lowercase spelling). Verified end-to-end with
+the project's real guest toolchain:
+
+```
+i386-tcc -c editf.c -o editf.o -I.        # now compiles cleanly
+ld -m elf_i386 -T tcc_guest.ld -o editf.elf editf.o   # links cleanly
+```
+
+Also updated `editf.c`'s own header comment, which referenced its
+pre-rename filename (`text_edit.c`) in the build instructions, to match
+its real name.
+
+## Fix #7 (added): guest gfx programs (editf etc.) felt sluggish at runtime
+
+**Symptom:** once built and running, `editf` (and any other guest gfx
+program) felt laggy — delayed keystrokes, sluggish redraws — even
+though the CPU-emulation instruction budget per tick was already sized
+generously by Fix from the earlier pass.
+
+**Root cause:** `kernel_parts/11_kernel_main.h`'s main loop has no real
+hardware timer (no PIT/IRQ0), so it uses a plain loop-iteration counter
+(`poll_counter`) as a substitute "software timer". That counter is the
+**only** gate on how often `tick_elf_processes()` runs at all — i.e.
+the only thing that lets ANY guest ELF process, including `editf`,
+execute a batch of instructions. It was set to trip once every 500 raw
+loop iterations, and every one of those iterations also performs real
+PS/2 port I/O via `poll_input_universal()`, which is comparatively slow
+(more so under emulation/virtualization). So a keystroke or a redraw in
+`editf` could sit waiting for up to 500 I/O-bound iterations before the
+guest was even scheduled once — independent of how fast `editf`'s own
+drawing code is.
+
+**Fix:** dropped the threshold from 500 to 20 in
+`kernel_parts/11_kernel_main.h`. `g_evt_timer` (the flag this counter
+sets) has no other consumer in the kernel, so this only affects guest
+scheduling cadence — it doesn't touch the idle power-saving backoff
+(`pause`-ramping), which only engages once nothing is happening anyway.
+
+**Caveat:** this fix is a targeted, code-level correction based on
+static analysis of the scheduling path (confirmed `g_evt_timer` has no
+other reader, confirmed the old value had no real-time justification).
+Unlike Fix #6, it was **not** verified by actually booting the OS in an
+emulator — that would require building Bochs 2.0 from source and a full
+ISO/disk image, which wasn't done in this pass. If it's still not
+smooth enough after rebuilding, the next things to check are the
+per-tick instruction budget in `bochs_cpu_tick()` (`bochs_glue.cpp`,
+currently `n * 65536`) and `GUEST_SUBTICKS` (currently 8) in the same
+loop.
+
 ## Changes Summary
 
 ### File: bochs_glue.cpp

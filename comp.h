@@ -14,13 +14,15 @@
  *     #include "comp.h"
  *
  *     ui_button_t   quit_btn = { 10, 10, 60, 20, "Quit" };
- *     ui_scrollbar_t bar;    ui_scrollbar_init(&bar, 300, 10, 12, 180, 0, 100, 0);
+ *     ui_scrollbar_t bar;    ui_scrollbar_init(&bar, 300, 10, 12, 180, 0,
+100, 0);
  *     ui_textbox_t   box;    ui_textbox_init(&box, 10, 40, 200, 18);
  *
  *     void _start(void) {
  *         for (;;) {
  *             ui_frame_t f;
- *             ui_frame_begin(&f, 0x202028);      // polls mouse+key, clears canvas
+ *             ui_frame_begin(&f, 0x202028);      // polls mouse+key,
+clears canvas
  *
  *             if (ui_button(&f, &quit_btn))  break;
  *             ui_scrollbar_update(&f, &bar);
@@ -45,7 +47,10 @@
 #include "drivers.h"
 #include "font.h"
 
-/* ── palette ──────────────────────────────────────────────────────── */
+/* ── palette
+─────────────────────────
+─────────────────────────
+────── */
 #define UI_COLOR_BG          0x202028
 #define UI_COLOR_PANEL       0x30303A
 #define UI_COLOR_BORDER      0x55555F
@@ -57,19 +62,24 @@
 #define UI_COLOR_ACCENT      0x5C7CFA
 #define UI_COLOR_CURSOR      0xFFFFFF
 
-/* ── low-level drawing (into gfx_framebuffer) ────────────────────── */
+/* ── low-level drawing (into gfx_framebuffer)
+────────────────────── */
 
-static inline void ui_fill_rect(int x, int y, int w, int h, unsigned int color)
+static inline void ui_fill_rect(int x, int y, int w, int h, unsigned int
+color)
 {
     for (int j = 0; j < h; j++)
         for (int i = 0; i < w; i++)
             gfx_set_pixel(x + i, y + j, color);
 }
 
-static inline void ui_stroke_rect(int x, int y, int w, int h, unsigned int color)
+static inline void ui_stroke_rect(int x, int y, int w, int h, unsigned int
+color)
 {
-    for (int i = 0; i < w; i++) { gfx_set_pixel(x + i, y, color); gfx_set_pixel(x + i, y + h - 1, color); }
-    for (int j = 0; j < h; j++) { gfx_set_pixel(x, y + j, color); gfx_set_pixel(x + w - 1, y + j, color); }
+    for (int i = 0; i < w; i++) { gfx_set_pixel(x + i, y, color);
+gfx_set_pixel(x + i, y + h - 1, color); }
+    for (int j = 0; j < h; j++) { gfx_set_pixel(x, y + j, color);
+gfx_set_pixel(x + w - 1, y + j, color); }
 }
 
 /* 8x8 bitmap glyph, 1:1 scale, from font.h (shared with the kernel's
@@ -82,12 +92,14 @@ static inline void ui_draw_char(int x, int y, char c, unsigned int color)
     for (int row = 0; row < 8; row++) {
         unsigned char bits = glyph[row];
         for (int col = 0; col < 8; col++) {
-            if (bits & (0x80 >> col)) gfx_set_pixel(x + col, y + row, color);
+            if (bits & (0x80 >> col)) gfx_set_pixel(x + col, y + row,
+color);
         }
     }
 }
 
-static inline void ui_draw_text(int x, int y, const char* s, unsigned int color)
+static inline void ui_draw_text(int x, int y, const char* s, unsigned int
+color)
 {
     int cx = x;
     while (*s) {
@@ -105,11 +117,13 @@ static inline int ui_text_width(const char* s)
     return w;
 }
 
-/* ── frame: one mouse+keyboard snapshot for this pass of the loop ─── */
+/* ── frame: one mouse+keyboard snapshot for this pass of the loop
+─── */
 
 typedef struct {
     mouse_state_t mouse;
-    int           key;     /* key_poll() result: 0 = none, else the char/KEY_* code */
+    int           key;     /* key_poll() result: 0 = none, else the
+char/KEY_* code */
 } ui_frame_t;
 
 static inline void ui_frame_begin(ui_frame_t* f, unsigned int bg_color)
@@ -121,12 +135,16 @@ static inline void ui_frame_begin(ui_frame_t* f, unsigned int bg_color)
 
 static inline void ui_frame_end(void) { gfx_present(); }
 
-static inline int ui_point_in_rect(int px, int py, int x, int y, int w, int h)
+static inline int ui_point_in_rect(int px, int py, int x, int y, int w, int
+h)
 {
     return px >= x && px < x + w && py >= y && py < y + h;
 }
 
-/* ── button ───────────────────────────────────────────────────────── */
+/* ── button
+─────────────────────────
+─────────────────────────
+─────── */
 /* Stateless (immediate mode): just a rect + label. Returns 1 on the
  * frame the button is clicked (left button transitioned down while
  * the cursor was over it), 0 otherwise. Draws itself every frame it's
@@ -140,11 +158,13 @@ typedef struct {
 
 static inline int ui_button(const ui_frame_t* f, const ui_button_t* b)
 {
-    int hot = f->mouse.in_window && ui_point_in_rect(f->mouse.x, f->mouse.y, b->x, b->y, b->w, b->h);
+    int hot = f->mouse.in_window && ui_point_in_rect(f->mouse.x, f
+->mouse.y, b->x, b->y, b->w, b->h);
     int clicked = hot && f->mouse.left_clicked;
 
     unsigned int face = UI_COLOR_BUTTON;
-    if (hot) face = f->mouse.left_down ? UI_COLOR_BUTTON_DOWN : UI_COLOR_BUTTON_HOT;
+    if (hot) face = f->mouse.left_down ? UI_COLOR_BUTTON_DOWN :
+UI_COLOR_BUTTON_HOT;
 
     ui_fill_rect(b->x, b->y, b->w, b->h, face);
     ui_stroke_rect(b->x, b->y, b->w, b->h, UI_COLOR_BORDER);
@@ -161,21 +181,26 @@ static inline int ui_button(const ui_frame_t* f, const ui_button_t* b)
     return clicked;
 }
 
-/* ── scrollbar (vertical) ─────────────────────────────────────────── */
+/* ── scrollbar (vertical)
+─────────────────────────
+────────────────── */
 /* Retained state: remembers whether the thumb is currently being
  * dragged across frames (a drag naturally spans many mouse_poll()
  * calls). value is clamped to [min, max] and stored directly in the
- * struct so the caller just reads bar.value after ui_scrollbar_update(). */
+ * struct so the caller just reads bar.value after ui_scrollbar_update().
+*/
 
 typedef struct {
     int x, y, w, h;
     int min, max;
     int value;
     int dragging;
-    int drag_grab_offset;   /* pixel offset from thumb top to where the drag grabbed it */
+    int drag_grab_offset;   /* pixel offset from thumb top to where the
+drag grabbed it */
 } ui_scrollbar_t;
 
-static inline void ui_scrollbar_init(ui_scrollbar_t* s, int x, int y, int w, int h,
+static inline void ui_scrollbar_init(ui_scrollbar_t* s, int x, int y, int
+w, int h,
                                       int min, int max, int initial)
 {
     s->x = x; s->y = y; s->w = w; s->h = h;
@@ -201,7 +226,8 @@ static inline int ui__scrollbar_thumb_y(const ui_scrollbar_t* s)
     return s->y + (s->value - s->min) * track / range;
 }
 
-static inline void ui_scrollbar_update(const ui_frame_t* f, ui_scrollbar_t* s)
+static inline void ui_scrollbar_update(const ui_frame_t* f, ui_scrollbar_t*
+s)
 {
     int thumb_h = ui__scrollbar_thumb_h(s);
     int thumb_y = ui__scrollbar_thumb_y(s);
@@ -216,22 +242,26 @@ static inline void ui_scrollbar_update(const ui_frame_t* f, ui_scrollbar_t* s)
             int rel = new_thumb_y - s->y;
             if (rel < 0) rel = 0;
             if (rel > track) rel = track;
-            s->value = (track > 0 && range > 0) ? (s->min + rel * range / track) : s->min;
+            s->value = (track > 0 && range > 0) ? (s->min + rel * range /
+track) : s->min;
         }
         return;
     }
 
     if (!f->mouse.in_window || !f->mouse.left_clicked) return;
-    if (!ui_point_in_rect(f->mouse.x, f->mouse.y, s->x, s->y, s->w, s->h)) return;
+    if (!ui_point_in_rect(f->mouse.x, f->mouse.y, s->x, s->y, s->w, s->h))
+return;
 
-    if (ui_point_in_rect(f->mouse.x, f->mouse.y, s->x, thumb_y, s->w, thumb_h)) {
+    if (ui_point_in_rect(f->mouse.x, f->mouse.y, s->x, thumb_y, s->w,
+thumb_h)) {
         /* Grabbed the thumb itself — remember where, so dragging keeps
          * the cursor at the same spot on the thumb instead of snapping
          * the thumb's top to the cursor. */
         s->dragging = 1;
         s->drag_grab_offset = f->mouse.y - thumb_y;
     } else {
-        /* Clicked the track above/below the thumb — page toward the click. */
+        /* Clicked the track above/below the thumb — page toward the
+click. */
         int range = s->max - s->min;
         int page = range > 4 ? range / 4 : 1;
         if (f->mouse.y < thumb_y) s->value -= page; else s->value += page;
@@ -247,10 +277,13 @@ static inline void ui_scrollbar_draw(const ui_scrollbar_t* s)
 
     int thumb_h = ui__scrollbar_thumb_h(s);
     int thumb_y = ui__scrollbar_thumb_y(s);
-    ui_fill_rect(s->x + 1, thumb_y, s->w - 2, thumb_h, s->dragging ? UI_COLOR_BUTTON_DOWN : UI_COLOR_ACCENT);
+    ui_fill_rect(s->x + 1, thumb_y, s->w - 2, thumb_h, s->dragging ?
+UI_COLOR_BUTTON_DOWN : UI_COLOR_ACCENT);
 }
 
-/* ── text box (single line) ──────────────────────────────────────── */
+/* ── text box (single line)
+─────────────────────────
+─────────────── */
 /* Click to focus; while focused, printable keys append and backspace
  * (KEY_DELETE, or ASCII 0x08 from the guest ABI's own '\b' mapping)
  * removes the last character. Clicking anywhere else on the canvas
@@ -267,7 +300,8 @@ typedef struct {
     int focused;
 } ui_textbox_t;
 
-static inline void ui_textbox_init(ui_textbox_t* t, int x, int y, int w, int h)
+static inline void ui_textbox_init(ui_textbox_t* t, int x, int y, int w,
+int h)
 {
     t->x = x; t->y = y; t->w = w; t->h = h;
     t->buf[0] = 0;
@@ -278,7 +312,8 @@ static inline void ui_textbox_init(ui_textbox_t* t, int x, int y, int w, int h)
 static inline void ui_textbox_update(const ui_frame_t* f, ui_textbox_t* t)
 {
     if (f->mouse.in_window && f->mouse.left_clicked) {
-        t->focused = ui_point_in_rect(f->mouse.x, f->mouse.y, t->x, t->y, t->w, t->h);
+        t->focused = ui_point_in_rect(f->mouse.x, f->mouse.y, t->x, t->y, t
+->w, t->h);
     }
 
     if (!t->focused || f->key == 0) return;
@@ -297,7 +332,8 @@ static inline void ui_textbox_update(const ui_frame_t* f, ui_textbox_t* t)
 static inline void ui_textbox_draw(const ui_textbox_t* t)
 {
     ui_fill_rect(t->x, t->y, t->w, t->h, UI_COLOR_PANEL);
-    ui_stroke_rect(t->x, t->y, t->w, t->h, t->focused ? UI_COLOR_ACCENT : UI_COLOR_BORDER);
+    ui_stroke_rect(t->x, t->y, t->w, t->h, t->focused ? UI_COLOR_ACCENT :
+UI_COLOR_BORDER);
     ui_draw_text(t->x + 4, t->y + (t->h - 8) / 2, t->buf, UI_COLOR_TEXT);
 
     /* Caret: no timer ABI available to a guest for a real blink, so
@@ -305,11 +341,15 @@ static inline void ui_textbox_draw(const ui_textbox_t* t)
      * redraws often enough that this doesn't read as static. */
     if (t->focused) {
         int caret_x = t->x + 4 + ui_text_width(t->buf);
-        for (int i = 0; i < 8; i++) gfx_set_pixel(caret_x, t->y + (t->h - 8) / 2 + i, UI_COLOR_ACCENT);
+        for (int i = 0; i < 8; i++) gfx_set_pixel(caret_x, t->y + (t->h -
+8) / 2 + i, UI_COLOR_ACCENT);
     }
 }
 
-/* ── cursor ───────────────────────────────────────────────────────── */
+/* ── cursor
+─────────────────────────
+─────────────────────────
+─────── */
 /* Guest gfx programs draw into their own isolated canvas and have no
  * idea where the kernel's real system cursor is being rendered on top
  * of it (the kernel draws that separately, once, over the whole

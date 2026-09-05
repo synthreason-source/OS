@@ -1157,7 +1157,26 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
         }
 
         // Software timer (no PIT — IRQ0 would fire into an unhandled vector)
-        if (++poll_counter >= 500) {
+        //
+        // FIX (guest programs felt sluggish): this counter is the ONLY
+        // gate on how often ANY guest ELF process (editf, gfx_demo, ...)
+        // gets to run at all -- g_evt_timer has no other consumer (see
+        // tick_elf_processes' call site below). Every iteration of this
+        // loop also does real PS/2 port I/O via poll_input_universal(),
+        // which is comparatively slow, especially under emulation/
+        // virtualization. At a threshold of 500 that made keystrokes,
+        // cursor movement, and screen redraws in a guest gfx program
+        // wait for up to 500 of those I/O-bound iterations before the
+        // guest even got scheduled once -- laggy typing and sluggish
+        // repaints in editf, independent of how fast its own drawing
+        // code is. There was no real-time calibration behind 500, just
+        // an arbitrary loop-iteration count. Dropping it to 20 lets
+        // guest processes get ticked ~25x more often relative to input
+        // polling without touching anything else this counter used to
+        // pace (nothing else reads g_evt_timer) -- the idle power-saving
+        // backoff further down (pause-ramping on idle_streak) is
+        // unaffected since it only kicks in once nothing is happening.
+        if (++poll_counter >= 20) {
             poll_counter  = 0;
             g_evt_timer   = true;
 			g_evt_dirty = true;
