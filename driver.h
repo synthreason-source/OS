@@ -208,33 +208,40 @@ static inline void drv_disk_test(drv_status_t *st)
 
 /* ── graphics driver ────────────────────────────────────────────────
  * Unlike the other tests, this isn't a one-shot call: it draws a
- * small test pattern (RGB bars + a diagonal gradient) into a caller-
- * supplied rectangle of the CURRENT frame every time it's called, so
- * a GUI front-end can just call it from its own per-frame draw loop
- * (guarded by a "graphics test enabled" flag the caller owns) instead
- * of it trying to own gfx_clear()/gfx_present() itself -- those stay
- * the caller's responsibility, same as any other widget in comp.h. */
+ * small test pattern into a caller-supplied rectangle of the CURRENT
+ * frame every time it's called, so a GUI front-end can just call it
+ * from its own per-frame draw loop (guarded by a "graphics test
+ * enabled" flag the caller owns) instead of it trying to own
+ * gfx_clear()/gfx_present() itself -- those stay the caller's
+ * responsibility, same as any other widget in comp.h.
+ *
+ * LEAN BY DESIGN: an earlier version blended a diagonal brightness
+ * gradient into the bars, which meant computing a shade with three
+ * multiplies and three divides (one per color channel) for every
+ * single pixel. Under software-interpreted CPU emulation (this
+ * runs as a guest ELF via bochs_glue.cpp, not native code) integer
+ * division is by a wide margin the most expensive thing a guest can
+ * do, and this test redraws every pixel of its rect every single
+ * frame while enabled -- so that gradient made the single most
+ * expensive part of this whole driver kit something purely
+ * decorative. Three flat-color vertical bars below still prove the
+ * same thing (every pixel in the rect is still addressed and written
+ * individually via gfx_set_pixel) at a fraction of the per-pixel
+ * cost: no division, no multiplication, no even per-pixel branching
+ * -- each of the three inner loops below writes one constant color
+ * in a straight run. */
 static inline void drv_graphics_test(drv_status_t *st, int x, int y, int w, int h)
 {
     if (w <= 0 || h <= 0) { st->last_result = 1; drv__strcpy(st->message, "FAIL: empty rect.", DRV_MSG_MAX); return; }
 
-    int bar_w = w / 3;
+    int bar_w  = w / 3;
+    int bar2_w = 2 * bar_w;
     for (int j = 0; j < h; j++) {
-        for (int i = 0; i < w; i++) {
-            unsigned int color;
-            if (i < bar_w)          color = 0xFF3B30;              /* red bar   */
-            else if (i < 2*bar_w)   color = 0x34C759;              /* green bar */
-            else                    color = 0x0A84FF;              /* blue bar  */
-            /* Blend in a diagonal brightness gradient so the pattern
-             * also proves per-pixel addressing (not just solid fills)
-             * is landing in the right place. */
-            unsigned int shade = (unsigned int)(((i + j) * 128) / (w + h));
-            unsigned int r = ((color >> 16) & 0xFF) * (128 + shade) / 255;
-            unsigned int g = ((color >> 8)  & 0xFF) * (128 + shade) / 255;
-            unsigned int b = ( color        & 0xFF) * (128 + shade) / 255;
-            if (r > 255) r = 255; if (g > 255) g = 255; if (b > 255) b = 255;
-            gfx_set_pixel(x + i, y + j, (r << 16) | (g << 8) | b);
-        }
+        int py = y + j;
+        int i = 0;
+        for (; i < bar_w;  i++) gfx_set_pixel(x + i, py, 0xFF3B30); /* red   */
+        for (; i < bar2_w; i++) gfx_set_pixel(x + i, py, 0x34C759); /* green */
+        for (; i < w;      i++) gfx_set_pixel(x + i, py, 0x0A84FF); /* blue  */
     }
 
     st->last_result = 0;

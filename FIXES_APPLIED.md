@@ -81,6 +81,55 @@ per-tick instruction budget in `bochs_cpu_tick()` (`bochs_glue.cpp`,
 currently `n * 65536`) and `GUEST_SUBTICKS` (currently 8) in the same
 loop.
 
+## Fix #8 (added): pushed the scheduling fix all the way — as lean as it gets
+
+**Symptom:** still felt sluggish after Fix #7's 500→20 change.
+
+**Root cause / further finding:** 20 was still an arbitrary gap with no
+real-time basis, for the same reason 500 was. And having found that
+`g_evt_timer` gates *both* guest ticking and the frame-dirty flag from
+the same `if` (they always fire together, on the same iteration), the
+whole surrounding "sub-tick" apparatus was more indirection than the
+current, lower threshold actually needed:
+
+- `GUEST_SUBTICKS = 8` split each timer interval into 8 rounds of
+  `tick_elf_processes(1)` purely so the mouse could be polled/redrawn
+  partway through a long (originally 500-iteration) gap. With the timer
+  now firing every iteration, that gap is gone, so 8 rounds per
+  iteration meant doing up to 8x the intended per-iteration guest work
+  (and 8x redundant `poll_input_universal()` calls) before ever
+  returning to redraw — the opposite of lean.
+- The `subtick_rounds = GUEST_SUBTICKS / active_count` division existed
+  to keep total per-interval guest work roughly constant regardless of
+  how many processes were running. With one round instead of up to 8,
+  that division always resolves to exactly 1 — dead arithmetic sitting
+  in the hot path.
+
+**Fix, in `kernel_parts/11_kernel_main.h`:**
+1. `poll_counter` threshold: `20` → `1` (fires every iteration; kept as
+   a counter rather than replaced with an unconditional assignment so
+   it's still a one-line change if a real interval is ever wanted).
+2. Removed `GUEST_SUBTICKS` and the per-process division entirely —
+   `tick_elf_processes(1)` is now called exactly once per main-loop
+   iteration, with a single `poll_input_universal()` + cursor-redraw
+   check right after it (previously duplicated on every one of the 8
+   rounds).
+3. `driver.h`'s `drv_graphics_test()` (the driver kit's live graphics
+   panel) no longer blends a diagonal gradient into its color bars.
+   That blend cost three multiplies **and three divides per pixel**,
+   redone every frame the panel is left on — under software CPU
+   interpretation, integer division is the single most expensive thing
+   a guest program can do, so that gradient was the most expensive
+   line of code in the entire driver kit for a purely cosmetic effect.
+   It's now three flat-color loops (no per-pixel math at all) while
+   still writing every pixel individually via `gfx_set_pixel`.
+
+**Caveat:** same as Fix #7 — verified by static analysis and careful
+re-reading of every place `g_evt_timer`/`active_count`/`GUEST_SUBTICKS`
+were used (to make sure removing them didn't drop needed behavior), and
+by rebuilding+relinking `driverkit.c`/`driver.h` through the real guest
+toolchain, but **not** by booting the OS end-to-end.
+
 ## Changes Summary
 
 ### File: bochs_glue.cpp
