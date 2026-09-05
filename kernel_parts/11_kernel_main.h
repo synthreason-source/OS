@@ -353,8 +353,57 @@ return true;
     return true;
 }
 // And definition without default:
-void tick_elf_processes(int steps) {
+//
+// FIX (focused app + mouse starved by background processes): this used
+// to run x86_tick() for every active slot every single call, uniformly
+// -- with only one guest program running (the common case) that's
+// fine, but with two or more active at once (e.g. a background
+// terminal still finishing a `run` while the user is actively using a
+// different, focused window), every slot's CPU-emulation work and its
+// bochs_activate_slot() context switch happened on EVERY iteration
+// regardless of which window the user is actually looking at. That
+// makes each iteration take longer in wall time, which in turn slows
+// down how often the mouse gets polled/redrawn AND how often the
+// focused app's own next frame lands -- both by exactly the same
+// mechanism, since neither has a dedicated fast path independent of
+// how long the shared main-loop iteration takes.
+//
+// `focus_slot` (the window manager's get_focused_elf_slot(), or -1 if
+// nothing's focused) lets the caller say which slot the user is
+// actually watching. The focused slot always executes, every call, in
+// full -- it never gets deprioritized. Non-focused active slots take
+// turns round-robin, at most one of them executing per call, so a
+// background process still makes forward progress (just not at the
+// cost of competing with the focused app on every single iteration).
+// Passing -1 (or leaving it at the default) restores the original
+// "tick everyone every call" behavior, which is also what happens
+// naturally whenever 0 or 1 slots are active anyway.
+//
+// Deliberately NOT touched: output draining and exit/teardown handling
+// below still run unconditionally for every active slot every call,
+// same as before this fix. Only the x86_tick() call itself -- the
+// actual CPU-emulation step -- is what gets skipped for a deprioritized
+// slot this round. That keeps this change additive on top of logic
+// this function's own comments describe as fragile, rather than
+// touching it.
+void tick_elf_processes(int steps, int focus_slot = -1) {
     bool any_exited_this_frame = false;
+
+    // Pick this call's one "extra" (non-focused) slot to actually run,
+    // round-robin across whichever active slots aren't the focused one.
+    static int rr_cursor = 0;
+    int chosen_background_slot = -1;
+    if (focus_slot >= 0) {
+        for (int k = 1; k <= MAX_ELF_PROCESSES; ++k) {
+            int cand = (rr_cursor + k) % MAX_ELF_PROCESSES;
+            if (cand == focus_slot) continue;
+            if (elf_processes[cand].active && !elf_processes[cand].completed) {
+                chosen_background_slot = cand;
+                rr_cursor = cand;
+                break;
+            }
+        }
+    }
 
     for (int i = 0; i < MAX_ELF_PROCESSES; ++i) {
         ElfProcess& proc = elf_processes[i];
@@ -382,6 +431,13 @@ void tick_elf_processes(int steps) {
         }
 
         if (proc.waiting_for_input && in_empty(i)) continue;
+
+        // Priority gate: skip the actual CPU-emulation step (but nothing
+        // else -- output above and exit handling below still run) for a
+        // non-focused, non-chosen-this-round slot. See the function
+        // comment above for the full rationale.
+        bool should_execute = (focus_slot < 0) || (i == focus_slot) || (i == chosen_background_slot);
+        if (!should_execute) continue;
 
         bool running = x86_tick(i, steps);
 
@@ -1229,7 +1285,11 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
                 if (elf_processes[i].active && !elf_processes[i].completed) active_count++;
             }
 
-            tick_elf_processes(1);
+            // Pass the focused window's ELF slot (-1 if none) so a
+            // background process can't compete with the one the user
+            // is actually watching -- see tick_elf_processes' own
+            // comment for the full rationale.
+            tick_elf_processes(1, wm.get_focused_elf_slot());
 
             poll_input_universal();
             bool tick_mouse_moved = (mouse_x != prev_mouse_x || mouse_y != prev_mouse_y);

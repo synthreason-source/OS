@@ -130,6 +130,54 @@ were used (to make sure removing them didn't drop needed behavior), and
 by rebuilding+relinking `driverkit.c`/`driver.h` through the real guest
 toolchain, but **not** by booting the OS end-to-end.
 
+## Fix #9 (added): give the focused app and the mouse actual scheduling priority
+
+**Symptom:** still felt sluggish after Fix #8. The person pointed at
+the likely cause directly: nothing in the scheduler distinguished the
+app the user is watching (or the mouse) from anything else running in
+the background.
+
+**Root cause:** `tick_elf_processes()` ticked *every* active ELF slot
+every single call, uniformly, regardless of which window was focused.
+With only one guest program running (the common case) this made no
+difference — but with two or more active at once (e.g. a background
+terminal still finishing a run while a different window has focus),
+every slot's CPU-emulation step and its `bochs_activate_slot()` context
+switch happened on every iteration no matter which window the user was
+actually looking at. That makes each main-loop iteration take longer in
+wall time, and *that* is what throttles both the mouse's effective poll
+rate and the focused app's frame rate — they don't have a dedicated
+fast path independent of how long the shared iteration takes, so
+anything that slows the iteration slows both of them together, exactly
+matching the symptom.
+
+**Fix, in `kernel_parts/11_kernel_main.h`:**
+- `tick_elf_processes(int steps, int focus_slot = -1)` — new second
+  parameter, defaulting to -1 (old "tick everyone" behavior, also what
+  happens naturally with 0-1 active slots).
+- The call site now passes `wm.get_focused_elf_slot()` (already existed
+  in `04_window_system.h`, previously only used for keyboard-input
+  routing) so the scheduler knows which slot the user is watching.
+- Inside the function: the focused slot always runs its `x86_tick()`
+  step every call, no exceptions. Non-focused active slots take turns
+  round-robin, at most one executing per call — background work still
+  makes forward progress, just without competing with the focused app
+  on every single iteration.
+- Deliberately **not** touched: output draining and exit/teardown
+  handling still run unconditionally for every active slot every call,
+  identical to before. Only the `x86_tick()` step itself is skipped for
+  a deprioritized slot — this function's own comments describe its
+  exit/teardown logic as fragile from past surgical changes, so this
+  fix stays additive around it rather than touching it.
+
+**Caveat:** same as the other scheduling fixes — verified by careful
+static tracing (confirmed the only call site, confirmed no other code
+depended on the old always-tick-everyone behavior) and by re-checking
+brace/control-flow structure by hand, but not by booting the OS. If a
+single guest program running alone (no background processes) is still
+slow, this particular fix won't move the needle — that scenario was
+already covered by Fix #8, and the two are unrelated.
+
 ## Changes Summary
 
 ### File: bochs_glue.cpp
