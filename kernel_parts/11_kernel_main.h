@@ -353,57 +353,8 @@ return true;
     return true;
 }
 // And definition without default:
-//
-// FIX (focused app + mouse starved by background processes): this used
-// to run x86_tick() for every active slot every single call, uniformly
-// -- with only one guest program running (the common case) that's
-// fine, but with two or more active at once (e.g. a background
-// terminal still finishing a `run` while the user is actively using a
-// different, focused window), every slot's CPU-emulation work and its
-// bochs_activate_slot() context switch happened on EVERY iteration
-// regardless of which window the user is actually looking at. That
-// makes each iteration take longer in wall time, which in turn slows
-// down how often the mouse gets polled/redrawn AND how often the
-// focused app's own next frame lands -- both by exactly the same
-// mechanism, since neither has a dedicated fast path independent of
-// how long the shared main-loop iteration takes.
-//
-// `focus_slot` (the window manager's get_focused_elf_slot(), or -1 if
-// nothing's focused) lets the caller say which slot the user is
-// actually watching. The focused slot always executes, every call, in
-// full -- it never gets deprioritized. Non-focused active slots take
-// turns round-robin, at most one of them executing per call, so a
-// background process still makes forward progress (just not at the
-// cost of competing with the focused app on every single iteration).
-// Passing -1 (or leaving it at the default) restores the original
-// "tick everyone every call" behavior, which is also what happens
-// naturally whenever 0 or 1 slots are active anyway.
-//
-// Deliberately NOT touched: output draining and exit/teardown handling
-// below still run unconditionally for every active slot every call,
-// same as before this fix. Only the x86_tick() call itself -- the
-// actual CPU-emulation step -- is what gets skipped for a deprioritized
-// slot this round. That keeps this change additive on top of logic
-// this function's own comments describe as fragile, rather than
-// touching it.
-void tick_elf_processes(int steps, int focus_slot = -1) {
+void tick_elf_processes(int steps) {
     bool any_exited_this_frame = false;
-
-    // Pick this call's one "extra" (non-focused) slot to actually run,
-    // round-robin across whichever active slots aren't the focused one.
-    static int rr_cursor = 0;
-    int chosen_background_slot = -1;
-    if (focus_slot >= 0) {
-        for (int k = 1; k <= MAX_ELF_PROCESSES; ++k) {
-            int cand = (rr_cursor + k) % MAX_ELF_PROCESSES;
-            if (cand == focus_slot) continue;
-            if (elf_processes[cand].active && !elf_processes[cand].completed) {
-                chosen_background_slot = cand;
-                rr_cursor = cand;
-                break;
-            }
-        }
-    }
 
     for (int i = 0; i < MAX_ELF_PROCESSES; ++i) {
         ElfProcess& proc = elf_processes[i];
@@ -431,13 +382,6 @@ void tick_elf_processes(int steps, int focus_slot = -1) {
         }
 
         if (proc.waiting_for_input && in_empty(i)) continue;
-
-        // Priority gate: skip the actual CPU-emulation step (but nothing
-        // else -- output above and exit handling below still run) for a
-        // non-focused, non-chosen-this-round slot. See the function
-        // comment above for the full rationale.
-        bool should_execute = (focus_slot < 0) || (i == focus_slot) || (i == chosen_background_slot);
-        if (!should_execute) continue;
 
         bool running = x86_tick(i, steps);
 
@@ -1116,16 +1060,14 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
     // (0 - 0) >= 1, i.e. false — so despite the g_evt_timer/g_evt_dirty
     // flags being forced below, the paint block a few lines down was
     // still skipped on frame one and the desktop (icons, taskbar, clock)
-    // stayed blank until the software timer's poll_counter first ticked
-    // over, rather than appearing immediately as the comment intended.
-    // (Was a wait of up to 500 iterations with the original threshold;
-    // the fix below stands regardless of what that threshold is.)
+    // stayed blank until the software timer's poll_counter first reached
+    // 500, rather than appearing immediately as the comment intended.
     uint32_t last_tick_tick = (uint32_t)0 - TICKS_PER_FRAME;
     int prev_mouse_x = mouse_x;
     int prev_mouse_y = mouse_y;
 
-    // Force an immediate first render — don't wait for the software
-    // timer to tick over before the desktop appears.
+    // Force an immediate first render — don't wait 500 poll iterations
+    // for the software timer to tick before the desktop appears.
     g_evt_timer = true;
     g_evt_dirty = true;
 
@@ -1134,12 +1076,8 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
     uint32_t hb_counter = 0;
     const char hb_chars[] = "|/-\\";
     static uint32_t poll_counter = 0;
-    // Power-saving idle backoff -- see the big comment at the bottom of
-    // the loop body for why this uses `pause` and not `hlt`.
-    uint32_t idle_streak = 0;
 
     for (;;) {
-        bool did_anything_this_iteration = false;
         if (++hb_counter % 10000 == 0) {
             *vga_hb = (uint16_t)(0x0A00u | (uint8_t)hb_chars[(hb_counter/10000)%4]);
 
@@ -1215,65 +1153,12 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
         }
 
         // Software timer (no PIT — IRQ0 would fire into an unhandled vector)
-        //
-        // FIX (guest programs still felt sluggish after the 500->20
-        // change): 20 was still an arbitrary gap, not a real interval.
-        // Since g_evt_timer has no consumer besides gating guest
-        // ticking (see above) and unconditionally marking the frame
-        // dirty (right below), there's no reason to gate it at all --
-        // firing it every single iteration removes the last bit of
-        // artificial latency between "guest produced a new frame" and
-        // "that frame gets ticked/shown" while leaving every other
-        // per-iteration cost (PS/2 polling, the idle pause-ramp)
-        // exactly as it was. Kept as a counter rather than an
-        // unconditional `g_evt_timer = true` purely so this stays a
-        // one-line tweak if a real interval is ever wanted again.
-        if (++poll_counter >= 1) {
+        if (++poll_counter >= 500) {
             poll_counter  = 0;
             g_evt_timer   = true;
+			g_evt_dirty = true;
             g_timer_ticks++;
         }
-
-        // FIX (lean repaint -- Bochs CPU-emulation time was being stolen
-        // by the desktop): the line removed just above used to also set
-        // `g_evt_dirty = true` on every one of these, which -- since the
-        // block above it fires on every single raw loop iteration (Fix
-        // #8's poll_counter threshold of 1) -- meant the full repaint
-        // path a few lines down (g_gfx.clear_screen() over the whole
-        // framebuffer, then wm.update_all() walking and redrawing every
-        // window) ran unconditionally on every iteration, forever, even
-        // with the desktop completely idle and no guest program running
-        // at all. That's real wall-clock time spent clearing and
-        // redrawing the entire screen back-to-back with no gap, and
-        // under software CPU interpretation it competes directly with
-        // tick_elf_processes() for the same loop budget -- i.e. it's the
-        // opposite of lean, and it gets worse (not better) exactly when
-        // a guest program is running and every iteration's time matters
-        // most.
-        //
-        // Every case that actually needs a repaint already flags
-        // g_evt_dirty itself, right when it happens, with no polling
-        // needed: guest output (the three g_evt_dirty = true sites in
-        // tick_elf_processes above), a guest process exiting, and any
-        // input that can change what's on screen (input_needs_full_repaint,
-        // set below). The one thing the removed unconditional flag was
-        // still doing useful work for is self-animating windows that
-        // redraw on their own timer with no external trigger -- e.g. the
-        // clock's second hand -- which need SOME periodic full-repaint
-        // sweep to ever be seen moving. That's a cosmetic animation
-        // cadence, not a responsiveness requirement, so it doesn't need
-        // to run every iteration; it's decoupled into its own coarser
-        // counter below, deliberately independent of poll_counter/
-        // TICKS_PER_FRAME above, which stay untouched -- guest-tick
-        // pacing must stay immediate (see Fix #7/#8), only the ambient
-        // redraw sweep is being throttled.
-        static uint32_t anim_repaint_counter = 0;
-        const uint32_t  ANIM_REPAINT_INTERVAL = 200;
-        if (++anim_repaint_counter >= ANIM_REPAINT_INTERVAL) {
-            anim_repaint_counter = 0;
-            g_evt_dirty = true;
-        }
-
 
         if (g_evt_input) {
             g_evt_input = false;
@@ -1304,49 +1189,46 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
             // would leave the last painted frame without the breadcrumbs
             // pointing at where the hang happened.
             //
-            // (Historical note: this call used to be split into several
-            // "sub-ticks" with a mouse poll/redraw between each one, to
-            // keep the cursor responsive across the long gap the old
-            // 500-iteration software timer left between guest ticks.
-            // That gap is gone now that the timer fires every iteration,
-            // so a single tick_elf_processes() call per iteration is
-            // both simpler and, if the guest never yields, no worse
-            // than before: the main loop's own poll_input_universal()/
-            // redraw at the top of the next iteration takes over that
-            // job instead. The old code also divided a GUEST_SUBTICKS
-            // round count across however many processes were active so
-            // no single interval's total budget scaled with process
-            // count -- with exactly one round now instead of up to 8,
-            // that division always resolved to 1 anyway, so it's gone
-            // too rather than left in as dead arithmetic.)
-            int active_count = 0;
-            for (int i = 0; i < MAX_ELF_PROCESSES; i++) {
-                if (elf_processes[i].active && !elf_processes[i].completed) active_count++;
-            }
+            // A single tick_elf_processes() call can itself block for a
+            // perceptible chunk of wall time -- bochs_cpu_tick() (see
+            // bochs_glue.cpp) hands the guest a budget of up to tens of
+            // thousands of software-interpreted instructions per call,
+            // and a CPU-bound guest with little port I/O to yield on
+            // (its main way of handing control back early) can burn
+            // through that whole budget before returning. During that
+            // entire call the mouse can't be polled or redrawn at all --
+            // "everything is smooth until a program is actually running,
+            // then the cursor stutters" is exactly what that looks like.
+            // Splitting the interval's guest-execution budget into
+            // several smaller ticks and polling+redrawing the cursor
+            // between each one gives the pointer many more chances to
+            // stay current while a program runs, instead of only one at
+            // the very end of the interval. (A single sub-tick can still
+            // block for its own full budget if the guest never yields at
+            // all -- this doesn't fix that pathological case, but it's
+            // the common one: any guest doing the usual putc/getc-style
+            // I/O yields far more often than that.)
+            const int GUEST_SUBTICKS = 8;
+            for (int st = 0; st < GUEST_SUBTICKS; st++) {
+                tick_elf_processes(1);
 
-            // Pass the focused window's ELF slot (-1 if none) so a
-            // background process can't compete with the one the user
-            // is actually watching -- see tick_elf_processes' own
-            // comment for the full rationale.
-            tick_elf_processes(1, wm.get_focused_elf_slot());
-
-            poll_input_universal();
-            bool tick_mouse_moved = (mouse_x != prev_mouse_x || mouse_y != prev_mouse_y);
-            if (tick_mouse_moved) {
-                prev_mouse_x = mouse_x;
-                prev_mouse_y = mouse_y;
-                // Only the cheap cursor-only redraw here -- if a button
-                // is down (drag/resize/paint in progress) or the
-                // backbuffer isn't in a known-clean state, leave it for
-                // the normal full-repaint path below instead of risking
-                // a partial/stale-looking mid-tick frame.
-                if (g_backbuffer_is_clean_on_screen &&
-                    !mouse_left_down && !mouse_right_down) {
-                    erase_cursor_from_screen();
-                    draw_cursor_to_screen(mouse_x, mouse_y, ColorPalette::CURSOR_WHITE);
+                poll_input_universal();
+                bool subtick_mouse_moved = (mouse_x != prev_mouse_x || mouse_y != prev_mouse_y);
+                if (subtick_mouse_moved) {
+                    prev_mouse_x = mouse_x;
+                    prev_mouse_y = mouse_y;
+                    // Only the cheap cursor-only redraw here -- if a
+                    // button is down (drag/resize/paint in progress) or
+                    // the backbuffer isn't in a known-clean state, leave
+                    // it for the normal full-repaint path below instead
+                    // of risking a partial/stale-looking mid-tick frame.
+                    if (g_backbuffer_is_clean_on_screen &&
+                        !mouse_left_down && !mouse_right_down) {
+                        erase_cursor_from_screen();
+                        draw_cursor_to_screen(mouse_x, mouse_y, ColorPalette::CURSOR_WHITE);
+                    }
                 }
             }
-            if (active_count > 0) did_anything_this_iteration = true;
 
             last_tick_tick = g_timer_ticks;
             g_evt_timer     = false;
@@ -1355,28 +1237,20 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
         // Repaint is intentionally NOT gated on g_evt_timer above — only
         // on whether anything actually changed (g_evt_dirty /
         // hasNewInput). It used to require BOTH the timer *and* a dirty
-        // flag, and the software timer here originally only fired once
-        // every 500 raw loop iterations (poll_counter, further up --
-        // there's no real PIT/IRQ0 to drive it). Mouse movement/clicks
-        // and keystrokes are polled and flagged dirty on EVERY iteration
-        // regardless (see poll_input_universal() + the g_evt_input block
-        // above), so gating the actual repaint behind a slower timer
-        // made the on-screen cursor visibly lag behind the real,
-        // continuously-updated mouse_x/mouse_y — i.e. the mouse felt
-        // "slow"/laggy even though input was being read promptly.
-        // Repainting as soon as something is dirty fixes that.
-        //
-        // g_evt_dirty itself is set the instant something that actually
-        // needs a repaint happens (guest output, a process exiting,
-        // input that changes what's drawn -- all flagged at their own
-        // call sites) PLUS a coarser, throttled sweep (anim_repaint_counter
-        // above, decoupled from the guest-tick timer) purely so
-        // self-animating windows like the clock still get repainted
-        // periodically with nothing external driving them. It is
-        // deliberately NOT forced true on every single main-loop
-        // iteration any more -- see the fix note at anim_repaint_counter
-        // above for why that was a real, measurable performance drain on
-        // guest-program CPU-emulation time, not just a cosmetic detail.
+        // flag, but the software timer here only fires once every 500
+        // raw loop iterations (poll_counter, further up — there's no
+        // real PIT/IRQ0 to drive it). Mouse movement/clicks and
+        // keystrokes are polled and flagged dirty on EVERY iteration
+        // (see poll_input_universal() + the g_evt_input block above),
+        // so gating the actual repaint behind that same slow timer made
+        // the on-screen cursor visibly lag ~500 iterations behind the
+        // real, continuously-updated mouse_x/mouse_y — i.e. the mouse
+        // felt "slow"/laggy even though input was being read promptly.
+        // Repainting as soon as something is dirty fixes that; the
+        // timer above still exists to pace guest ticking and to cover
+        // the "nothing moved, but a guest changed its own frame"
+        // periodic case via g_evt_timer's own g_evt_dirty = true (set
+        // where poll_counter reaches 500, further up).
         if (g_evt_dirty || g_input_state.hasNewInput) {
             g_evt_dirty               = false;
             g_input_state.hasNewInput = false;
@@ -1399,7 +1273,6 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
             erase_cursor_from_screen(); // no-op the first time through
             draw_cursor_to_screen(mouse_x, mouse_y, ColorPalette::CURSOR_WHITE);
             g_backbuffer_is_clean_on_screen = true;
-            did_anything_this_iteration = true;
         } else if (mouse_moved && g_backbuffer_is_clean_on_screen) {
             // Cursor-only fast path: nothing but the pointer position
             // changed this frame (no key, no click, no button held --
@@ -1410,37 +1283,6 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
             // full 1024x768 blit for a one-pixel pointer nudge.
             erase_cursor_from_screen();
             draw_cursor_to_screen(mouse_x, mouse_y, ColorPalette::CURSOR_WHITE);
-            did_anything_this_iteration = true;
-        }
-
-        // ── Power saving: back off the busy-poll spin when idle ────────────
-        // This kernel has no working periodic hardware interrupt (see the
-        // "Software timer (no PIT...)" comment above) and mouse/keyboard
-        // input is polled, not interrupt-driven -- so `hlt` is NOT safe
-        // here. Nothing would ever fire to wake the CPU back up once
-        // halted, and the very first genuinely idle moment would hang the
-        // machine solid. `pause` is the safe alternative: it's a hint to
-        // the CPU that this is a spin-wait rather than real work, which on
-        // real hardware measurably cuts power draw and heat in a busy-poll
-        // loop like this one without changing behavior -- the very next
-        // instruction still executes immediately afterward, so it can
-        // never cause a missed input or a delayed guest tick.
-        //
-        // Back off adaptively: the longer nothing has happened, the more
-        // pauses this iteration spends (capped), which lowers the
-        // polling loop's CPU floor further the longer the system sits
-        // genuinely idle. Any real input, redraw, or active guest process
-        // resets it to full responsiveness immediately -- this never adds
-        // latency to anything, it only spends idle cycles more cheaply.
-        if (did_anything_this_iteration) {
-            idle_streak = 0;
-        } else if (idle_streak < 0xFFFFFFFFu) {
-            idle_streak++;
-        }
-        {
-            uint32_t pause_count = 1 + (idle_streak >> 6); // ramps 1 -> 64
-            if (pause_count > 64) pause_count = 64;
-            for (uint32_t p = 0; p < pause_count; p++) asm volatile("pause");
         }
     }
 }

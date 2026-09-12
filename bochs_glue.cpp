@@ -1935,36 +1935,20 @@ extern "C" int bochs_cpu_tick(int n) {
     // guest hits one of those yield points, at which point it returns.
     // Budget multiplier: how many guest instructions one unit of
     // "steps" (as passed to bochs_cpu_tick/tick_elf_processes) buys.
-    //
-    // FIX (reverting the budget=1 change -- it broke editf's keyboard
-    // and mouse): budget was cut to 1 on request to make Bochs "tick
-    // ~1 at a time". That's safe for a guest whose only per-frame work
-    // is a handful of instructions before its next port-I/O yield, but
-    // editf (and any other non-blocking GUI-style guest, see its own
-    // "key_poll() ... polled unconditionally (never getch())" design
-    // note) NEVER calls getch() at all -- its only yield point is
-    // gfx_present(), called once at the END of a full frame: poll
-    // keyboard, poll mouse, update editor state, redraw the whole
-    // GFX_MAX_W x GFX_MAX_H canvas, THEN present. That's easily tens
-    // of thousands of instructions with no yield point in between. With
-    // budget=1, cpu_loop() got nowhere near that first gfx_present()
-    // call in a single tick, so a keystroke or click needed to survive
-    // -- as live, unconsumed input -- across an enormous number of
-    // main-loop iterations before the guest ever finished a frame to
-    // show it, i.e. the editor was effectively frozen: not broken input
-    // handling, just input the guest was never given enough budget to
-    // ever get around to processing and redrawing.
-    //
-    // Restored to 65536 -- the value already proven to let a
-    // pixel-heavy GFX frame complete in a handful of ticks (see the
-    // history in the comment this replaces). If tighter per-tick CPU
-    // accounting is still wanted, tune this down partway (e.g. a few
-    // thousand) rather than all the way to 1 -- anything below roughly
-    // "one guest program's worst-case single-frame instruction count"
-    // reproduces this same freeze for that program.
+    // 256 was tuned for chatty, port-IO-heavy guests (e.g. putc-based
+    // text output, where the guest naturally does an outb every
+    // ~10-15 instructions) -- fine for something like `hello`, but a
+    // CPU-bound guest loop with little or no port I/O in between (e.g.
+    // a graphics program computing tens of thousands of pixels via
+    // gfx_set_pixel before ever calling gfx_present()) could need many
+    // thousands of ticks -- i.e. many seconds of real time at
+    // tick_elf_processes(1)'s one-tick-per-main-loop-iteration cadence
+    // -- before making any visible progress at all. Bumped 256x so a
+    // pixel-heavy frame completes in a handful of ticks instead of
+    // thousands; existing chatty programs are unaffected since they
+    // already finish in far fewer instructions than either budget.
     Bit64u budget = (Bit64u)n * 65536;
     if (budget > 0x7FFFFFFFull) budget = 0x7FFFFFFFull;  // Bit32s range
-
 
     BX_CPU(0)->kill_bochs_request = 0;
     BX_CPU(0)->async_event          = 0;
