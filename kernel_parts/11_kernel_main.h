@@ -1231,8 +1231,47 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
         if (++poll_counter >= 1) {
             poll_counter  = 0;
             g_evt_timer   = true;
-			g_evt_dirty = true;
             g_timer_ticks++;
+        }
+
+        // FIX (lean repaint -- Bochs CPU-emulation time was being stolen
+        // by the desktop): the line removed just above used to also set
+        // `g_evt_dirty = true` on every one of these, which -- since the
+        // block above it fires on every single raw loop iteration (Fix
+        // #8's poll_counter threshold of 1) -- meant the full repaint
+        // path a few lines down (g_gfx.clear_screen() over the whole
+        // framebuffer, then wm.update_all() walking and redrawing every
+        // window) ran unconditionally on every iteration, forever, even
+        // with the desktop completely idle and no guest program running
+        // at all. That's real wall-clock time spent clearing and
+        // redrawing the entire screen back-to-back with no gap, and
+        // under software CPU interpretation it competes directly with
+        // tick_elf_processes() for the same loop budget -- i.e. it's the
+        // opposite of lean, and it gets worse (not better) exactly when
+        // a guest program is running and every iteration's time matters
+        // most.
+        //
+        // Every case that actually needs a repaint already flags
+        // g_evt_dirty itself, right when it happens, with no polling
+        // needed: guest output (the three g_evt_dirty = true sites in
+        // tick_elf_processes above), a guest process exiting, and any
+        // input that can change what's on screen (input_needs_full_repaint,
+        // set below). The one thing the removed unconditional flag was
+        // still doing useful work for is self-animating windows that
+        // redraw on their own timer with no external trigger -- e.g. the
+        // clock's second hand -- which need SOME periodic full-repaint
+        // sweep to ever be seen moving. That's a cosmetic animation
+        // cadence, not a responsiveness requirement, so it doesn't need
+        // to run every iteration; it's decoupled into its own coarser
+        // counter below, deliberately independent of poll_counter/
+        // TICKS_PER_FRAME above, which stay untouched -- guest-tick
+        // pacing must stay immediate (see Fix #7/#8), only the ambient
+        // redraw sweep is being throttled.
+        static uint32_t anim_repaint_counter = 0;
+        const uint32_t  ANIM_REPAINT_INTERVAL = 200;
+        if (++anim_repaint_counter >= ANIM_REPAINT_INTERVAL) {
+            anim_repaint_counter = 0;
+            g_evt_dirty = true;
         }
 
 
@@ -1318,23 +1357,26 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
         // hasNewInput). It used to require BOTH the timer *and* a dirty
         // flag, and the software timer here originally only fired once
         // every 500 raw loop iterations (poll_counter, further up --
-        // there's no real PIT/IRQ0 to drive it; it now fires every
-        // iteration instead, see the fix note there). Mouse movement/
-        // clicks and keystrokes are polled and flagged dirty on EVERY
-        // iteration regardless (see poll_input_universal() + the
-        // g_evt_input block above), so gating the actual repaint behind
-        // a slower timer made the on-screen cursor visibly lag behind
-        // the real, continuously-updated mouse_x/mouse_y — i.e. the
-        // mouse felt "slow"/laggy even though input was being read
-        // promptly. Repainting as soon as something is dirty fixes
-        // that; the timer above still exists to pace guest ticking and
-        // to cover the "nothing moved, but a guest changed its own
-        // frame" case via g_evt_timer's own g_evt_dirty = true (set
-        // further up, now every iteration rather than every 500th).
-        // timer above still exists to pace guest ticking and to cover
-        // the "nothing moved, but a guest changed its own frame"
-        // periodic case via g_evt_timer's own g_evt_dirty = true (set
-        // where poll_counter last ticked over, further up).
+        // there's no real PIT/IRQ0 to drive it). Mouse movement/clicks
+        // and keystrokes are polled and flagged dirty on EVERY iteration
+        // regardless (see poll_input_universal() + the g_evt_input block
+        // above), so gating the actual repaint behind a slower timer
+        // made the on-screen cursor visibly lag behind the real,
+        // continuously-updated mouse_x/mouse_y — i.e. the mouse felt
+        // "slow"/laggy even though input was being read promptly.
+        // Repainting as soon as something is dirty fixes that.
+        //
+        // g_evt_dirty itself is set the instant something that actually
+        // needs a repaint happens (guest output, a process exiting,
+        // input that changes what's drawn -- all flagged at their own
+        // call sites) PLUS a coarser, throttled sweep (anim_repaint_counter
+        // above, decoupled from the guest-tick timer) purely so
+        // self-animating windows like the clock still get repainted
+        // periodically with nothing external driving them. It is
+        // deliberately NOT forced true on every single main-loop
+        // iteration any more -- see the fix note at anim_repaint_counter
+        // above for why that was a real, measurable performance drain on
+        // guest-program CPU-emulation time, not just a cosmetic detail.
         if (g_evt_dirty || g_input_state.hasNewInput) {
             g_evt_dirty               = false;
             g_input_state.hasNewInput = false;

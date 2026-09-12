@@ -170,6 +170,78 @@ matching the symptom.
   exit/teardown logic as fragile from past surgical changes, so this
   fix stays additive around it rather than touching it.
 
+## Fix #10 (added): the desktop was doing a full repaint on every single
+main-loop iteration, forever — the real "Bochs is draining the kernel"
+cost
+
+**Symptom:** even with Fixes #7–#9 in place, the whole system (not just
+guest ELF programs) felt like it was fighting for CPU, and the drain
+got worse specifically while a guest program was running — the opposite
+of what a scheduling fix alone should produce.
+
+**Root cause:** Fix #8 dropped `poll_counter`'s threshold to `1` so the
+software timer (`g_evt_timer`) fires every raw loop iteration — correct,
+and necessary for guest-tick responsiveness. But the same `if` block
+also set `g_evt_dirty = true` unconditionally every time it ran. Since
+it now runs on literally every iteration, that meant the repaint block
+further down — `g_gfx.clear_screen()` over the entire framebuffer,
+followed by `wm.update_all()` walking and redrawing every open window —
+executed on **every single main-loop pass**, with no gap, regardless of
+whether anything on screen had actually changed. Under software CPU
+interpretation that full-screen clear+redraw is real, substantial
+per-iteration cost, and it runs in the same loop and competes for the
+same CPU time as `tick_elf_processes()` — so the busier the desktop
+redraw path got, the less of each iteration was left for actually
+stepping a guest program's emulated CPU. This is exactly backwards:
+Bochs CPU emulation is the expensive, useful work; the desktop redraw
+was supposed to be gated to only happen when needed, and instead had
+quietly become the thing running unconditionally on every pass.
+
+**Fix, in `kernel_parts/11_kernel_main.h`:**
+- Split the single `if (++poll_counter >= 1)` block in two.
+  `g_evt_timer`/`g_timer_ticks` (guest-tick pacing) keep firing every
+  iteration exactly as Fix #8 set them up — untouched.
+- `g_evt_dirty` is no longer set there. Every place that actually
+  produces something worth repainting already flags it itself, the
+  instant it happens, with no polling needed: guest output
+  (`tick_elf_processes`'s three `g_evt_dirty = true` sites), a guest
+  process exiting, and any input that changes what's drawn
+  (`input_needs_full_repaint`). None of those needed the removed line
+  to work — they were already redundant with it.
+- The one thing the removed line was still pulling weight for:
+  self-animating windows (the clock's second hand is the concrete
+  example) that redraw on their own timer with nothing external
+  triggering them, and so need *some* periodic full-repaint sweep to
+  ever visibly update. That's a cosmetic animation cadence, not a
+  responsiveness requirement, so it doesn't need to run every
+  iteration. It's now driven by its own counter,
+  `anim_repaint_counter` / `ANIM_REPAINT_INTERVAL` (200), deliberately
+  separate from `poll_counter`/`TICKS_PER_FRAME` so guest-tick pacing
+  is never touched by this change.
+- Net effect: the expensive full-screen repaint now runs only when
+  something real changed, or at most once every 200 loop iterations
+  for idle animation upkeep — down from every single iteration — while
+  guest-program scheduling (Fixes #7–#9) is completely unaffected.
+- Also updated the stale comment further down (at the
+  `if (g_evt_dirty || g_input_state.hasNewInput)` repaint gate) that
+  described `g_evt_dirty` as being forced every iteration — it no
+  longer is, and the comment now describes the real dirty-flagging
+  paths instead.
+
+**Caveat:** same as Fixes #7–#9 — verified by tracing every read/write
+of `g_evt_dirty` across the kernel (`10_window_manager_impl.h`'s
+`mark_screen_dirty()` plus all four remaining set-sites) to confirm the
+existing event-driven flags fully cover real repaint needs, and by hand
+brace/paren-balance checking the edited block, but **not** by building
+Bochs 2.0 from source and booting the ISO — this patch set doesn't
+include a prebuilt toolchain or Bochs source tree, so that step still
+needs to happen in an environment with both. `ANIM_REPAINT_INTERVAL`
+(200) is, like every other iteration-count constant in this loop
+(`hb_counter`'s 10000, the old `poll_counter` thresholds), an arbitrary
+number picked in the absence of a real timer — tune it up if the clock/
+animations look choppy, or down if idle CPU use still looks high on
+real hardware/Bochs.
+
 **Caveat:** same as the other scheduling fixes — verified by careful
 static tracing (confirmed the only call site, confirmed no other code
 depended on the old always-tick-everyone behavior) and by re-checking
