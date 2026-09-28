@@ -879,6 +879,46 @@ static SVGAResult vmware_svga_init(uint32_t w, uint32_t h) {
 static bool g_gfx_click_left_pending  = false;
 static bool g_gfx_click_right_pending = false;
 
+// =============================================================================
+// LAG FIX: pacing helpers -- TSC time base calibrated against PIT channel 2
+// =============================================================================
+// The old main loop derived its "timer" from a raw iteration counter
+// (++poll_counter >= 500), so frame rate, repaint rate and guest CPU share
+// all changed with host speed. There is no usable IRQ0 here, so we build a
+// real-time base instead: calibrate the TSC once against PIT channel 2 (which
+// is read by POLLING port 0x61, no interrupt needed) and pace everything off
+// rdtsc afterwards.
+//
+// All 64-bit math below avoids division so a freestanding i386 build does not
+// need __udivdi3 from libgcc.
+static inline uint64_t ml_rdtsc() {
+    uint32_t lo, hi;
+    asm volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+static inline void    ml_outb(uint16_t p, uint8_t v) { asm volatile("outb %0,%1" :: "a"(v), "Nd"(p)); }
+static inline uint8_t ml_inb (uint16_t p) { uint8_t v; asm volatile("inb %1,%0" : "=a"(v) : "Nd"(p)); return v; }
+
+static uint32_t ml_tsc_per_ms = 2000000;   // fallback ~2 GHz if calibration fails
+
+static void ml_calibrate_tsc() {
+    uint8_t g = ml_inb(0x61);
+    ml_outb(0x61, g & 0xFC);                  // gate off, speaker off
+    ml_outb(0x43, 0xB0);                      // ch2, lo/hi byte access, mode 0
+    ml_outb(0x42, 0x9C); ml_outb(0x42, 0x2E); // 0x2E9C = 11932 ticks ~= 10 ms
+    ml_outb(0x61, (g & 0xFC) | 0x01);         // gate on: start counting
+    uint64_t t0 = ml_rdtsc();
+    uint32_t guard = 0;
+    bool ok = true;
+    while (!(ml_inb(0x61) & 0x20)) {          // OUT2 goes high at terminal count
+        if (++guard > 20000000u) { ok = false; break; }
+    }
+    uint64_t t1 = ml_rdtsc();
+    ml_outb(0x61, g);                         // restore port 0x61
+    uint64_t d = t1 - t0;
+    if (ok && d > 100000ull && d < 0xFFFFFFFFull) ml_tsc_per_ms = (uint32_t)d / 10;
+}
+
 extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
 
     // ── Verify Multiboot 1 magic FIRST, before any hardware probing ───────────
@@ -1052,22 +1092,70 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
     vga_status("Init complete - entering main loop", 0x0A);
 
     // ── Main loop ─────────────────────────────────────────────────────────────
-    const uint32_t TICKS_PER_FRAME = 1;
-    // Seeded so that (g_timer_ticks - last_tick_tick) >= TICKS_PER_FRAME is
-    // already true on the very first loop iteration (0 - (uint32_t)-1
-    // wraps around to 1). With last_tick_tick starting at 0 (matching
-    // g_timer_ticks' own starting value of 0), that gating check read
-    // (0 - 0) >= 1, i.e. false — so despite the g_evt_timer/g_evt_dirty
-    // flags being forced below, the paint block a few lines down was
-    // still skipped on frame one and the desktop (icons, taskbar, clock)
-    // stayed blank until the software timer's poll_counter first reached
-    // 500, rather than appearing immediately as the comment intended.
-    uint32_t last_tick_tick = (uint32_t)0 - TICKS_PER_FRAME;
-    int prev_mouse_x = mouse_x;
-    int prev_mouse_y = mouse_y;
+    // LAG FIX: fully rewritten. See the notes at each numbered stage.
+    //
+    // Root causes fixed here:
+    //  * Pacing came from a loop-iteration counter, not real time, so frame
+    //    rate / repaint rate / guest CPU share all varied with host speed and
+    //    the timer's g_evt_dirty forced full-desktop repaints far too often.
+    //  * Click edges and mouse motion seen by poll_input_universal() INSIDE
+    //    the guest sub-tick loop were never accumulated, so they were lost
+    //    (and prev_mouse_x/y were overwritten there) -> handle_input() was
+    //    skipped and drags / clicks stalled while a program ran.
+    //  * The guest only got CPU on the slow software timer.
+    //  * Nothing capped repaints (held buttons, chatty guest output).
+    //  * cleanup_closed_windows() ran on every spin of the loop.
+    ml_calibrate_tsc();
 
-    // Force an immediate first render — don't wait 500 poll iterations
-    // for the software timer to tick before the desktop appears.
+    const uint64_t FRAME_TSC = (uint64_t)ml_tsc_per_ms * 16;    // ~60 Hz paint / tick cap
+    const uint64_t GUEST_TSC = (uint64_t)ml_tsc_per_ms * 6;     // max guest time per pass
+    const uint64_t CLOCK_TSC = (uint64_t)ml_tsc_per_ms * 1000;  // idle refresh (taskbar clock)
+
+    uint64_t last_paint = 0;
+    uint64_t last_tick  = ml_rdtsc();
+    uint64_t last_clock = last_tick;
+
+    // Input state: edges/motion are accumulated by poll_and_latch() no matter
+    // WHERE polling happens (main loop or inside the guest slice), then
+    // consumed once per pass, so nothing is lost while a guest is running.
+    bool prev_left = mouse_left_down, prev_right = mouse_right_down;
+    int  seen_x = mouse_x, seen_y = mouse_y;
+    bool acc_lclick = false, acc_rclick = false, acc_moved = false;
+
+    // Where the cursor glyph currently sits on the live framebuffer.
+    int  drawn_x = -1, drawn_y = -1;
+
+    auto poll_and_latch = [&]() {
+        poll_input_universal();
+        if (mouse_left_down  && !prev_left)  { acc_lclick = true; g_gfx_click_left_pending  = true; }
+        if (mouse_right_down && !prev_right) { acc_rclick = true; g_gfx_click_right_pending = true; }
+        prev_left  = mouse_left_down;
+        prev_right = mouse_right_down;
+        if (mouse_x != seen_x || mouse_y != seen_y) {
+            acc_moved = true; seen_x = mouse_x; seen_y = mouse_y;
+        }
+    };
+
+    // Cheap cursor-only update straight on the framebuffer.
+    auto fast_cursor = [&]() {
+        if (g_backbuffer_is_clean_on_screen && !mouse_left_down && !mouse_right_down &&
+            (mouse_x != drawn_x || mouse_y != drawn_y)) {
+            erase_cursor_from_screen();
+            draw_cursor_to_screen(mouse_x, mouse_y, ColorPalette::CURSOR_WHITE);
+            drawn_x = mouse_x; drawn_y = mouse_y;
+        }
+    };
+
+    // A guest is "runnable" if it's alive and not parked waiting on stdin.
+    auto any_runnable = [&]() -> bool {
+        for (int i = 0; i < MAX_ELF_PROCESSES; ++i) {
+            ElfProcess& p = elf_processes[i];
+            if (p.active && !p.completed && !(p.waiting_for_input && in_empty(i))) return true;
+        }
+        return false;
+    };
+
+    // Force an immediate first render.
     g_evt_timer = true;
     g_evt_dirty = true;
 
@@ -1075,73 +1163,35 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
     volatile uint16_t* vga_hb = (volatile uint16_t*)(0xB8000 + 2*79);
     uint32_t hb_counter = 0;
     const char hb_chars[] = "|/-\\";
-    static uint32_t poll_counter = 0;
 
     for (;;) {
-        if (++hb_counter % 10000 == 0) {
-            *vga_hb = (uint16_t)(0x0A00u | (uint8_t)hb_chars[(hb_counter/10000)%4]);
+        if ((++hb_counter & 0x3FFF) == 0)
+            *vga_hb = (uint16_t)(0x0A00u | (uint8_t)hb_chars[(hb_counter >> 14) & 3]);
 
-		}
-
-
-        bool prev_left  = mouse_left_down;
-        bool prev_right = mouse_right_down;
-        poll_input_universal();
-
-        bool leftClickedThisFrame  = (mouse_left_down  && !prev_left);
-        bool rightClickedThisFrame = (mouse_right_down && !prev_right);
-
-        // Latch click edges for the guest mouse ABI (bochs_drivers.h's
-        // mouse_poll(), via kernel_gfx_mouse_poll() below). This loop
-        // runs every iteration, but tick_elf_processes() -- where a
-        // guest actually gets to poll -- only runs once every
-        // TICKS_PER_FRAME iterations, so a plain "clicked this frame"
-        // bool would often be gone again before any guest ever saw it.
-        // Sticky-until-consumed fixes that: set here, cleared only by
-        // kernel_gfx_mouse_poll() once it's actually been reported.
-        if (leftClickedThisFrame)  g_gfx_click_left_pending  = true;
-        if (rightClickedThisFrame) g_gfx_click_right_pending = true;
-        bool mouse_moved = (mouse_x != prev_mouse_x || mouse_y != prev_mouse_y);
+        // ── 1. Input (edges + motion accumulated, then consumed) ─────────────
+        poll_and_latch();
+        bool leftClickedThisFrame  = acc_lclick;
+        bool rightClickedThisFrame = acc_rclick;
+        bool mouse_moved           = acc_moved;
+        acc_lclick = acc_rclick = acc_moved = false;
         bool key_pressed = (last_key_press != 0);
 
-        // Anything that can actually change what's on screen beyond the
-        // cursor's own position: a key, a fresh click edge, or a button
-        // being held (drag/resize/paint-canvas in progress). A plain
-        // hover-move with nothing held is deliberately NOT included here
-        // -- see the cursor-only fast path further down for why forcing
-        // a full repaint for that case is what made mouse movement feel
-        // heavy.
+        // Anything that can change what's on screen beyond the cursor's own
+        // position: a key, a fresh click edge, or a button being held
+        // (drag/resize/paint in progress). A plain hover-move is NOT included
+        // -- it takes the cursor-only fast path instead of a full repaint.
         bool input_needs_full_repaint = key_pressed || leftClickedThisFrame ||
-                                         rightClickedThisFrame || mouse_left_down ||
-                                         mouse_right_down;
+                                        rightClickedThisFrame || mouse_left_down ||
+                                        mouse_right_down;
 
         if (key_pressed || mouse_moved || leftClickedThisFrame || rightClickedThisFrame) {
             g_evt_input = true;
             if (input_needs_full_repaint) g_input_state.hasNewInput = true;
-            prev_mouse_x = mouse_x;
-            prev_mouse_y = mouse_y;
         }
 
-        // Route keypresses to any active ELF guest process
-        //
-        // FIX (focus ignored on click): this used to scan every slot
-        // and hand the keystroke to the FIRST one that was active &&
-        // waiting_for_input, regardless of which terminal window was
-        // actually focused/clicked. With two terminals each running
-        // a program that reads stdin, typing while Terminal B was
-        // focused would silently feed Terminal A instead (whichever
-        // slot happened to be waiting), and last_key_press got
-        // zeroed here before wm.handle_input ever saw it — so B's
-        // own captured_elf_slot path (kernel.cpp's BUSYBOX CAPTURE
-        // block) never even ran.
-        //
-        // Fix: only steal the keystroke for the ELF slot owned by
-        // the currently FOCUSED window. If that slot isn't waiting
-        // for input (or no window is focused, or the focused window
-        // isn't capturing a slot), fall through and let the normal
-        // g_evt_input / wm.handle_input path below handle the key —
-        // which is what already correctly threads input to whichever
-        // terminal's captured_elf_slot the user clicked into.
+        // Route keypress to the FOCUSED window's ELF slot only. If that slot
+        // isn't waiting for input, fall through to wm.handle_input, which
+        // threads it to whichever terminal's captured_elf_slot was clicked.
         if (last_key_press != 0) {
             int fs = wm.get_focused_elf_slot();
             if (fs >= 0 && fs < MAX_ELF_PROCESSES &&
@@ -1152,137 +1202,78 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
             }
         }
 
-        // Software timer (no PIT — IRQ0 would fire into an unhandled vector)
-        if (++poll_counter >= 500) {
-            poll_counter  = 0;
-            g_evt_timer   = true;
-			g_evt_dirty = true;
-            g_timer_ticks++;
-        }
-
+        bool handled_input = false;
         if (g_evt_input) {
             g_evt_input = false;
+            handled_input = true;
             wm.handle_input(last_key_press, mouse_x, mouse_y,
                             mouse_left_down,
                             leftClickedThisFrame,
                             rightClickedThisFrame);
             if (last_key_press != 0) last_key_press = 0;
-            // Only force the expensive full-desktop repaint for input
-            // that can actually change what's drawn. handle_input()
-            // early-returns doing nothing at all for a plain hover-move
-            // (no button down, no click edge), so there's nothing here
-            // for a full repaint to pick up in that case anyway.
             if (input_needs_full_repaint) g_evt_dirty = true;
         }
 
-        wm.cleanup_closed_windows();
-
-        // Guest-process ticking stays paced by the software timer (as
-        // before) — this is what governs how much CPU-emulation work a
-        // running ELF guest gets per iteration, and shouldn't speed up
-        // or slow down just because the mouse is being moved.
-        if (g_evt_timer && (g_timer_ticks - last_tick_tick) >= TICKS_PER_FRAME) {
-            // Tick ELF processes BEFORE the paint so any breadcrumbs they
-            // write (x86_breadcrumb at row 2, glue's tick markers at row 0
-            // col 72/73, panic tags at col 70) are reflected in the next
-            // swap_buffers. Otherwise a hang inside tick_elf_processes
-            // would leave the last painted frame without the breadcrumbs
-            // pointing at where the hang happened.
-            //
-            // A single tick_elf_processes() call can itself block for a
-            // perceptible chunk of wall time -- bochs_cpu_tick() (see
-            // bochs_glue.cpp) hands the guest a budget of up to tens of
-            // thousands of software-interpreted instructions per call,
-            // and a CPU-bound guest with little port I/O to yield on
-            // (its main way of handing control back early) can burn
-            // through that whole budget before returning. During that
-            // entire call the mouse can't be polled or redrawn at all --
-            // "everything is smooth until a program is actually running,
-            // then the cursor stutters" is exactly what that looks like.
-            // Splitting the interval's guest-execution budget into
-            // several smaller ticks and polling+redrawing the cursor
-            // between each one gives the pointer many more chances to
-            // stay current while a program runs, instead of only one at
-            // the very end of the interval. (A single sub-tick can still
-            // block for its own full budget if the guest never yields at
-            // all -- this doesn't fix that pathological case, but it's
-            // the common one: any guest doing the usual putc/getc-style
-            // I/O yields far more often than that.)
-            const int GUEST_SUBTICKS = 8;
-            for (int st = 0; st < GUEST_SUBTICKS; st++) {
-                tick_elf_processes(1);
-
-                poll_input_universal();
-                bool subtick_mouse_moved = (mouse_x != prev_mouse_x || mouse_y != prev_mouse_y);
-                if (subtick_mouse_moved) {
-                    prev_mouse_x = mouse_x;
-                    prev_mouse_y = mouse_y;
-                    // Only the cheap cursor-only redraw here -- if a
-                    // button is down (drag/resize/paint in progress) or
-                    // the backbuffer isn't in a known-clean state, leave
-                    // it for the normal full-repaint path below instead
-                    // of risking a partial/stale-looking mid-tick frame.
-                    if (g_backbuffer_is_clean_on_screen &&
-                        !mouse_left_down && !mouse_right_down) {
-                        erase_cursor_from_screen();
-                        draw_cursor_to_screen(mouse_x, mouse_y, ColorPalette::CURSOR_WHITE);
-                    }
-                }
-            }
-
-            last_tick_tick = g_timer_ticks;
-            g_evt_timer     = false;
+        // ── 2. Real-time timebase (replaces the 500-iteration software timer) ─
+        uint64_t now = ml_rdtsc();
+        bool frame_due = false;
+        if (now - last_tick >= FRAME_TSC) {
+            last_tick = now;                 // = now, not += : no catch-up bursts
+            g_timer_ticks++;                 // now advances at ~60 Hz
+            g_evt_timer = true;
+            frame_due = true;
+        }
+        if (now - last_clock >= CLOCK_TSC) { // idle refresh: taskbar clock, ~1 Hz
+            last_clock = now;
+            g_evt_dirty = true;
         }
 
-        // Repaint is intentionally NOT gated on g_evt_timer above — only
-        // on whether anything actually changed (g_evt_dirty /
-        // hasNewInput). It used to require BOTH the timer *and* a dirty
-        // flag, but the software timer here only fires once every 500
-        // raw loop iterations (poll_counter, further up — there's no
-        // real PIT/IRQ0 to drive it). Mouse movement/clicks and
-        // keystrokes are polled and flagged dirty on EVERY iteration
-        // (see poll_input_universal() + the g_evt_input block above),
-        // so gating the actual repaint behind that same slow timer made
-        // the on-screen cursor visibly lag ~500 iterations behind the
-        // real, continuously-updated mouse_x/mouse_y — i.e. the mouse
-        // felt "slow"/laggy even though input was being read promptly.
-        // Repainting as soon as something is dirty fixes that; the
-        // timer above still exists to pace guest ticking and to cover
-        // the "nothing moved, but a guest changed its own frame"
-        // periodic case via g_evt_timer's own g_evt_dirty = true (set
-        // where poll_counter reaches 500, further up).
-        if (g_evt_dirty || g_input_state.hasNewInput) {
+        if (handled_input || frame_due) wm.cleanup_closed_windows();
+
+        // ── 3. Guest slice: time-boxed; polls input + moves cursor between ticks
+        // Tick ELF processes BEFORE the paint so breadcrumbs they write are
+        // reflected in the next swap_buffers.
+        bool ran_guest = false;
+        if (any_runnable()) {
+            ran_guest = true;
+            uint64_t slice_start = now;
+            do {
+                tick_elf_processes(1);
+                poll_and_latch();
+                fast_cursor();
+            } while (ml_rdtsc() - slice_start < GUEST_TSC && any_runnable());
+            if (frame_due) g_evt_dirty = true;   // guest may have redrawn its canvas
+        }
+        if (frame_due) g_evt_timer = false;
+
+        // ── 4. Paint: only when dirty, at most once per FRAME_TSC ────────────
+        // A deferred paint keeps its dirty flag and happens on a later pass.
+        now = ml_rdtsc();
+        bool want_paint = g_evt_dirty || g_input_state.hasNewInput;
+        if (want_paint && (now - last_paint) >= FRAME_TSC) {
             g_evt_dirty               = false;
             g_input_state.hasNewInput = false;
-            g_gfx.clear_screen(ColorPalette::DESKTOP_GRAY );
+            g_gfx.clear_screen(ColorPalette::DESKTOP_GRAY);
             wm.update_all();
             // Diagnostic overlay: paint VGA text-mode rows 0/1/2
             // (boot/panic/tick breadcrumbs, host-IDT fault tags,
-            // x86_tick lazy-init progress) onto the framebuffer so
-            // they are visible in graphics mode. Drawn last so it
-            // overlays everything.
+            // x86_tick lazy-init progress) onto the framebuffer.
             draw_vga_overlay();
             swap_buffers();
-            // The backbuffer just pushed to the screen has no cursor in
-            // it (draw_cursor() is intentionally not called here any
-            // more -- see the cursor-only fast path comment below), so
-            // draw the cursor glyph straight onto the framebuffer now
-            // and remember where. That's what lets the *next* frame, if
-            // it's just a plain pointer move, skip the full repaint
-            // entirely.
+            // The pushed backbuffer has no cursor in it; draw the glyph
+            // straight onto the framebuffer so the next plain pointer move
+            // can skip the full repaint.
             erase_cursor_from_screen(); // no-op the first time through
             draw_cursor_to_screen(mouse_x, mouse_y, ColorPalette::CURSOR_WHITE);
+            drawn_x = mouse_x; drawn_y = mouse_y;
             g_backbuffer_is_clean_on_screen = true;
-        } else if (mouse_moved && g_backbuffer_is_clean_on_screen) {
-            // Cursor-only fast path: nothing but the pointer position
-            // changed this frame (no key, no click, no button held --
-            // handle_input() already established there's nothing else
-            // to redraw). Move just the ~8x12px cursor glyph directly
-            // on the framebuffer instead of clearing and redrawing the
-            // entire desktop/every window/the taskbar clock and doing a
-            // full 1024x768 blit for a one-pixel pointer nudge.
-            erase_cursor_from_screen();
-            draw_cursor_to_screen(mouse_x, mouse_y, ColorPalette::CURSOR_WHITE);
+            last_paint = ml_rdtsc();
+        } else {
+            // Nothing to paint (or paint deferred to hold 60 Hz): keep the
+            // pointer responsive with the cheap path.
+            fast_cursor();
+            if (!want_paint && !ran_guest && !handled_input)
+                asm volatile("pause");   // idle: be kind to the (virtual) CPU
         }
     }
 }
