@@ -53,6 +53,8 @@ SECTIONS
     . = 0x08002000;
     .text   : { *(.text._start) *(.text .text.*)   } :load
     .rodata : { *(.rodata .rodata.*)               } :load
+    /* kernel-rendered static GUI scene (gui_scene.h) */
+    .guiscene : ALIGN(4) { KEEP(*(.guiscene)) } :load
     .data   : { *(.data .data.*)                   } :load
     .bss    : { *(.bss .bss.* COMMON)              } :load
 

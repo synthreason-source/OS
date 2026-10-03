@@ -49,6 +49,9 @@ SECTIONS
         *(.rodata .rodata.*)
     } :load
 
+    /* kernel-rendered static GUI scene (gui_scene.h) */
+    .guiscene : ALIGN(4) { KEEP(*(.guiscene)) } :load
+
     .data : {
         *(.data .data.*)
     } :load

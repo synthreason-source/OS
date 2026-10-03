@@ -22,6 +22,45 @@ char prompt_buffer[TERM_WIDTH];
 // =============================================================================
 #include "../matrix_array.h"
 #include "../desktop_suite/launcher.h"
+#include "../gui_render.h"
+
+// ── Static GUI scenes (.guiscene ELF section) ─────────────────────────
+// A guest ELF may carry its whole UI as data (see gui_scene.h). The
+// kernel finds the section at launch, never starts the guest CPU, and
+// renders + hit-tests the scene itself into a private pixel canvas that
+// TerminalWindow::draw() blits through the same path as a gfx_present()
+// frame. gui_ops_t has no context pointer, hence these file-statics.
+static uint32_t* g_sg_px = nullptr;
+static int g_sg_w = 0, g_sg_h = 0;
+static void sg_fill(int x, int y, int w, int h, unsigned int rgb) {
+    if (!g_sg_px) return;
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > g_sg_w) w = g_sg_w - x;
+    if (y + h > g_sg_h) h = g_sg_h - y;
+    for (int j = 0; j < h; j++)
+        for (int i = 0; i < w; i++) g_sg_px[(y + j) * g_sg_w + x + i] = rgb;
+}
+static void sg_text(int x, int y, const char* str, unsigned int rgb) {
+    for (int k = 0; str[k]; k++) {
+        unsigned char c = (unsigned char)str[k];
+        if (c > 127) continue;
+        const uint8_t* g = font + c * 8;
+        for (int r = 0; r < 8; r++)
+            for (int b = 0; b < 8; b++)
+                if (g[r] & (0x80 >> b)) sg_fill(x + k * 8 + b, y + r, 1, 1, rgb);
+    }
+}
+#define SGUI_MAX_W 480
+#define SGUI_MAX_H 320
+struct StaticGui {
+    gui_scene_t scene;
+    unsigned char* blob;     // owned, 4-byte-aligned copy of .guiscene
+    uint32_t* px;            // cw*ch canvas
+    int w, h;
+    bool prev_left;
+    int key;                 // pending keystroke (0 = none)
+};
 
 // parse "rwxt" → bitmask of NPA_R/W/RX/TX. Default: r+w+x if empty.
 static uint16_t parse_perms(const char* s) {
@@ -1624,6 +1663,21 @@ int load_and_execute_elf(const char* filename, const char* args, TerminalWindow*
             break;
         }
 
+        // Static GUI: if the ELF carries a .guiscene section, the kernel
+        // renders it itself and the guest is never started.
+        {
+            const void* gsec = nullptr; unsigned gsz = 0;
+            if (gui_elf_find_section(elfdata, entry.file_size, &gsec, &gsz) == 0) {
+                if (terminal && terminal->start_static_gui(gsec, gsz)) {
+                    terminal->title = "Static GUI";
+                    terminal->console_print("[static gui: rendered by kernel from .guiscene]\n");
+                } else if (terminal) {
+                    terminal->console_print("ELF: invalid .guiscene section\n");
+                }
+                break;   // result stays -1: no Bochs slot to capture
+            }
+        }
+
         Elf32_Phdr* phdr = (Elf32_Phdr*)(elfdata + ehdr.e_phoff);
         uint32_t filesize = entry.file_size;
 
@@ -1889,6 +1943,77 @@ public:
     bool is_emulator_window = false;
     bool bochs_reset_done   = false;  // reset runs once per window
     int captured_elf_slot = -1;
+
+    // ── static-scene state (see StaticGui above) ──
+    StaticGui* sgui = nullptr;
+
+    void stop_static_gui() {
+        if (!sgui) return;
+        if (g_sg_px == sgui->px) g_sg_px = nullptr;
+        delete[] sgui->px;
+        delete[] sgui->blob;
+        delete sgui;
+        sgui = nullptr;
+        gfx_rect_valid = false;
+    }
+
+    // `sec`/`sz` point into the ELF image read from disk (not necessarily
+    // aligned, freed by the caller), so copy into an owned aligned buffer.
+    bool start_static_gui(const void* sec, unsigned sz) {
+        stop_static_gui();
+        if (!sec || sz < sizeof(gui_node_t) || sz > 64u * 1024u) return false;
+        StaticGui* g = new StaticGui();
+        if (!g) return false;
+        memset(g, 0, sizeof(*g));
+        unsigned words = (sz + 3) / 4;
+        uint32_t* blob = new uint32_t[words];
+        if (!blob) { delete g; return false; }
+        memcpy(blob, sec, sz);
+        g->blob = (unsigned char*)blob;
+        if (gui_scene_load(&g->scene, blob, sz) != 0 ||
+            g->scene.cw < 1 || g->scene.ch < 1 ||
+            g->scene.cw > SGUI_MAX_W || g->scene.ch > SGUI_MAX_H) {
+            delete[] g->blob; delete g; return false;
+        }
+        g->w = g->scene.cw; g->h = g->scene.ch;
+        g->px = new uint32_t[(unsigned)g->w * (unsigned)g->h];
+        if (!g->px) { delete[] g->blob; delete g; return false; }
+        g->prev_left = mouse_left_down;   // don't count the launching click
+        sgui = g;
+        return true;
+    }
+
+    // One frame of the static GUI: input -> events -> render. Returns the
+    // canvas for draw() to blit, or false once the scene has quit.
+    bool sgui_frame(const uint32_t** out_px, int* out_w, int* out_h) {
+        StaticGui* g = sgui;
+        bool focused = wm.is_window_focused(this);
+        bool left = focused && mouse_left_down;
+        bool click = left && !g->prev_left;
+        g->prev_left = left;
+
+        int lx = 0, ly = 0, in = 0;
+        if (gfx_rect_valid && gfx_rect_w > 0 && gfx_rect_h > 0) {
+            // Unclamped mapping (so scrollbar drags keep tracking outside
+            // the canvas); in_window only when actually over it.
+            lx = (mouse_x - gfx_rect_x) * g->w / gfx_rect_w;
+            ly = (mouse_y - gfx_rect_y) * g->h / gfx_rect_h;
+            in = focused && mouse_x >= gfx_rect_x && mouse_y >= gfx_rect_y &&
+                 mouse_x < gfx_rect_x + gfx_rect_w && mouse_y < gfx_rect_y + gfx_rect_h;
+        }
+        int key = g->key; g->key = 0;
+        if (gui_scene_event(&g->scene, lx, ly, left, click, in, key)) {
+            stop_static_gui();
+            console_print("[static gui exited]\n");
+            print_prompt();
+            return false;
+        }
+        g_sg_px = g->px; g_sg_w = g->w; g_sg_h = g->h;
+        gui_ops_t ops = { sg_fill, sg_text, 8, 8 };
+        gui_scene_render(&g->scene, &ops);
+        *out_px = g->px; *out_w = g->w; *out_h = g->h;
+        return true;
+    }
     int term_id = -1;
     int get_elf_slot() const override { return captured_elf_slot; }
     int get_taskbar_id() const override { return term_id; }
@@ -1961,10 +2086,12 @@ public:
             proc.cpu_initialized = false;
         }
         captured_elf_slot = -1;
+        stop_static_gui();
         is_closed = true;
     }
 
     ~TerminalWindow() { 
+        stop_static_gui();
         if(edit_lines) {
             for(int i = 0; i < edit_line_count; i++) delete[] edit_lines[i];
             delete[] edit_lines;
@@ -2081,7 +2208,9 @@ public:
     // ordinary text on the very next draw().
     const uint32_t* gfx_px = nullptr;
     int gfx_w = 0, gfx_h = 0;
-    bool gfx_active = (captured_elf_slot >= 0) &&
+    bool gfx_active = false;
+    if (sgui) gfx_active = sgui_frame(&gfx_px, &gfx_w, &gfx_h);
+    else gfx_active = (captured_elf_slot >= 0) &&
         bochs_gfx_get_frame(captured_elf_slot, &gfx_px, &gfx_w, &gfx_h);
 
     if (gfx_active) {
@@ -2245,6 +2374,7 @@ public:
     }
 
     void on_key_press(char c) override {
+    if (sgui) { sgui->key = (int)(signed char)c; return; }
     if (in_editor) {
         if (!edit_lines || edit_current_line >= edit_line_count) return;
 

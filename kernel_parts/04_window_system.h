@@ -269,6 +269,10 @@ void load_desktop_items() {
     // terminal capturing an ELF process. Used to route keystrokes to
     // whichever process the user actually clicked into, instead of
     // just the first process that happens to be waiting for input.
+    bool is_window_focused(const Window* w) const {
+        return focused_idx >= 0 && focused_idx < num_windows && windows[focused_idx] == w;
+    }
+
     int get_focused_elf_slot() const {
         if (focused_idx < 0 || focused_idx >= num_windows) return -1;
         return windows[focused_idx]->get_elf_slot();
