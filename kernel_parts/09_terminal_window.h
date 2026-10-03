@@ -53,6 +53,20 @@ static void sg_text(int x, int y, const char* str, unsigned int rgb) {
 }
 #define SGUI_MAX_W 480
 #define SGUI_MAX_H 320
+// FAT32 hooks for GUI_ACT_OPEN / GUI_ACT_SAVE (static editors such as editf.c).
+static int sg_file_read(const char* name, char* buf, int cap) {
+    char* data = fat32_read_file_as_string(name);
+    if (!data) return -1;
+    uint32_t size = 0;
+    if (fat32_stat_file(name, &size) != 0 || (int)size > cap) { delete[] data; return -1; }
+    for (uint32_t i = 0; i < size; i++) buf[i] = data[i];
+    delete[] data;
+    return (int)size;
+}
+static int sg_file_write(const char* name, const char* buf, int len) {
+    return fat32_write_file(name, buf, (uint32_t)len) == 0 ? 0 : -1;
+}
+static const gui_file_ops_t g_sg_file_ops = { sg_file_read, sg_file_write };
 struct StaticGui {
     gui_scene_t scene;
     unsigned char* blob;     // owned, 4-byte-aligned copy of .guiscene
@@ -1975,6 +1989,7 @@ public:
             g->scene.cw > SGUI_MAX_W || g->scene.ch > SGUI_MAX_H) {
             delete[] g->blob; delete g; return false;
         }
+        g->scene.files = &g_sg_file_ops;
         g->w = g->scene.cw; g->h = g->scene.ch;
         g->px = new uint32_t[(unsigned)g->w * (unsigned)g->h];
         if (!g->px) { delete[] g->blob; delete g; return false; }

@@ -11,13 +11,21 @@
 #define GUI_MAX_VARS     16
 #define GUI_MAX_TEXTBOX  4
 #define GUI_TEXTBOX_CAP  48
+#define GUI_MAX_TEXTAREA 1
+#define GUI_TA_CAP       4096             /* bytes in the text-area buffer */
 #define GUI_TEXT_LEN     20               /* incl. NUL */
 
 enum {
     GUI_OP_HEADER = 0, GUI_OP_FILL, GUI_OP_STROKE, GUI_OP_TEXT, GUI_OP_BUTTON,
-    GUI_OP_SCROLL, GUI_OP_TEXTBOX, GUI_OP_VALUE, GUI_OP_BARV, GUI_OP_INITVAR
+    GUI_OP_SCROLL, GUI_OP_TEXTBOX, GUI_OP_VALUE, GUI_OP_BARV, GUI_OP_INITVAR,
+    GUI_OP_TEXTAREA, GUI_OP_STATUS
 };
-enum { GUI_ACT_NONE = 0, GUI_ACT_ADD, GUI_ACT_QUIT };
+enum { GUI_ACT_NONE = 0, GUI_ACT_ADD, GUI_ACT_QUIT,
+       /* file actions: operate on text-area 0 and the textbox slot in `var`
+        * (the kernel supplies the file callbacks; see gui_file_ops_t). */
+       GUI_ACT_NEW, GUI_ACT_OPEN, GUI_ACT_SAVE,
+       /* two-click quit: first click arms, second (or unmodified) quits */
+       GUI_ACT_QUIT_CONFIRM };
 
 typedef struct {                  /* 44 bytes, no pointers, no padding */
     unsigned char op, var, aux, flags;
@@ -38,8 +46,16 @@ typedef struct {                  /* 44 bytes, no pointers, no padding */
 #define GUI_BUTTON(x,y,w,h,s,act,var,d) GUI__N(GUI_OP_BUTTON,var,act,x,y,w,h,0,d,0,s)
 #define GUI_SCROLL(x,y,w,h,var,mn,mx)   GUI__N(GUI_OP_SCROLL,var,0,x,y,w,h,0,mn,mx,"")
 #define GUI_TEXTBOX(x,y,w,h,slot)       GUI__N(GUI_OP_TEXTBOX,slot,0,x,y,w,h,0,0,0,"")
+/* same, but pre-filled with s (<= 19 chars) */
+#define GUI_TEXTBOX_INIT(x,y,w,h,slot,s) GUI__N(GUI_OP_TEXTBOX,slot,0,x,y,w,h,0,0,0,s)
 #define GUI_VALUE(x,y,c,var)            GUI__N(GUI_OP_VALUE,var,0,x,y,0,0,c,0,0,"")
 #define GUI_BARV(x,y,w,h,c,var,mn,mx)   GUI__N(GUI_OP_BARV,var,0,x,y,w,h,c,mn,mx,"")
+/* multi-line editor: slot = text-area index (0), aux = CHAR_W/LINE_H are the
+ * kernel glyph cell.  Keyboard goes here when it has focus. */
+#define GUI_TEXTAREA(x,y,w,h,slot)      GUI__N(GUI_OP_TEXTAREA,slot,0,x,y,w,h,0,0,0,"")
+/* status line: "Ln L  Col C   N/CAP chars  *modified*  <message>" */
+#define GUI_STATUS(x,y,c)               GUI__N(GUI_OP_STATUS,0,0,x,y,0,0,c,0,0,"")
+#define GUI_FILE_BUTTON(x,y,w,h,s,act,tbslot) GUI__N(GUI_OP_BUTTON,tbslot,act,x,y,w,h,0,0,0,s)
 #define GUI_INITVAR(var,val)            GUI__N(GUI_OP_INITVAR,var,0,0,0,0,0,0,val,0,"")
 
 /* Declare the scene.  `used` + `aligned` keep it through --gc-sections. */

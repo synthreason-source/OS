@@ -257,3 +257,29 @@ structs the caller owns — usually file-scope `static` — the same
 needs both headers present (`make cc` syncs all three onto `disk.img`
 automatically, the same way it already does for `bochs_drivers.h`
 alone).
+
+### Static GUI editor (`editf.c`)
+
+`editf.c` now ships its UI as a `.guiscene` (see `gui_scene.h`), so the
+kernel draws and drives it and the guest never runs:
+
+```bash
+make cc SRC=editf.c
+# in the OS shell:
+editf
+```
+
+New scene nodes used by it:
+
+| Macro | Purpose |
+|---|---|
+| `GUI_TEXTAREA(x,y,w,h,0)` | multi-line editor (arrows, Home/End, Del, Tab, click-to-place, h+v scroll) |
+| `GUI_STATUS(x,y,color)` | `Ln/Col`, `bytes/4095`, `*mod*`, last message |
+| `GUI_FILE_BUTTON(..., GUI_ACT_NEW/OPEN/SAVE, textbox_slot)` | file actions using the named filename box |
+| `GUI_ACT_QUIT_CONFIRM` | two-click quit when there are unsaved changes |
+| `GUI_TEXTBOX_INIT(..., slot, "text")` | textbox with a default value |
+
+Limits: 4095-byte buffer, fixed 480x320 canvas (scaled to the window, no
+re-layout on resize). The previous resizable 8 KB immediate-mode editor is
+still in the file: build with `-DEDITF_LIVE` to get it.
+Host test: `gcc -o t host_test_editf.c && ./t <editf.elf>`.

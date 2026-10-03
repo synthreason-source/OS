@@ -1,11 +1,66 @@
+/* editf.c -- text editor, now with a STATIC GUI front end.
+ *
+ * Default build (static GUI)
+ * --------------------------
+ *   make cc SRC=editf.c      then run `editf` in the OS shell.
+ *
+ * The whole UI below is DATA (gui_scene.h): the compiler puts it in the
+ * ".guiscene" ELF section and the kernel renders, hit-tests and edits it
+ * itself (see gui_render.h).  _start() never draws anything, so there is
+ * no per-frame guest loop, no key_poll()/mouse_poll() and no gfx_present().
+ *
+ * What the scene gives you
+ *   - Filename box (click to focus) + New / Open / Save buttons.
+ *   - Multi-line text area: typing, Backspace/Delete, Enter, Tab (4 spaces),
+ *     arrows, Home/End, click-to-place cursor, sticky column on Up/Down,
+ *     vertical AND horizontal scrolling that follows the cursor.
+ *   - Status line: Ln/Col, bytes used / capacity, *mod* flag, last result.
+ *   - Two-click Quit: with unsaved changes the first click arms it
+ *     ("Sure?"), the second one exits.
+ *
+ * Differences from the live editor
+ *   - Buffer is GUI_TA_CAP (4096) bytes, not 8192.
+ *   - Canvas is fixed-size (the kernel scales it to the window); it does
+ *     not re-layout when the window is resized.
+ *
+ * The original immediate-mode editor is kept, unchanged, below: build it
+ * with  make cc SRC=editf.c CFLAGS=-DEDITF_LIVE  (or add -DEDITF_LIVE to
+ * your cc invocation) if you need the resizable/8 KB version.
+ */
+#ifndef EDITF_LIVE
+#include "gui_scene.h"
+
+GUI_SCENE(
+    GUI_HEADER(480, 320, 0x1E2227),
+
+    /* toolbar */
+    GUI_FILE_BUTTON(  4,  4,  50, 20, "New",  GUI_ACT_NEW,  0),
+    GUI_FILE_BUTTON( 58,  4,  50, 20, "Open", GUI_ACT_OPEN, 0),
+    GUI_FILE_BUTTON(112,  4,  50, 20, "Save", GUI_ACT_SAVE, 0),
+    GUI_BUTTON(406, 4, 70, 20, "Quit", GUI_ACT_QUIT_CONFIRM, 0, 0),
+
+    /* filename row (textbox slot 0, pre-filled like the live editor) */
+    GUI_TEXT(4, 32, 0x9A9A9A, "File:"),
+    GUI_TEXTBOX_INIT(44, 28, 220, 16, 0, "untitled.txt"),
+
+    /* editor + status */
+    GUI_TEXTAREA(4, 52, 472, 240, 0),
+    GUI_STATUS(4, 298, 0x9A9A9A)
+);
+
+/* Nothing to execute: the kernel never starts the guest for a .guiscene
+ * ELF.  Kept so the file still links as a normal guest program. */
+void _start(void) { for (;;) { } }
+
+#else  /* EDITF_LIVE -- original immediate-mode editor, unchanged */
 /* text_edit.c — a small but fully-featured multi-line text editor
  * built on top of comp.h's widgets and drivers.h's FAT32 disk ABI.
  *
  * Build (from the host):
- *     make cc SRC=text_edit.c
+ *     make cc SRC=editf.c
  * Or from the OS shell:
- *     cc text_edit.c
- *     text_edit
+ *     cc editf.c
+ *     editf
  *
  * Features
  * --------
@@ -439,3 +494,4 @@ void _start(void)
     kputs("text_edit: exiting.\n");
     kexit(0);
 }
+#endif /* EDITF_LIVE */
