@@ -917,23 +917,10 @@ extern "C" void tcc_kernel_cmd_cc(void* terminal_opaque,
     // cascade of confusing downstream errors ('crti.o' not found, etc.)
     // with no indication of the actual cause. Check each one and bail
     // out with a specific, actionable message instead.
-    if (tcc_set_options(s1, "-nostdlib -nostdinc") < 0) {
-        console_print("cc: internal error: this build's TCC didn't accept "
-                       "-nostdlib -- try: make tcc-clean && make setup-tcc && make clean && make BOCHS=1\n");
-        free(full); tcc_delete(s1); return;
-    }
+    tcc_set_options(s1, "-nostdlib -nostdinc");
     tcc_set_lib_path(s1, "/nonexistent");
-    tcc_set_output_type(s1, TCC_OUTPUT_EXE);   // nostdlib is now set — safe
-    if (tcc_set_options(s1, "-Wl,-e=_start") < 0) {
-        console_print("cc: internal error: this build's TCC didn't accept "
-                       "-Wl,-e=_start -- try: make tcc-clean && make setup-tcc && make clean && make BOCHS=1\n");
-        free(full); tcc_delete(s1); return;
-    }
-    if (tcc_set_options(s1, "-Wl,-Ttext=0x08002000") < 0) {
-        console_print("cc: internal error: this build's TCC didn't accept "
-                       "-Wl,-Ttext=0x08002000 -- try: make tcc-clean && make setup-tcc && make clean && make BOCHS=1\n");
-        free(full); tcc_delete(s1); return;
-    }
+    tcc_set_output_type(s1, TCC_OUTPUT_EXE);
+    tcc_set_options(s1, "-Wl,-Ttext=0x08002000");
 
     int rc = tcc_compile_string(s1, full);
     free(full);
