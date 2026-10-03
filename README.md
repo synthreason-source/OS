@@ -6,10 +6,10 @@ CTRL-Q saves and exits text editor...
 
 SATA port selection with 'disk_select'
 
-guest programs require drivers.h and comp.h to interface with the OS.
+guest programs require drivers.h, comp.h & gui_scene.h to interface with the OS.
 
-TODO: add ethernet, web browser & busybox implementation
-TODO: add driver kit, CPU resource optimising
+TODO: add ethernet, WiFi, web browser & busybox implementation
+TODO: add driver kit
 # Build Instructions
 
 ## Prerequisites (one-time apt installs)
