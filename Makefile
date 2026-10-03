@@ -229,7 +229,14 @@ $(TCC_SRC_DIR)/.extracted: $(TCC_ARCHIVE)
 	# TCC version -- so it silently matched nothing and the intended
 	# patch never applied (sed doesn't error on a no-op substitution).
 	# Verified against the actual downloaded source before fixing.
-	sed -i 's/tcc_error_noabort("link symbol '"'"'%s'"'"' defined twice", name);/\/\* ignore \*\//' $(TCC_SRC_DIR)/tccelf.c
+	# The text differs between TCC versions: 0.9.27 / older mob say
+	# "link symbol '%s' defined twice", current mob says just
+	# "'%s' defined twice". Match BOTH (the "link symbol " prefix is optional),
+	# then fail the build loudly if neither form was patched out, instead
+	# of silently shipping an unpatched libtcc.
+	sed -i -E 's/tcc_error_noabort\("(link symbol )?'"'"'%s'"'"' defined twice", name\);/\/\* ignore \*\//' $(TCC_SRC_DIR)/tccelf.c
+	@if grep -q "defined twice" $(TCC_SRC_DIR)/tccelf.c; then \
+	    echo "ERROR: tccelf.c still contains 'defined twice' after patching"; exit 1; fi
 	touch $@
 
 # Build i386-tcc cross-compiler + libtcc into tcc-local/.
