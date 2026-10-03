@@ -6,7 +6,7 @@ CTRL-Q saves and exits text editor...
 
 SATA port selection with 'disk_select'
 
-guest programs require drivers.h, comp.h, gui_render.h & gui_scene.h to interface with the OS.
+guest programs require many '.h' files within the base directory for compiled programs to interface with the OS.
 
 TODO: add ethernet, WiFi, web browser & busybox implementation
 
