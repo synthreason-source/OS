@@ -573,6 +573,19 @@ bochs_cstubs.o: bochs_cstubs.c
 TCC_KERN_LIB := i386-libtcc-kern.a
 
 $(TCC_KERN_LIB): $(TCC_I386)
+	@grep -q tcc_kern_configure $(TCC_SRC_DIR)/libtcc.c || printf '%s\n' \
+	  '' \
+	  'int tcc_kern_configure(TCCState *s, unsigned text_addr, const char *entry)' \
+	  '{' \
+	  '    if (!s) return -1;' \
+	  '    s->nostdinc = 1;' \
+	  '    s->nostdlib = 1;' \
+	  '    s->nostdlib_paths = 1;' \
+	  '    s->static_link = 1;' \
+	  '    if (text_addr) { s->text_addr = text_addr; s->has_text_addr = 1; }' \
+	  '    if (entry && *entry) tcc_set_str(&s->elf_entryname, entry);' \
+	  '    return 0;' \
+	  '}' >> $(TCC_SRC_DIR)/libtcc.c
 	@echo ">>> Building i386-targeting libtcc for kernel ..."
 	cd $(TCC_SRC_DIR) && gcc -m32 -c libtcc.c \
 	    -DTCC_TARGET_I386 -DONE_SOURCE=1 -DCONFIG_TCC_SEMLOCK=0 \

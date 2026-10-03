@@ -41,7 +41,6 @@ extern "C" {
     int   tcc_bridge_exec_elf     (void* terminal, const char* filename,
                                    const char* args);
 }
-
 // Convenience macros so the rest of tcc_kernel.cpp reads naturally
 #define console_print(s)              tcc_bridge_console_print(s)
 #define fat32_read_file_as_string(f)  tcc_bridge_fat32_read(f)
@@ -794,7 +793,7 @@ int unlink(const char*) { return 0; }
 extern "C" {
 #include "libtcc.h"
 }
-
+extern "C" int tcc_kern_configure(TCCState*, unsigned text_addr, const char* entry);
 // ── Error callback ────────────────────────────────────────────────────────────
 static char  g_errbuf[2048];
 static int   g_errlen = 0;
@@ -917,10 +916,10 @@ extern "C" void tcc_kernel_cmd_cc(void* terminal_opaque,
     // cascade of confusing downstream errors ('crti.o' not found, etc.)
     // with no indication of the actual cause. Check each one and bail
     // out with a specific, actionable message instead.
-    tcc_set_options(s1, "-nostdlib -nostdinc");
+    tcc_set_error_func(s1, nullptr, tcc_err_cb);
+    tcc_kern_configure(s1, 0x08002000, "_start");   // must come first
     tcc_set_lib_path(s1, "/nonexistent");
-    tcc_set_output_type(s1, TCC_OUTPUT_EXE);
-    tcc_set_options(s1, "-Wl,-Ttext=0x08002000");
+    tcc_set_output_type(s1, TCC_OUTPUT_EXE);        // asks for crt1.o only if nostdlib is unset
 
     int rc = tcc_compile_string(s1, full);
     free(full);
