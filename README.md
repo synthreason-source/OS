@@ -8,7 +8,9 @@ SATA port selection with 'disk_select'
 
 guest programs require many '.h' files within the base directory for compiled programs to interface with the OS.
 
-TODO: add ethernet, WiFi, web browser & busybox implementation
+Ethernet: RTL8139, Intel e1000 and e1000e drivers with ARP/IPv4/ICMP/UDP/DHCP/DNS (shell: `ifconfig`, `dhcp`, `ping`, `nslookup`, `arp`).
+
+TODO: TCP, WiFi, web browser & busybox implementation
 
 TODO: add driver kit
 
@@ -66,5 +68,9 @@ qemu-system-i386 -M q35 -m 2048M -vga std \
     -device ahci,id=ahci \
     -device ide-cd,drive=cd0,bus=ahci.0 \
     -device ide-hd,drive=disk0,bus=ahci.1 \
+    -nic user,model=e1000 \
     -boot d
 ```
+
+`-nic user,model=...` accepts `e1000`, `e1000e` or `rtl8139`. In QEMU user-mode
+networking the guest gets 10.0.2.15 by DHCP; `ping 10.0.2.2` tests the link.

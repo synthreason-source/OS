@@ -29,6 +29,7 @@
 #include "kernel_parts/05_io_wait_ps2_funcs.h"
 #include "kernel_parts/06_fat32_filesystem_and_explorer.h"
 #include "kernel_parts/07_chkdsk_and_hardware.h"
+#include "kernel_parts/07b_network.h"
 #include "kernel_parts/08_tinyvm_compiler_vm.h"
 #include "kernel_parts/09_terminal_window.h"
 #include "kernel_parts/10_window_manager_impl.h"

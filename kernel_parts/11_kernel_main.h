@@ -1107,6 +1107,17 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
     //  * cleanup_closed_windows() ran on every spin of the loop.
     ml_calibrate_tsc();
 
+    // ── Ethernet (RTL8139 / e1000 / e1000e) ───────────────────────────────────
+    // Needs the heap and a calibrated TSC (for timeouts), hence placed here.
+    if (net_init(ml_tsc_per_ms)) {
+        char nmsg[96]; char* o = nmsg;
+        o = net_cat(o, "Net: "); o = net_cat(o, g_nic_name); o = net_cat(o, "  IP ");
+        o = net_ipstr(o, g_ip); o = net_cat(o, g_net_configured ? " (DHCP)\n" : " (static)\n");
+        wm.print_to_focused(nmsg);
+    } else {
+        wm.print_to_focused("Net: no supported NIC (RTL8139/e1000/e1000e).\n");
+    }
+
     const uint64_t FRAME_TSC = (uint64_t)ml_tsc_per_ms * 16;    // ~60 Hz paint / tick cap
     const uint64_t GUEST_TSC = (uint64_t)ml_tsc_per_ms * 6;     // max guest time per pass
     const uint64_t CLOCK_TSC = (uint64_t)ml_tsc_per_ms * 1000;  // idle refresh (taskbar clock)
@@ -1167,6 +1178,8 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
     for (;;) {
         if ((++hb_counter & 0x3FFF) == 0)
             *vga_hb = (uint16_t)(0x0A00u | (uint8_t)hb_chars[(hb_counter >> 14) & 3]);
+
+        net_poll();   // answer ARP / ping requests, drain the NIC RX ring
 
         // ── 1. Input (edges + motion accumulated, then consumed) ─────────────
         poll_and_latch();

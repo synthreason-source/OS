@@ -919,6 +919,8 @@ void handle_command() {
 					  "  bochs <elf-file> [args]  -- run ELF in Bochs emulator window\n"
 				  "  testelf <elf-file>       -- boot ELF via test module (Phase1/2 + diagnostics)\n"
 					  "  cc <file.c> [out]        -- compile C in-kernel via TCC\n"
+					  "  ifconfig [ip mask [gw]]  -- show / set network config\n"
+					  "  dhcp, arp, ping <host> [n], nslookup <host>  -- networking\n"
 					  "  hello                   -- shortcut: bochs hello\n"
 					  "  reset                   -- shortcut: bochs reset\n"
 					  "  (ELF programs can draw graphics -- see bochs_drivers.h's\n"
@@ -1093,6 +1095,9 @@ void handle_command() {
         bool ok = encrypt ? aes_encrypt_file(key_hex, infile, outfile) : aes_decrypt_file(key_hex, infile, outfile);
         console_print(ok ? "AES operation successful.\n" : "AES failed.\n");
     }
+	else if (net_is_command(command)) {
+		net_run_command(command, args);
+	}
 	else if (strcmp(command, "select_disk") == 0) {
 		g_disk_unlocked = false;
 		fs_crypto_clear();                   // wipe key on disk switch
