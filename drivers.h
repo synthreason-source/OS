@@ -158,6 +158,87 @@ static inline int kfstat(const char *filename, unsigned int *size_out)
     return mbox.status;
 }
 
+/* ── network ABI: blocking HTTP GET over the kernel's TCP/IP stack ──────
+ *
+ * The kernel (kernel_parts/07b_network.h) drives the NIC (RTL8139 / e1000),
+ * does DHCP, DNS and TCP; a guest just asks for a URL's raw HTTP response.
+ * Same protocol shape as the disk mailbox: fill a net_mailbox_t, write the
+ * little-endian bytes of its own address to ports 0xD0-0xD3, then the
+ * command byte to 0xD4.  That OUT does not return until the whole fetch
+ * (DNS + connect + request + read-until-close) is done and the mailbox
+ * holds the result -- so the desktop is frozen while it runs (up to
+ * ~25 s worst case, typically well under a second on a LAN / QEMU user-net).
+ *
+ * Plain HTTP only (no TLS): https:// is not reachable through this ABI.
+ *
+ *     static char resp[32768];
+ *     unsigned got, flags;
+ *     int rc = knet_http_get("example.com", 80, "/", resp, sizeof resp, &got, &flags);
+ *     // rc == KNET_OK: resp[0..got) is "HTTP/1.0 200 OK\r\n...headers...\r\n\r\nbody"
+ *     // flags & KNET_F_TRUNC   : buffer was too small, response cut off
+ *     // flags & KNET_F_TIMEOUT : server stopped sending without closing
+ *
+ * Redirects, chunked encoding and content types are NOT handled here; the
+ * caller sees the raw bytes (web.c shows how).
+ */
+typedef struct {
+    char         host[64];     /* DNS name or dotted-quad, NUL-terminated  */
+    char         path[192];    /* request target, must start with '/'      */
+    unsigned int port;         /* usually 80                               */
+    unsigned int buf_addr;     /* guest address of the response buffer     */
+    unsigned int buf_len;      /* IN: capacity   OUT: bytes received       */
+    int          status;       /* OUT: KNET_OK or a KNET_ERR_* code        */
+    unsigned int flags;        /* OUT: KNET_F_* bits                       */
+} net_mailbox_t;
+
+#define NET_PORT_ADDR0 0xD0
+#define NET_PORT_ADDR1 0xD1
+#define NET_PORT_ADDR2 0xD2
+#define NET_PORT_ADDR3 0xD3
+#define NET_PORT_CMD   0xD4
+#define NET_CMD_HTTP_GET 1
+
+#define KNET_OK            0
+#define KNET_ERR_NONIC   (-1)   /* no supported NIC / no IP address         */
+#define KNET_ERR_DNS     (-2)   /* name did not resolve                     */
+#define KNET_ERR_CONNECT (-3)   /* TCP connect failed (refused / timeout)   */
+#define KNET_ERR_NODATA  (-4)   /* connected, but no response arrived       */
+#define KNET_ERR_ARGS    (-5)   /* bad host/path/port or request too long   */
+#define KNET_ERR_BADCMD  (-6)
+#define KNET_ERR_BADBUF  (-7)   /* response buffer outside guest memory     */
+#define KNET_ERR_UNREACHABLE (-9) /* kernel has no network ABI (old build) */
+
+#define KNET_F_TRUNC   1
+#define KNET_F_TIMEOUT 2
+
+static inline int knet_http_get(const char *host, unsigned int port, const char *path,
+                                void *buf, unsigned int buflen,
+                                unsigned int *got, unsigned int *flags)
+{
+    static net_mailbox_t mbox;
+    unsigned int i, addr;
+    for (i = 0; host[i]; i++) if (i >= sizeof(mbox.host) - 1) return KNET_ERR_ARGS;
+    for (i = 0; path[i]; i++) if (i >= sizeof(mbox.path) - 1) return KNET_ERR_ARGS;
+    for (i = 0; host[i]; i++) mbox.host[i] = host[i];
+    mbox.host[i] = '\0';
+    for (i = 0; path[i]; i++) mbox.path[i] = path[i];
+    mbox.path[i] = '\0';
+    mbox.port     = port;
+    mbox.buf_addr = (unsigned int)(unsigned long)buf;
+    mbox.buf_len  = buflen;
+    mbox.flags    = 0;
+    mbox.status   = KNET_ERR_UNREACHABLE;   /* a dropped command must not look like success */
+    addr = (unsigned int)(unsigned long)&mbox;
+    outb(NET_PORT_ADDR0, (unsigned char)(addr & 0xFF));
+    outb(NET_PORT_ADDR1, (unsigned char)((addr >> 8)  & 0xFF));
+    outb(NET_PORT_ADDR2, (unsigned char)((addr >> 16) & 0xFF));
+    outb(NET_PORT_ADDR3, (unsigned char)((addr >> 24) & 0xFF));
+    outb(NET_PORT_CMD,   NET_CMD_HTTP_GET);
+    if (got)   *got   = (mbox.status == KNET_OK || mbox.status == KNET_ERR_NODATA) ? mbox.buf_len : 0;
+    if (flags) *flags = mbox.flags;
+    return mbox.status;
+}
+
 /* ── graphics ABI: draw pixels straight into this program's terminal
  * window ────────────────────────────────────────────────────────────
  *

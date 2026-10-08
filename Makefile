@@ -740,3 +740,9 @@ test_main: boot.o test_main.o $(BOCHS_OBJ) $(TCC_KERN_LIB) $(BOCHS_DEP)
 run-test: test_main
 	qemu-system-i386 -M q35 -cdrom $(TEST_ISO) -boot d \
 	    -m 512M -display none -debugcon stdio -no-reboot
+
+# ── webdisk: web renderer + editor + driver kit + headers → disk.img ─────────
+#   make webdisk       (see mkwebdisk.sh for exactly what is copied)
+.PHONY: webdisk
+webdisk: $(DISK_IMG)
+	sh mkwebdisk.sh $(DISK_IMG)

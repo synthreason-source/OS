@@ -214,6 +214,14 @@ static Bit32u s_disk_addr_bytes[4] = {0, 0, 0, 0};
 extern "C" void bochs_guest_gfx_cmd(unsigned int mbox_addr, int cmd);
 static Bit32u s_gfx_addr_bytes[4] = {0, 0, 0, 0};
 
+// Ports 0xD0-0xD4 — guest network wrapper (blocking HTTP GET over the kernel's
+// TCP/IP stack; see bochs_drivers.h's net_mailbox_t / knet_http_get and
+// bochs_glue.cpp's bochs_guest_net_cmd).  Same latch-then-trigger shape as
+// the disk mailbox: little-endian mailbox address to 0xD0-0xD3, command
+// byte to 0xD4, which runs the whole fetch before the OUT returns.
+extern "C" void bochs_guest_net_cmd(unsigned int mbox_addr, int cmd);
+static Bit32u s_net_addr_bytes[4] = {0, 0, 0, 0};
+
 // Port 0xEF / 0xF0-0xF4 — guest mouse wrapper (compositor cursor
 // passthrough into the active gfx-mode window; see bochs_drivers.h's
 // mouse_poll() and bochs_glue.cpp's bochs_guest_mouse_poll() /
@@ -255,6 +263,17 @@ void   bx_devices_c::outp(Bit16u port, Bit32u val, unsigned) {
                     | (s_disk_addr_bytes[2] << 16)
                     | (s_disk_addr_bytes[3] << 24);
         bochs_guest_disk_cmd(addr, (int)(val & 0xFF));
+    }
+    // Ports 0xD0-0xD3 — latch the network mailbox address; 0xD4 triggers.
+    else if (port >= 0xD0 && port <= 0xD3) {
+        s_net_addr_bytes[port - 0xD0] = (Bit32u)(val & 0xFF);
+    }
+    else if (port == 0xD4) {
+        Bit32u addr = s_net_addr_bytes[0]
+                    | (s_net_addr_bytes[1] << 8)
+                    | (s_net_addr_bytes[2] << 16)
+                    | (s_net_addr_bytes[3] << 24);
+        bochs_guest_net_cmd(addr, (int)(val & 0xFF));
     }
     // Ports 0xEA-0xED — latch one byte each of the graphics mailbox's
     // guest-physical address. Consumed when 0xEE is written.

@@ -1,0 +1,21 @@
+<html><head><title>About</title></head><body>
+<h1>About</h1>
+<p>A web browser in one C file. It tokenises the HTML, wraps
+words into lines, and draws them with the 8x8 font from <code>font.h</code>
+into the 320x200 canvas.</p>
+<h3>What it is built on</h3>
+<dl>
+<dt>drivers.h</dt><dd>disk (kfread), network (knet_http_get), gfx, mouse and key ports</dd>
+<dt>07b_network.h</dt><dd>the kernel NIC driver, DHCP, DNS and TCP</dd>
+<dt>comp.h</dt><dd>toolbar buttons, URL box, scrollbar</dd>
+<dt>font.h</dt><dd>glyph bitmaps</dd>
+</dl>
+<h3>Limits</h3>
+<ul>
+<li>Files up to 48000 bytes</li>
+<li>No images, CSS or scripts</li>
+<li>http:// only: no TLS, so https sites cannot be opened</li>
+<li>The desktop freezes while a page downloads</li>
+</ul>
+<p><a href="home.htm">Home</a> | <a href="http://example.com/">An http link</a></p>
+</body></html>

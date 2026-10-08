@@ -1623,6 +1623,47 @@ static void disk_report_hex32(Bit32u v) {
     disk_report(buf);
 }
 
+// =====================================================================
+// Guest network wrapper (ports 0xD0-0xD4 = blocking HTTP GET)
+// =====================================================================
+// Mirrors bochs_drivers.h's net_mailbox_t byte-for-byte (all fields 4-byte
+// aligned, no padding).  net_guest_http_get() is kernel.cpp's TCP/IP stack
+// (kernel_parts/07b_network.h); like the fat32_* calls it runs to completion
+// before the guest's triggering OUT returns, so the guest never polls.
+struct GuestNetMailbox {
+    char         host[64];
+    char         path[192];
+    unsigned int port;
+    unsigned int buf_addr;
+    unsigned int buf_len;     // IN: capacity   OUT: bytes received
+    int          status;      // OUT: 0 ok, else KNET_ERR_*
+    unsigned int flags;       // OUT: KNET_F_* bits
+};
+enum { NET_CMD_HTTP_GET = 1, NET_ERR_BADCMD = -6, NET_ERR_BADBUF = -7 };
+
+extern int net_guest_http_get(const char* host, unsigned port, const char* path,
+                              void* out, unsigned cap, unsigned* got, unsigned* flags);
+
+extern "C" void bochs_guest_net_cmd(unsigned int mbox_addr, int cmd) {
+    GuestNetMailbox* m = (GuestNetMailbox*)disk_guest_ptr(mbox_addr, sizeof(GuestNetMailbox));
+    if (!m) {
+        disk_report("\n[net] mailbox unreachable at guest addr ");
+        disk_report_hex32(mbox_addr);
+        disk_report(" -- command dropped\n");
+        return;
+    }
+    m->host[sizeof(m->host) - 1] = '\0';
+    m->path[sizeof(m->path) - 1] = '\0';
+    if (cmd != NET_CMD_HTTP_GET) { m->status = NET_ERR_BADCMD; return; }
+    void* dst = disk_guest_ptr(m->buf_addr, m->buf_len);
+    if (!dst || m->buf_len < 64) { m->status = NET_ERR_BADBUF; return; }
+    unsigned got = 0, flags = 0;
+    int rc = net_guest_http_get(m->host, m->port, m->path, dst, m->buf_len, &got, &flags);
+    m->buf_len = got;
+    m->flags   = flags;
+    m->status  = rc;
+}
+
 extern "C" void bochs_guest_disk_cmd(unsigned int mbox_addr, int cmd) {
     GuestDiskMailbox* mbox =
         (GuestDiskMailbox*)disk_guest_ptr(mbox_addr, sizeof(GuestDiskMailbox));

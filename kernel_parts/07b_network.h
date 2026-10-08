@@ -135,6 +135,7 @@ static bool rtl_send(const uint8_t* d, uint32_t len) {
 }
 
 static void net_input(const uint8_t* f, uint32_t len);   // stack entry, defined below
+static void net_tcp_input(uint32_t src, uint32_t dst, const uint8_t* pl, uint32_t pll);
 
 static void rtl_poll() {
     for (int n = 0; n < 16; n++) {
@@ -480,6 +481,9 @@ static void net_input(const uint8_t* f, uint32_t len) {
         } else if (ic->type == 0 && net_h16(ic->id) == g_ping_id && net_h16(ic->seq) == g_ping_seq && !g_ping_got) {
             g_ping_t1 = net_rdtsc(); g_ping_from = src; g_ping_ttl = ip->ttl; g_ping_got = true;
         }
+    } else if (ip->proto == 6 && pll >= 20) {                            // TCP
+        net_arp_learn(src, e->src);
+        net_tcp_input(src, dst, pl, pll);
     } else if (ip->proto == 17 && pll >= 8) {                            // UDP
         const NetUdp* u = (const NetUdp*)pl;
         uint16_t dport = net_h16(u->dport), ulen = net_h16(u->len);
@@ -665,6 +669,218 @@ static bool net_ping_once(uint32_t ip, uint32_t timeout_ms, uint32_t* rtt_x10) {
     return true;
 }
 
+
+// ════════════════════════ TCP client + HTTP/1.0 GET ═════════════════════════
+// Deliberately small: ONE outgoing connection at a time, active open only,
+// in-order receive (an out-of-order segment just triggers a duplicate ACK so
+// the peer retransmits), stop-and-wait transmit (requests fit one segment).
+// That is all an HTTP/1.0 "GET, read until close" client needs.  Used by the
+// guest network ABI (bochs_drivers.h knet_http_get -> bochs_glue.cpp).
+#define TCP_FIN 0x01
+#define TCP_SYN 0x02
+#define TCP_RST 0x04
+#define TCP_PSH 0x08
+#define TCP_ACK 0x10
+#define TCP_RING 16
+#define TCP_MSS  1460
+#define TCP_WIN  14600
+
+struct __attribute__((packed)) NetTcp { uint16_t sport, dport; uint32_t seq, ack; uint8_t off, flags; uint16_t win, csum, urg; };
+struct TcpSeg { uint32_t seq, ack; uint16_t len, win; uint8_t flags; uint8_t data[TCP_MSS]; };
+
+static TcpSeg            g_tcp_ring[TCP_RING];
+static volatile uint32_t g_tcp_head = 0, g_tcp_tail = 0;
+static volatile bool     g_tcp_active = false;
+static uint16_t          g_tcp_lport, g_tcp_rport;
+static uint32_t          g_tcp_rip;
+static uint32_t          g_snd_nxt, g_snd_una, g_rcv_nxt;
+static uint8_t*          g_tcp_out;                  // receive destination
+static uint32_t          g_tcp_cap, g_tcp_got;
+static bool              g_tcp_fin, g_tcp_rst, g_tcp_over;
+
+static void net_tcp_input(uint32_t src, uint32_t dst, const uint8_t* pl, uint32_t pll) {
+    if (!g_tcp_active || pll < 20) return;
+    const NetTcp* t = (const NetTcp*)pl;
+    if (net_h16(t->dport) != g_tcp_lport || net_h16(t->sport) != g_tcp_rport || src != g_tcp_rip) return;
+    uint32_t hl = (uint32_t)(t->off >> 4) * 4;
+    if (hl < 20 || hl > pll) return;
+    uint32_t ps = (src >> 16) + (src & 0xFFFF) + (dst >> 16) + (dst & 0xFFFF) + 6 + pll;
+    if (net_csum(pl, pll, ps) != 0) return;
+    uint32_t next = (g_tcp_head + 1) % TCP_RING;
+    if (next == g_tcp_tail) return;                                  // ring full: peer will retransmit
+    TcpSeg& s = g_tcp_ring[g_tcp_head];
+    s.seq = net_h32(t->seq); s.ack = net_h32(t->ack); s.flags = t->flags; s.win = net_h16(t->win);
+    uint32_t dl = pll - hl; if (dl > TCP_MSS) dl = TCP_MSS;
+    s.len = (uint16_t)dl; net_cpy(s.data, pl + hl, dl);
+    g_tcp_head = next;
+}
+
+static bool tcp_send(uint8_t flags, uint32_t seq, uint32_t ack, const uint8_t* data, uint16_t len, bool mss_opt) {
+    static uint8_t pkt[1500];
+    if (len > 1400) return false;
+    uint32_t hl = mss_opt ? 24 : 20, tl = hl + len;
+    NetTcp* t = (NetTcp*)pkt;
+    t->sport = net_h16(g_tcp_lport); t->dport = net_h16(g_tcp_rport);
+    t->seq = net_h32(seq); t->ack = net_h32(ack);
+    t->off = (uint8_t)((hl / 4) << 4); t->flags = flags; t->win = net_h16(TCP_WIN); t->csum = 0; t->urg = 0;
+    if (mss_opt) { pkt[20] = 2; pkt[21] = 4; pkt[22] = TCP_MSS >> 8; pkt[23] = TCP_MSS & 0xFF; }
+    if (len) net_cpy(pkt + hl, data, len);
+    uint32_t ps = (g_ip >> 16) + (g_ip & 0xFFFF) + (g_tcp_rip >> 16) + (g_tcp_rip & 0xFFFF) + 6 + tl;
+    t->csum = net_h16(net_csum(pkt, tl, ps));
+    return net_send_ip(g_tcp_rip, 6, pkt, tl);
+}
+
+static inline bool tcp_peek(TcpSeg** s) { if (g_tcp_tail == g_tcp_head) return false; *s = &g_tcp_ring[g_tcp_tail]; return true; }
+static inline void tcp_pop() { g_tcp_tail = (g_tcp_tail + 1) % TCP_RING; }
+
+// Handle one received segment on an established connection.
+static void tcp_process(const TcpSeg& s) {
+    if (s.flags & TCP_RST) { g_tcp_rst = true; return; }
+    if ((s.flags & TCP_ACK) && (int32_t)(s.ack - g_snd_una) > 0 && (int32_t)(s.ack - g_snd_nxt) <= 0) g_snd_una = s.ack;
+    uint32_t len = s.len, seq = s.seq; const uint8_t* d = s.data;
+    bool fin = (s.flags & TCP_FIN) != 0;
+    if (!len && !fin) return;                                        // bare ACK
+    int32_t behind = (int32_t)(g_rcv_nxt - seq);
+    if (behind < 0) { tcp_send(TCP_ACK, g_snd_nxt, g_rcv_nxt, 0, 0, false); return; }   // gap: dup ACK
+    if (behind > 0) {                                                // overlap / retransmit
+        if ((uint32_t)behind >= len) {
+            if (!(fin && (uint32_t)behind == len)) { tcp_send(TCP_ACK, g_snd_nxt, g_rcv_nxt, 0, 0, false); return; }
+            len = 0;                                                 // only the FIN is new
+        } else { d += behind; len -= (uint32_t)behind; }
+    }
+    if (len) {
+        uint32_t room = g_tcp_cap - g_tcp_got, n = len < room ? len : room;
+        if (n) { net_cpy(g_tcp_out + g_tcp_got, d, n); g_tcp_got += n; }
+        if (n < len) g_tcp_over = true;
+        g_rcv_nxt += len;
+    }
+    if (fin) { g_rcv_nxt++; g_tcp_fin = true; }
+    tcp_send(TCP_ACK, g_snd_nxt, g_rcv_nxt, 0, 0, false);
+}
+
+static bool tcp_connect(uint32_t ip, uint16_t port) {
+    g_tcp_rip = ip; g_tcp_rport = port;
+    g_tcp_lport = (uint16_t)(49152 + ((uint32_t)net_rdtsc() & 0x3FFF));
+    g_tcp_head = g_tcp_tail = 0;
+    g_tcp_fin = g_tcp_rst = g_tcp_over = false; g_tcp_got = 0;
+    g_tcp_active = true;
+    uint32_t iss = (uint32_t)net_rdtsc() ^ 0x5EED1234u;
+    for (int attempt = 0; attempt < 4; attempt++) {
+        if (!tcp_send(TCP_SYN, iss, 0, 0, 0, true)) break;
+        uint64_t dl = net_deadline(1000 + attempt * 500);
+        while (!net_expired(dl)) {
+            net_poll();
+            TcpSeg* s;
+            while (tcp_peek(&s)) {
+                if ((s->flags & TCP_RST)) { tcp_pop(); g_tcp_active = false; return false; }
+                if ((s->flags & (TCP_SYN | TCP_ACK)) == (TCP_SYN | TCP_ACK) && s->ack == iss + 1) {
+                    g_rcv_nxt = s->seq + 1; g_snd_nxt = g_snd_una = iss + 1;
+                    tcp_pop();
+                    tcp_send(TCP_ACK, g_snd_nxt, g_rcv_nxt, 0, 0, false);
+                    return true;
+                }
+                tcp_pop();
+            }
+        }
+    }
+    g_tcp_active = false;
+    return false;
+}
+
+// Send one segment of data and wait for it to be ACKed (retransmitting).
+// Anything the server sends meanwhile is processed normally.  snd_nxt is
+// advanced BEFORE the first transmission: the server's reply typically
+// carries the ACK for this very segment, and tcp_process() only accepts
+// ACKs that are <= snd_nxt.
+static bool tcp_send_data(const uint8_t* d, uint16_t n) {
+    uint32_t start = g_snd_nxt, end = start + n;
+    g_snd_nxt = end;
+    for (int attempt = 0; attempt < 5; attempt++) {
+        if (!tcp_send(TCP_PSH | TCP_ACK, start, g_rcv_nxt, d, n, false)) return false;
+        uint64_t dl = net_deadline(1000);
+        while (!net_expired(dl)) {
+            net_poll();
+            TcpSeg* s;
+            while (tcp_peek(&s)) { tcp_process(*s); tcp_pop(); }
+            if (g_tcp_rst) return false;
+            if ((int32_t)(g_snd_una - end) >= 0) return true;
+        }
+    }
+    return false;
+}
+
+// Read until the peer closes, the buffer fills, or the connection goes idle.
+static bool g_tcp_timed_out;
+static void tcp_recv_all(uint32_t idle_ms, uint32_t total_ms) {
+    g_tcp_timed_out = false;
+    uint64_t idle = net_deadline(idle_ms), total = net_deadline(total_ms);
+    while (!g_tcp_fin && !g_tcp_rst && !g_tcp_over) {
+        net_poll();
+        TcpSeg* s; bool any = false;
+        while (tcp_peek(&s)) { tcp_process(*s); tcp_pop(); any = true; }
+        if (any) idle = net_deadline(idle_ms);
+        if (net_expired(idle) || net_expired(total)) { g_tcp_timed_out = true; break; }
+    }
+}
+
+static void tcp_close() {
+    if (g_tcp_fin && !g_tcp_rst) {                                   // orderly: answer their FIN with ours
+        tcp_send(TCP_FIN | TCP_ACK, g_snd_nxt, g_rcv_nxt, 0, 0, false);
+        uint64_t dl = net_deadline(250);
+        while (!net_expired(dl)) { net_poll(); TcpSeg* s; while (tcp_peek(&s)) tcp_pop(); }
+    } else if (!g_tcp_rst) {
+        tcp_send(TCP_RST | TCP_ACK, g_snd_nxt, g_rcv_nxt, 0, 0, false);
+    }
+    g_tcp_active = false;
+}
+
+// ── HTTP/1.0 GET ──────────────────────────────────────────────────────────
+// Status codes shared with the guest ABI (bochs_drivers.h KNET_*).
+#define KNET_OK          0
+#define KNET_ERR_NONIC  (-1)
+#define KNET_ERR_DNS    (-2)
+#define KNET_ERR_CONNECT (-3)
+#define KNET_ERR_NODATA (-4)
+#define KNET_ERR_ARGS   (-5)
+#define KNET_F_TRUNC     1      // buffer filled / response cut short
+#define KNET_F_TIMEOUT   2      // stopped on idle/total timeout rather than a clean close
+
+static char* net_app(char* o, const char* e, const char* s) { while (*s && o < e) *o++ = *s++; return o; }
+
+// Fetches http://host:port<path> and stores the RAW response (status line +
+// headers + body) in out[0..cap).  *got = bytes stored.  Redirects, chunked
+// decoding and content-type handling are the caller's job (see web.c).
+static int net_http_get(const char* host, uint32_t port, const char* path,
+                        uint8_t* out, uint32_t cap, uint32_t* got, uint32_t* flags) {
+    *got = 0; *flags = 0;
+    if (!host || !host[0] || !path || path[0] != '/' || !out || cap < 64 || port == 0 || port > 65535) return KNET_ERR_ARGS;
+    if (g_nic_type == NIC_NONE || !g_ip) return KNET_ERR_NONIC;
+    uint32_t ip;
+    if (!net_resolve_host(host, &ip)) return KNET_ERR_DNS;
+
+    static char req[640];
+    char* o = req; const char* e = req + sizeof(req) - 1;
+    o = net_app(o, e, "GET "); o = net_app(o, e, path); o = net_app(o, e, " HTTP/1.0\r\nHost: "); o = net_app(o, e, host);
+    if (port != 80) {
+        char nb[12]; int n = 0; uint32_t v = port;
+        do { nb[n++] = (char)('0' + v % 10); v /= 10; } while (v);
+        o = net_app(o, e, ":");
+        while (n && o < e) *o++ = nb[--n];
+    }
+    o = net_app(o, e, "\r\nUser-Agent: web.c/1.0 (tiny-os)\r\nAccept: text/html, text/plain;q=0.9, */*;q=0.1\r\n"
+                      "Accept-Encoding: identity\r\nConnection: close\r\n\r\n");
+    if (o >= e) return KNET_ERR_ARGS;                                // path+host too long for the request buffer
+
+    g_tcp_out = out; g_tcp_cap = cap;
+    if (!tcp_connect(ip, (uint16_t)port)) return KNET_ERR_CONNECT;
+    if (tcp_send_data((const uint8_t*)req, (uint16_t)(o - req))) tcp_recv_all(6000, 25000);
+    tcp_close();
+    *got = g_tcp_got;                                                // set on EVERY path (partial data still counts)
+    if (g_tcp_over) *flags |= KNET_F_TRUNC;
+    if (g_tcp_timed_out) *flags |= KNET_F_TIMEOUT;
+    return g_tcp_got ? KNET_OK : KNET_ERR_NODATA;
+}
+
 // ───────────────────────────────── init + shell ──────────────────────────────
 static void net_puts(const char* s) { console_print(s); }
 static char* net_u32(char* o, uint32_t v) {
@@ -799,4 +1015,11 @@ static void net_run_command(const char* cmd, char* args) {
         }
         o = net_u32(b, got); o = net_cat(o, "/"); o = net_u32(o, count); o = net_cat(o, " replies received\n"); net_puts(b);
     }
+}
+
+// Non-static entry point for bochs_glue.cpp (a separate TU, like the fat32_* wrappers):
+// guest network ABI -> blocking HTTP GET.  See bochs_drivers.h knet_http_get().
+int net_guest_http_get(const char* host, unsigned port, const char* path,
+                       void* out, unsigned cap, unsigned* got, unsigned* flags) {
+    return net_http_get(host, port, path, (uint8_t*)out, cap, got, flags);
 }
