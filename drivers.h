@@ -274,6 +274,7 @@ static inline int knet_http_get(const char *host, unsigned int port, const char 
 
 #define GFX_CMD_PRESENT 1   /* blit the GFX_WIDTH x GFX_HEIGHT buffer  */
 #define GFX_CMD_CLEAR   2   /* drop the frame, revert window to text   */
+#define GFX_CMD_YIELD   3   /* give the CPU back; no frame copy/repaint */
 
 /* Ready-to-use canvas so most programs never need their own buffer or
  * bookkeeping — just draw into this with gfx_set_pixel()/gfx_clear()
@@ -286,9 +287,25 @@ static inline void gfx_set_pixel(int x, int y, unsigned int rgb)
         gfx_framebuffer[y * GFX_WIDTH + x] = rgb;
 }
 
+/* Fill `count` consecutive 32-bit pixels starting at `dst` with `value`.
+ *
+ * ONE `rep stosl` instead of a per-pixel loop. Guest code is interpreted
+ * (Bochs, itself running inside the kernel), so what matters is how many
+ * guest instructions a frame costs: a TCC-compiled "for (...) fb[i] = c;"
+ * burns ~8 instructions per pixel (~500k for a full 320x200 clear), while
+ * REP STOSD is a single instruction the emulator runs as a tight host-side
+ * loop. Every full-frame clear and rectangle fill in comp.h goes through
+ * this. `cld` pins the direction flag so the fill always runs forward. */
+static inline void gfx_fill_u32(unsigned int *dst, unsigned int value, unsigned int count)
+{
+    __asm__ __volatile__("cld\n\trep stosl"
+                         : "+D"(dst), "+c"(count)
+                         : "a"(value)
+                         : "memory", "cc");
+}
 static inline void gfx_clear(unsigned int rgb)
 {
-    for (int i = 0; i < GFX_WIDTH * GFX_HEIGHT; i++) gfx_framebuffer[i] = rgb;
+    gfx_fill_u32(gfx_framebuffer, rgb, GFX_WIDTH * GFX_HEIGHT);
 }
 
 /* Present any GFX_WIDTH x GFX_HEIGHT buffer of your own (e.g. if you'd
@@ -311,6 +328,15 @@ static inline void gfx_present(void) { gfx_present_buf(gfx_framebuffer); }
  * text (kputs/kputc) in this window. Not required before exiting —
  * the kernel drops the frame automatically when the program ends. */
 static inline void gfx_exit(void) { outb(GFX_PORT_CMD, GFX_CMD_CLEAR); }
+
+/* Hand the CPU back to the kernel WITHOUT presenting a frame.
+ *
+ * A gfx program must yield at least once per loop (the emulator only
+ * returns to the kernel at yield points), and gfx_present() is the
+ * usual way -- but it also copies the whole 320x200 canvas and makes
+ * the desktop repaint. If nothing on screen changed this pass, call
+ * gfx_yield() instead: same hand-back, none of the cost. */
+static inline void gfx_yield(void) { outb(GFX_PORT_CMD, GFX_CMD_YIELD); }
 
 /* ── mouse ABI: the compositor's shared cursor, relayed into this
  * program's own gfx canvas ───────────────────────────────────────────

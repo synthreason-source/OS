@@ -688,6 +688,29 @@ static void flush_after_switch() {
 // We never actually use this 1 MiB region — every guest access falls
 // through to our registered handlers.
 
+// ── Guest preemption timer ───────────────────────────────────────────────────
+// cpu_loop() ignores its instruction-count argument on a single-CPU build
+// (CHECK_MAX_INSTRUCTIONS is compiled out), so a guest only ever hands control
+// back at a yield point (gfx_present, gfx_yield, getc, exit). A guest in the
+// middle of a long frame therefore starved the kernel: no keyboard/mouse polling
+// for the whole frame. The emulated keyboard controller only buffers ~16 bytes
+// (a handful of keypresses) -- the same as a real PS/2 keyboard -- so a burst of
+// typing during a slow frame overflowed it and keys were simply lost.
+//
+// Fix: a continuous Bochs timer. Bochs ticks it once per emulated instruction;
+// every PREEMPT_TICKS instructions its callback asks cpu_loop() to return, exactly
+// like the existing yield points do (kill_bochs_request + async_event; the next
+// bochs_cpu_tick() resumes at the same EIP -- REP string ops restart cleanly).
+// The kernel's slice loop then polls the keyboard/mouse and re-enters the guest.
+// Cost: one return + one poll per 40k instructions (~0.1%).
+#define PREEMPT_TICKS 40000
+static int g_preempt_timer = -1;
+static int g_preempt_dummy = 0;
+static void bochs_preempt_cb(void*) {
+    BX_CPU(0)->kill_bochs_request = 1;
+    BX_CPU(0)->async_event        = 1;
+}
+
 static void bochs_global_init() {
     if (g_global_init_done) return;
     live_breadcrumb(30, '0');
@@ -710,6 +733,12 @@ static void bochs_global_init() {
     // (386+, or all-ones on a BX_PHY_ADDRESS_LONG build) i.e. A20 on,
     // no address wrapping — the correct state for flat 32-bit guests.
     bx_pc_system.set_enable_a20(true);
+
+    // (1b) Periodic preemption timer (see the comment above bochs_preempt_cb).
+    if (g_preempt_timer < 0)
+        g_preempt_timer = bx_pc_system.register_timer_ticks(&g_preempt_dummy, bochs_preempt_cb,
+                                                            PREEMPT_TICKS, 1 /*continuous*/, 1 /*active*/,
+                                                            "kernel-preempt");
 
     live_breadcrumb(31, '1');
 
@@ -1766,7 +1795,21 @@ extern "C" void bochs_guest_disk_cmd(unsigned int mbox_addr, int cmd) {
 #define GFX_MAX_W 320
 #define GFX_MAX_H 200
 
-enum { GFX_CMD_PRESENT = 1, GFX_CMD_CLEAR = 2 };
+enum { GFX_CMD_PRESENT = 1, GFX_CMD_CLEAR = 2, GFX_CMD_YIELD = 3 };
+
+// Read by the kernel main loop (kernel_parts/11_kernel_main.h):
+//   g_bochs_gfx_serial  -- bumped whenever a guest's visible canvas changes
+//                          (PRESENT, or CLEAR dropping it). The desktop only
+//                          needs repainting when this moves; it used to repaint
+//                          everything at 60 Hz whenever ANY guest was running.
+//   g_bochs_gfx_yielded -- set when the guest handed back its timeslice
+//                          (PRESENT or YIELD). The slice loop ends right then
+//                          instead of re-entering a guest that has nothing
+//                          more to do until the next pass.
+extern "C" {
+volatile unsigned int g_bochs_gfx_serial  = 0;
+volatile int          g_bochs_gfx_yielded = 0;
+}
 
 struct GfxSlotState {
     bool     active = false;   // true once a PRESENT has landed and
@@ -1783,6 +1826,15 @@ extern "C" void bochs_guest_gfx_cmd(unsigned int mbox_addr, int cmd) {
 
     if (cmd == GFX_CMD_CLEAR) {
         gs.active = false;
+        g_bochs_gfx_serial++;
+        return;
+    }
+    if (cmd == GFX_CMD_YIELD) {
+        // "Nothing changed, I'm just giving the CPU back": same cpu_loop() exit
+        // as PRESENT, but no 256 KB canvas copy and no repaint request.
+        g_bochs_gfx_yielded = 1;
+        BX_CPU(0)->kill_bochs_request = 1;
+        BX_CPU(0)->async_event        = 1;
         return;
     }
     if (cmd != GFX_CMD_PRESENT) return;
@@ -1798,6 +1850,8 @@ extern "C" void bochs_guest_gfx_cmd(unsigned int mbox_addr, int cmd) {
     gs.width  = GFX_MAX_W;
     gs.height = GFX_MAX_H;
     gs.active = true;
+    g_bochs_gfx_serial++;
+    g_bochs_gfx_yielded = 1;
 
     // Yield back to the kernel main loop so it can repaint the canvas
     // and service mouse/input before the guest starts its next frame.
@@ -1821,6 +1875,7 @@ extern "C" void bochs_guest_gfx_cmd(unsigned int mbox_addr, int cmd) {
 static void gfx_forget_slot(int slot) {
     if (slot < 0 || slot >= MAX_BOCHS_SLOTS) return;
     g_gfx[slot].active = false;
+    g_bochs_gfx_serial++;          // window reverts to text: needs a repaint
 }
 
 // Read-only accessor for the kernel/window compositor side

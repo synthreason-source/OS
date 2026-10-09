@@ -1133,6 +1133,9 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
     int  seen_x = mouse_x, seen_y = mouse_y;
     bool acc_lclick = false, acc_rclick = false, acc_moved = false;
 
+    // Last guest-canvas generation we repainted for (see g_bochs_gfx_serial).
+    unsigned int gfx_serial_seen = g_bochs_gfx_serial;
+
     // Where the cursor glyph currently sits on the live framebuffer.
     int  drawn_x = -1, drawn_y = -1;
 
@@ -1187,6 +1190,9 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
         bool rightClickedThisFrame = acc_rclick;
         bool mouse_moved           = acc_moved;
         acc_lclick = acc_rclick = acc_moved = false;
+        // Keys decoded by ANY poll since last pass (including the many polls inside
+        // the guest slice) wait in the g_kbd_q ring -- take the oldest one now.
+        last_key_press = kbd_dequeue();
         bool key_pressed = (last_key_press != 0);
 
         // Anything that can change what's on screen beyond the cursor's own
@@ -1227,6 +1233,26 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
             if (input_needs_full_repaint) g_evt_dirty = true;
         }
 
+        // Fast typing: more keys may be queued behind the one handled above. Deliver
+        // them in this same pass (same routing rules) instead of one per loop trip --
+        // a loop trip can include a whole guest slice plus a repaint. No click edges
+        // are replayed for these; they are pure key events.
+        for (int extra = 0; extra < 31 && kbd_pending(); ++extra) {
+            char k2 = kbd_dequeue();
+            if (!k2) break;
+            int fs2 = wm.get_focused_elf_slot();
+            if (fs2 >= 0 && fs2 < MAX_ELF_PROCESSES &&
+                elf_processes[fs2].active && elf_processes[fs2].waiting_for_input) {
+                push_input(fs2, k2);
+                elf_processes[fs2].waiting_for_input = false;
+            } else {
+                wm.handle_input(k2, mouse_x, mouse_y, mouse_left_down, false, false);
+            }
+            g_evt_dirty = true;
+            g_input_state.hasNewInput = true;
+            handled_input = true;
+        }
+
         // ── 2. Real-time timebase (replaces the 500-iteration software timer) ─
         uint64_t now = ml_rdtsc();
         bool frame_due = false;
@@ -1251,11 +1277,23 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
             ran_guest = true;
             uint64_t slice_start = now;
             do {
+                g_bochs_gfx_yielded = 0;
                 tick_elf_processes(1);
                 poll_and_latch();
                 fast_cursor();
+                // The guest finished a frame (gfx_present) or went idle (gfx_yield):
+                // it has nothing more to do until we come round again, so don't spin
+                // re-entering it for the rest of the 6 ms budget.
+                if (g_bochs_gfx_yielded) break;
             } while (ml_rdtsc() - slice_start < GUEST_TSC && any_runnable());
-            if (frame_due) g_evt_dirty = true;   // guest may have redrawn its canvas
+            // Repaint only if a guest's canvas actually changed. (Text output sets
+            // g_evt_dirty itself in tick_elf_processes.) This used to be
+            // `if (frame_due) g_evt_dirty = true;` -- a full desktop repaint at
+            // 60 Hz for as long as any guest was alive, even a completely idle one.
+            if (g_bochs_gfx_serial != gfx_serial_seen) {
+                gfx_serial_seen = g_bochs_gfx_serial;
+                g_evt_dirty = true;
+            }
         }
         if (frame_due) g_evt_timer = false;
 

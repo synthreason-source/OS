@@ -358,6 +358,8 @@ extern "C" bool bochs_process_wants_input(int slot);
 // per pixel, owned by bochs_glue.cpp -- valid only until the next
 // bochs_guest_gfx_cmd() call, so callers should use it immediately
 // rather than caching the pointer.
+extern "C" volatile unsigned int g_bochs_gfx_serial;    // see bochs_glue.cpp
+extern "C" volatile int          g_bochs_gfx_yielded;   // see bochs_glue.cpp
 extern "C" bool bochs_gfx_get_frame(int slot, const unsigned int** pixels,
                                      int* w, int* h);
 

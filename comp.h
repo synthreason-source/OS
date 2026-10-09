@@ -59,17 +59,34 @@
 
 /* ── low-level drawing (into gfx_framebuffer) ────────────────────── */
 
+/* Rectangle fill: clipped to the canvas ONCE, then one REP STOSD per row
+ * (gfx_fill_u32). The old version called gfx_set_pixel() -- a bounds check
+ * plus a multiply -- for every single pixel (~25 interpreted guest
+ * instructions each), which made a full-canvas fill cost ~1.5M
+ * instructions; this costs a few hundred. Safe for any x/y/w/h, including
+ * rectangles that hang off the canvas. */
 static inline void ui_fill_rect(int x, int y, int w, int h, unsigned int color)
 {
-    for (int j = 0; j < h; j++)
-        for (int i = 0; i < w; i++)
-            gfx_set_pixel(x + i, y + j, color);
+    int x1 = x + w, y1 = y + h;
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x1 > GFX_WIDTH)  x1 = GFX_WIDTH;
+    if (y1 > GFX_HEIGHT) y1 = GFX_HEIGHT;
+    if (x1 <= x || y1 <= y) return;
+    unsigned int n = (unsigned int)(x1 - x);
+    unsigned int* row = &gfx_framebuffer[y * GFX_WIDTH + x];
+    for (int j = y; j < y1; j++, row += GFX_WIDTH) gfx_fill_u32(row, color, n);
 }
 
 static inline void ui_stroke_rect(int x, int y, int w, int h, unsigned int color)
 {
-    for (int i = 0; i < w; i++) { gfx_set_pixel(x + i, y, color); gfx_set_pixel(x + i, y + h - 1, color); }
-    for (int j = 0; j < h; j++) { gfx_set_pixel(x, y + j, color); gfx_set_pixel(x + w - 1, y + j, color); }
+    if (w <= 0 || h <= 0) return;
+    ui_fill_rect(x, y, w, 1, color);
+    if (h > 1) ui_fill_rect(x, y + h - 1, w, 1, color);
+    if (h > 2) {
+        ui_fill_rect(x, y + 1, 1, h - 2, color);
+        if (w > 1) ui_fill_rect(x + w - 1, y + 1, 1, h - 2, color);
+    }
 }
 
 /* 8x8 bitmap glyph, 1:1 scale, from font.h (shared with the kernel's
@@ -77,8 +94,28 @@ static inline void ui_stroke_rect(int x, int y, int w, int h, unsigned int color
 static inline void ui_draw_char(int x, int y, char c, unsigned int color)
 {
     unsigned char ch = (unsigned char)c;
-    if (ch >= 128) return;
+    if (ch >= 128 || ch == ' ') return;
     const unsigned char* glyph = &font[ch * 8];
+
+    if (x >= 0 && y >= 0 && x + 8 <= GFX_WIDTH && y + 8 <= GFX_HEIGHT) {
+        /* Fully on-canvas (the normal case): write through a row pointer,
+         * skipping blank glyph rows, with no per-pixel bounds checks. */
+        unsigned int* row = &gfx_framebuffer[y * GFX_WIDTH + x];
+        for (int r = 0; r < 8; r++, row += GFX_WIDTH) {
+            unsigned int bits = glyph[r];
+            if (!bits) continue;
+            if (bits & 0x80) row[0] = color;
+            if (bits & 0x40) row[1] = color;
+            if (bits & 0x20) row[2] = color;
+            if (bits & 0x10) row[3] = color;
+            if (bits & 0x08) row[4] = color;
+            if (bits & 0x04) row[5] = color;
+            if (bits & 0x02) row[6] = color;
+            if (bits & 0x01) row[7] = color;
+        }
+        return;
+    }
+    /* Straddling an edge: per-pixel clipped path. */
     for (int row = 0; row < 8; row++) {
         unsigned char bits = glyph[row];
         for (int col = 0; col < 8; col++) {
@@ -120,6 +157,22 @@ static inline void ui_frame_begin(ui_frame_t* f, unsigned int bg_color)
 }
 
 static inline void ui_frame_end(void) { gfx_present(); }
+
+/* Drain every key currently queued for this program (up to `max`) and
+ * return how many were read. ui_frame_begin() only hands back ONE key per
+ * frame (f->key); at the low frame rates an interpreted guest runs at, a
+ * burst of typing would otherwise sit in the queue for several frames and
+ * feel laggy. Call this once per frame instead and apply every key. */
+static inline int ui_poll_keys(int* keys, int max)
+{
+    int n = 0;
+    while (n < max) {
+        int k = key_poll();
+        if (!k) break;
+        keys[n++] = k;
+    }
+    return n;
+}
 
 static inline int ui_point_in_rect(int px, int py, int x, int y, int w, int h)
 {
@@ -275,15 +328,12 @@ static inline void ui_textbox_init(ui_textbox_t* t, int x, int y, int w, int h)
     t->focused = 0;
 }
 
-static inline void ui_textbox_update(const ui_frame_t* f, ui_textbox_t* t)
+/* Apply one key to the box (no focus/click logic). Returns 1 if the box
+ * consumed it, so callers draining several keys per frame can stop
+ * feeding other widgets. Enter commits and releases focus. */
+static inline int ui_textbox_key(ui_textbox_t* t, int k)
 {
-    if (f->mouse.in_window && f->mouse.left_clicked) {
-        t->focused = ui_point_in_rect(f->mouse.x, f->mouse.y, t->x, t->y, t->w, t->h);
-    }
-
-    if (!t->focused || f->key == 0) return;
-
-    int k = f->key;
+    if (!t->focused || k == 0) return 0;
     if (k == '\b' || k == 127 || k == KEY_DELETE) {
         if (t->len > 0) t->buf[--t->len] = 0;
     } else if (k == '\n' || k == '\r') {
@@ -292,6 +342,15 @@ static inline void ui_textbox_update(const ui_frame_t* f, ui_textbox_t* t)
         t->buf[t->len++] = (char)k;
         t->buf[t->len] = 0;
     }
+    return 1;
+}
+
+static inline void ui_textbox_update(const ui_frame_t* f, ui_textbox_t* t)
+{
+    if (f->mouse.in_window && f->mouse.left_clicked) {
+        t->focused = ui_point_in_rect(f->mouse.x, f->mouse.y, t->x, t->y, t->w, t->h);
+    }
+    ui_textbox_key(t, f->key);
 }
 
 static inline void ui_textbox_draw(const ui_textbox_t* t)
@@ -305,7 +364,7 @@ static inline void ui_textbox_draw(const ui_textbox_t* t)
      * redraws often enough that this doesn't read as static. */
     if (t->focused) {
         int caret_x = t->x + 4 + ui_text_width(t->buf);
-        for (int i = 0; i < 8; i++) gfx_set_pixel(caret_x, t->y + (t->h - 8) / 2 + i, UI_COLOR_ACCENT);
+        ui_fill_rect(caret_x, t->y + (t->h - 8) / 2, 1, 8, UI_COLOR_ACCENT);
     }
 }
 

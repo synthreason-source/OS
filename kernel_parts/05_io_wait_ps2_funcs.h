@@ -403,10 +403,15 @@ bool initialize_universal_mouse() {
     return false;
 }
 void poll_input_universal() {
-    last_key_press = 0;
+    // NOTE: deliberately does NOT clear any "current key" state. Decoded keys go
+    // into the g_kbd_q ring (see 03_input_ps2_mouse.h) and the main loop pops
+    // them; this function runs many times per pass (inside the guest slice too)
+    // and must never discard what an earlier call produced.
     // Non-blocking: only read if data is immediately available
 
-    for (int iterations = 0; iterations < 16; iterations++) {
+    // Up to 64 bytes per call (was 16): after a long guest frame the controller can
+    // hold a burst, and every byte left behind is another loop pass of latency.
+    for (int iterations = 0; iterations < 64; iterations++) {
         uint8_t status = inb(PS2_STATUS_PORT);
         if (!(status & PS2_STATUS_OUTPUT_FULL)) break;
 
@@ -414,35 +419,68 @@ void poll_input_universal() {
 
         if (status & PS2_STATUS_AUX_DATA) {
             process_universal_mouse_packet(data);
-        } else {
-            bool is_press = !(data & 0x80);
-            uint8_t scancode = data & 0x7F;
-
-            if (scancode == 0 || scancode > 0x58) continue;
-
-            if (scancode == 0x2A || scancode == 0x36) {
-                is_shift_pressed = is_press;
-            } else if (scancode == 0x1D) {
-                is_ctrl_pressed = is_press;
-            } else if (is_press) {
-                switch(scancode) {
-                    case 0x48: last_key_press = KEY_UP; break;
-                    case 0x50: last_key_press = KEY_DOWN; break;
-                    case 0x4B: last_key_press = KEY_LEFT; break;
-                    case 0x4D: last_key_press = KEY_RIGHT; break;
-                    case 0x53: last_key_press = KEY_DELETE; break;
-                    case 0x47: last_key_press = KEY_HOME; break;
-                    case 0x4F: last_key_press = KEY_END; break;
-                    default: {
-                        const char* map = is_ctrl_pressed ? sc_ascii_ctrl_map :
-                                          (is_shift_pressed ? sc_ascii_shift_map : sc_ascii_nomod_map);
-                        if (scancode < 128 && map[scancode] != 0) {
-                            last_key_press = map[scancode];
-                        }
-                    }
-                }
-            }
+            continue;
         }
+
+        // ── keyboard byte (scancode set 1) ──
+        if (g_kbd_skip > 0) { g_kbd_skip--; continue; }       // inside a Pause sequence
+        if (data == 0xE1) { g_kbd_skip = 5; continue; }       // Pause/Break: swallow the rest
+        if (data == 0xE0) { g_kbd_ext = true; continue; }     // extended-key prefix
+
+        bool ext = g_kbd_ext;
+        g_kbd_ext = false;
+
+        bool is_press = !(data & 0x80);
+        uint8_t sc = data & 0x7F;
+        if (sc == 0 || sc > 0x58) continue;
+
+        // E0 2A / E0 36 are "fake shifts" the keyboard wraps around Insert, Delete,
+        // arrows... when NumLock is on. They are not the Shift key.
+        if (ext && (sc == 0x2A || sc == 0x36)) continue;
+
+        if (sc == 0x2A || sc == 0x36) { is_shift_pressed = is_press; continue; }
+        if (sc == 0x1D)               { is_ctrl_pressed  = is_press; continue; }   // left or right Ctrl
+        if (!is_press) continue;
+
+        if (!ext && sc == 0x3A) { g_kbd_caps = !g_kbd_caps; continue; }            // Caps Lock
+        if (!ext && sc == 0x45) { g_kbd_num  = !g_kbd_num;  continue; }            // Num Lock
+
+        // ── navigation cluster: real arrows (E0-prefixed) always navigate; the
+        //    keypad (no prefix) types digits while NumLock is on, else navigates ──
+        if (sc >= 0x47 && sc <= 0x53 && sc != 0x4A && sc != 0x4E) {
+            if (!ext && g_kbd_num) {
+                char d = sc_keypad_digit(sc);
+                if (d) kbd_enqueue(d);
+                continue;
+            }
+            switch (sc) {
+                case 0x48: kbd_enqueue(KEY_UP);     break;
+                case 0x50: kbd_enqueue(KEY_DOWN);   break;
+                case 0x4B: kbd_enqueue(KEY_LEFT);   break;
+                case 0x4D: kbd_enqueue(KEY_RIGHT);  break;
+                case 0x53: kbd_enqueue(KEY_DELETE); break;
+                case 0x47: kbd_enqueue(KEY_HOME);   break;
+                case 0x4F: kbd_enqueue(KEY_END);    break;
+                default: break;                      // PgUp/PgDn/Ins/keypad-5: no code
+            }
+            continue;
+        }
+
+        // keypad operators (no prefix); keypad '/' and Enter arrive as E0 35 / E0 1C
+        // and decode through the main table below.
+        if (!ext && sc == 0x37) { kbd_enqueue('*'); continue; }
+        if (!ext && sc == 0x4A) { kbd_enqueue('-'); continue; }
+        if (!ext && sc == 0x4E) { kbd_enqueue('+'); continue; }
+
+        // ── main typing area ──
+        char base = sc_ascii_nomod_map[sc];
+        if (base == 0) continue;                              // F-keys, Alt, Esc, ... : no character
+        bool letter = (base >= 'a' && base <= 'z');
+        bool use_shift = is_shift_pressed ^ (g_kbd_caps && letter);    // Caps Lock only affects letters
+        const char* map = is_ctrl_pressed ? sc_ascii_ctrl_map :
+                          (use_shift ? sc_ascii_shift_map : sc_ascii_nomod_map);
+        char out = map[sc];
+        if (out != 0) kbd_enqueue(out);
     }
 
     mouse_x = universal_mouse_state.x;

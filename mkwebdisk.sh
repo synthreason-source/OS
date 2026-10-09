@@ -23,8 +23,8 @@ IMG=${1:-disk.img}
 export MTOOLS_SKIP_CHECK=1
 
 HEADERS="drivers.h bochs_drivers.h driver.h comp.h font.h gui_scene.h gui_render.h"
-SOURCES="web.c editf.c"
-PROGS="web editf"
+SOURCES="web.c editf.c driverkit.c"
+PROGS="web editf driverkit"
 
 # i386-tcc: local build first (make setup-tcc), then PATH.  TCC_B may point
 # at an uninstalled tcc source tree (passed as -B).

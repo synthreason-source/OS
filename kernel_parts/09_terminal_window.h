@@ -2561,7 +2561,12 @@ public:
 			// ELF's stdin via push_input below, so applications that want
 			// to interpret special keys still see them.
 			unsigned char uc = (unsigned char)c;
-			if (uc == '\n' || uc == '\t' || (uc >= 32 && uc < 127)) {
+			// A program that owns a live gfx canvas draws its own UI: echoing every
+			// keystroke into the (hidden) text console behind it is pure waste and
+			// just scrolls that buffer. Only echo for text-mode programs.
+			const uint32_t* echo_px = nullptr; int echo_w = 0, echo_h = 0;
+			bool has_canvas = bochs_gfx_get_frame(captured_elf_slot, &echo_px, &echo_w, &echo_h);
+			if (!has_canvas && (uc == '\n' || uc == '\t' || (uc >= 32 && uc < 127))) {
 				char echo[2] = {c, 0};
 				console_print(echo);
 			}

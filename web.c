@@ -92,6 +92,7 @@ static char       s_status[48];
 static int        s_hist_n, s_pool_n, s_item_n, s_link_n;
 static int        s_doc_h, s_bytes, s_truncated;
 static int        s_dirty = 1, s_hover = -1;
+static int        s_tb_dirty = 1, s_tb_sig = -1;   /* toolbar redraw request / last hover signature */
 static int        s_last_mx = -1, s_last_my = -1, s_last_scroll = -1, s_last_in = 0;
 
 static ui_scrollbar_t s_bar;
@@ -578,12 +579,38 @@ static void parse_plain(const char* s, int n)       /* .txt/.c/.h ... : monospac
 }
 
 /* ── rendering ───────────────────────────────────────────────────── */
+static void draw_hline(int x0, int x1, int y, unsigned int col)
+{
+    if (y < VIEW_Y || y >= VIEW_Y + VIEW_H) return;
+    if (x0 < 0) x0 = 0;
+    if (x1 > VIEW_W) x1 = VIEW_W;
+    if (x1 > x0) ui_fill_rect(x0, y, x1 - x0, 1, col);
+}
+
+/* One glyph at (x,y), scale sc, optional faux-italic (row shear) / bold (double
+ * strike).  The 1x case -- all ordinary body text -- writes straight through a
+ * row pointer with no per-pixel bounds checks; everything else (headings at 2x,
+ * glyphs touching the view edge) takes the general clipped path. */
 static void draw_glyph(int x, int y, int ch, unsigned int col, int sc, int ital, int bold)
 {
     const unsigned char* g;
     int row, cb, r, dx;
-    if (ch < 0 || ch >= 128) return;
+    if (ch < 0 || ch >= 128 || ch == ' ') return;
     g = &font[ch * 8];
+
+    if (sc == 1 && x >= 0 && x + 12 <= VIEW_W) {
+        for (row = 0; row < 8; row++) {
+            unsigned int bits = g[row];
+            int yy = y + row;
+            unsigned int* p;
+            if (!bits || yy < VIEW_Y || yy >= VIEW_Y + VIEW_H) continue;
+            p = &gfx_framebuffer[yy * GFX_WIDTH + x + (ital ? ((7 - row) >> 2) : 0)];
+            for (cb = 0; cb < 8; cb++) {
+                if (bits & (0x80 >> cb)) { p[cb] = col; if (bold) p[cb + 1] = col; }
+            }
+        }
+        return;
+    }
     for (row = 0; row < 8; row++) {
         unsigned char bits = g[row];
         int off;
@@ -603,13 +630,6 @@ static void draw_glyph(int x, int y, int ch, unsigned int col, int sc, int ital,
     }
 }
 
-static void draw_hline(int x0, int x1, int y, unsigned int col)
-{
-    int x;
-    if (y < VIEW_Y || y >= VIEW_Y + VIEW_H) return;
-    for (x = x0; x < x1; x++) if (x >= 0 && x < VIEW_W) gfx_set_pixel(x, y, col);
-}
-
 static void draw_view(void)
 {
     int i, j, scroll = s_bar.value;
@@ -619,7 +639,8 @@ static void draw_view(void)
         int sc = it->scale, sy = VIEW_Y + it->y - scroll, x = MARGIN + it->x;
         int h = 8 * sc + 2;
         unsigned int col = it->color;
-        if (sy + h <= VIEW_Y || sy >= VIEW_Y + VIEW_H) continue;
+        if (sy >= VIEW_Y + VIEW_H) break;          /* items are sorted by y: nothing further down is visible */
+        if (sy + h <= VIEW_Y) continue;
 
         if (it->kind == IT_HR) {
             draw_hline(MARGIN, MARGIN + TEXT_W, sy + 4, PG_RULE);
@@ -656,6 +677,7 @@ static int hit_link(int mx, int my)
         int sy, w;
         if (it->link < 0 || it->kind != IT_TEXT) continue;
         sy = VIEW_Y + it->y - scroll;
+        if (sy > my) break;                       /* sorted by y: nothing below the pointer can match */
         w = it->len * 8 * it->scale;
         if (ui_point_in_rect(mx, my, MARGIN + it->x, sy, w, 8 * it->scale + 2)) return it->link;
     }
@@ -714,6 +736,7 @@ static void hist_push(const char* name)
 static void set_url_box(const char* s)
 {
     s_url.len = w_cpy(s_url.buf, s, UI_TEXTBOX_MAX);   /* the box holds 63 chars; the page keeps the full URL */
+    s_tb_dirty = 1;
 }
 
 /* "Error" page: head line, explanation, and the offending name/URL
@@ -1099,6 +1122,21 @@ static void clamp_scroll(void)
     if (s_bar.value > s_bar.max) s_bar.value = s_bar.max;
 }
 
+static void draw_toolbar(const ui_frame_t* f)
+{
+    ui_fill_rect(0, 0, 320, VIEW_Y - 1, UI_COLOR_PANEL);
+    ui_fill_rect(0, VIEW_Y - 1, 320, 1, UI_COLOR_BORDER);
+    ui_textbox_draw(&s_url);                   /* text may spill right; the Go button below covers it */
+    ui_button(f, &b_back);                     /* ui_button() both draws and hit-tests; here only the drawing is wanted */
+    ui_button(f, &b_home);
+    ui_button(f, &b_go);
+}
+
+static int btn_hot(const ui_frame_t* f, const ui_button_t* b)
+{
+    return f->mouse.in_window && ui_point_in_rect(f->mouse.x, f->mouse.y, b->x, b->y, b->w, b->h);
+}
+
 void _start(void)
 {
     kputs("web: starting (opens .htm/.html/.txt/.c files from the disk)\n");
@@ -1112,21 +1150,41 @@ void _start(void)
     nav_to("home.htm", 0, 0);
 #endif
 
+    /* Drawing is dirty-driven: the canvas persists between frames, so a frame in
+     * which nothing changed costs a handful of port reads and one gfx_yield()
+     * (no redraw, no 256 KB present, no desktop repaint).  The toolbar redraws
+     * only when its hover/focus/text state changes, the page area only when
+     * s_dirty is set (scroll, hover link, navigation). */
     for (;;) {
         ui_frame_t f;
-        int go = 0, back = 0, home = 0, quit = 0, was_focus, in_view, clicked_link = -1;
-        int old_scroll;
+        int keys[32], nk, ki;
+        int go = 0, back = 0, home = 0, quit = 0, in_view, clicked_link = -1;
+        int old_scroll, old_drag, was_focus, hb, hh, hg, sig;
 
         mouse_poll(&f.mouse);
-        f.key = key_poll();
+        f.key = 0;
+        nk = ui_poll_keys(keys, 32);            /* every key queued since last frame, in order */
         old_scroll = s_bar.value;
+        old_drag   = s_bar.dragging;
+        was_focus  = s_url.focused;
 
-        /* keyboard: URL box owns it while focused, otherwise it scrolls/navigates */
-        if (s_url.focused) {
-            if (f.key == '\n' || f.key == '\r') go = 1;
-        } else if (f.key) {
-            int consumed = 1;
-            switch (f.key) {
+        /* click in / out of the URL box */
+        if (f.mouse.in_window && f.mouse.left_clicked) {
+            s_url.focused = ui_point_in_rect(f.mouse.x, f.mouse.y, s_url.x, s_url.y, s_url.w, s_url.h);
+            if (!was_focus && s_url.focused) { s_url.buf[0] = 0; s_url.len = 0; }   /* click = select all */
+            if (s_url.focused != was_focus) s_tb_dirty = 1;
+        }
+
+        /* keyboard: processed in order, so "g", a URL and Enter can all arrive in one frame */
+        for (ki = 0; ki < nk; ki++) {
+            int k = keys[ki];
+            if (s_url.focused) {
+                if (k == '\n' || k == '\r') go = 1;
+                ui_textbox_key(&s_url, k);       /* Enter also releases focus */
+                s_tb_dirty = 1;
+                continue;
+            }
+            switch (k) {
             case KEY_UP:    s_bar.value -= 10; break;
             case KEY_DOWN:  s_bar.value += 10; break;
             case KEY_HOME:  s_bar.value = s_bar.min; break;
@@ -1136,29 +1194,22 @@ void _start(void)
             case '\b':
             case 127:       back = 1; break;
             case 'h':       home = 1; break;
-            case 'g':       s_url.focused = 1; s_url.buf[0] = 0; s_url.len = 0; break;
+            case 'g':       s_url.focused = 1; s_url.buf[0] = 0; s_url.len = 0; s_tb_dirty = 1; break;
             case 'q':       quit = 1; break;
-            default:        consumed = 0; break;
+            default:        break;
             }
-            if (consumed) f.key = 0;
+            clamp_scroll();
         }
-        clamp_scroll();
 
-        /* toolbar (redrawn every frame; it also gives hot/pressed feedback) */
-        ui_fill_rect(0, 0, 320, VIEW_Y - 1, UI_COLOR_PANEL);
-        ui_fill_rect(0, VIEW_Y - 1, 320, 1, UI_COLOR_BORDER);
-        was_focus = s_url.focused;
-        ui_textbox_update(&f, &s_url);
-        if (!was_focus && s_url.focused) { s_url.buf[0] = 0; s_url.len = 0; }   /* click = select all */
-        ui_textbox_draw(&s_url);
-        if (ui_button(&f, &b_back)) back = 1;
-        if (ui_button(&f, &b_home)) home = 1;
-        if (ui_button(&f, &b_go))   go = 1;
+        /* toolbar buttons: hit-test every frame (cheap), redraw only when the hover state changes */
+        hb = btn_hot(&f, &b_back); hh = btn_hot(&f, &b_home); hg = btn_hot(&f, &b_go);
+        if (f.mouse.left_clicked) { if (hb) back = 1; else if (hh) home = 1; else if (hg) go = 1; }
+        sig = hb | (hh << 1) | (hg << 2) | ((f.mouse.left_down && (hb || hh || hg)) ? 8 : 0);
+        if (sig != s_tb_sig) { s_tb_sig = sig; s_tb_dirty = 1; }
         if (was_focus && !s_url.focused && !go) set_url_box(s_cur);              /* abandoned edit */
 
         ui_scrollbar_update(&f, &s_bar);
-        ui_scrollbar_draw(&s_bar);
-        if (s_bar.value != old_scroll) s_dirty = 1;
+        if (s_bar.value != old_scroll || s_bar.dragging != old_drag) s_dirty = 1;
 
         /* hover / click on links (hit-test only when something moved) */
         in_view = f.mouse.in_window && f.mouse.x < VIEW_W && f.mouse.y >= VIEW_Y && f.mouse.y < VIEW_Y + VIEW_H;
@@ -1177,8 +1228,13 @@ void _start(void)
         else if (back)             nav_back();
         else if (clicked_link >= 0) nav_to(s_links[clicked_link], 1, 1);
 
-        if (s_dirty) { draw_view(); draw_status(); s_dirty = 0; }
-        ui_frame_end();
+        if (s_tb_dirty || s_dirty) {
+            if (s_tb_dirty) { draw_toolbar(&f); s_tb_dirty = 0; }
+            if (s_dirty)    { draw_view(); ui_scrollbar_draw(&s_bar); draw_status(); s_dirty = 0; }
+            ui_frame_end();                    /* something changed: present it */
+        } else {
+            gfx_yield();                       /* idle: hand the CPU back, no frame copy */
+        }
     }
 
     gfx_exit();
