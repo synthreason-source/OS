@@ -10,7 +10,7 @@ guest programs require many '.h' files within the base directory for compiled pr
 
 Ethernet: RTL8139, Intel e1000 and e1000e drivers with ARP/IPv4/ICMP/UDP/DHCP/DNS (shell: `ifconfig`, `dhcp`, `ping`, `nslookup`, `arp`).
 
-TODO: TCP, WiFi, web browser & busybox implementation
+TODO: TCP, WiFi, web browser & busybox implementation, fix OOM...
 
 TODO: add driver kit
 
